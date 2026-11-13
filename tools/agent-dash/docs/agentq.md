@@ -254,7 +254,7 @@ instead of letting it swing between idle and burst.
   `proxy_state.json` and decays by the time away on restart. The reserve never raises the
   429 controller's target above the Morph limit. The account-wide requests budget (1,000 a minute)
   has no reserve. `backlog_max_frac` still applies to the rolling budgets (total).
-- Output estimate: a request on a reserve-backed output budget is charged the `output_estimate_pct` (80) nearest-rank percentile of the last `output_estimate_window` (200) completions for its model, capped by `max_tokens`. Other budgets use the mean of the last 20. Each completion logs a `request_output` line, so a later replay can use per-request outputs. `tools/agent-dash/agentq/output_estimate_replay.py` compares the two estimates on a copy of the store.
+- Output estimate: by default every budget charges a request the mean of its model's last 20 completions, capped by `max_tokens`. Setting `output_estimate_pct` above 0 charges reserve-backed output budgets the nearest-rank percentile of the last `output_estimate_window` (200) completions instead. The default stays the mean: the 6 h replay found the p80 under-charges more minutes than the mean. Each completion logs a `request_output` line, so a later replay can use per-request outputs. `tools/agent-dash/agentq/output_estimate_replay.py` compares the two estimates on a copy of the store.
 - Commands: `python3 -m agentq.fill --home <dir>` prints one reading (what fill and
   pacing would do now, and why) and never writes; run it on a copy of the store.
   `agentq status` shows `filler: on|off|paused` and the filler jobs running. The

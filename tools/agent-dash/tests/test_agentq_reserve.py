@@ -390,7 +390,17 @@ class GovernorReserveTest(unittest.TestCase):
         self.assertTrue(oldest.holds)
         self.assertFalse(newer.holds)
 
-    def test_output_estimate_is_the_mean_for_the_recent_minute_and_the_p80_for_the_reserve_budget(self) -> None:
+    def test_output_estimate_defaults_to_the_mean_of_the_recent_minute_for_every_budget(self) -> None:
+        self.gov.output_history[MODEL_OUT] = deque([2_500] * 50 + [600] * 150, maxlen=200)
+        ticket = self.gov.make_ticket(
+            job="mean", lane="normal", model=MODEL_OUT, length=4, blocks=prefix_blocks("xxxx"),
+            max_tokens=None, now=self.wall[0],
+        )
+        self.assertEqual(ticket.estimates["output"], 600)
+        self.assertEqual(ticket.estimates["total"], 1 + 600)
+
+    def test_a_positive_percentile_charges_the_reserve_budget_at_that_percentile(self) -> None:
+        self.gov.config["output_estimate_pct"] = 80
         self.gov.output_history[MODEL_OUT] = deque([2_500] * 50 + [600] * 150, maxlen=200)
         ticket = self.gov.make_ticket(
             job="o", lane="normal", model=MODEL_OUT, length=4, blocks=prefix_blocks("xxxx"),
@@ -400,6 +410,7 @@ class GovernorReserveTest(unittest.TestCase):
         self.assertEqual(ticket.estimates["total"], 1 + 600)
 
     def test_the_output_estimate_is_still_capped_by_max_tokens(self) -> None:
+        self.gov.config["output_estimate_pct"] = 80
         self.gov.output_history[MODEL_OUT] = deque([2_500] * 50 + [600] * 150, maxlen=200)
         ticket = self.gov.make_ticket(
             job="o2", lane="normal", model=MODEL_OUT, length=4, blocks=prefix_blocks("xxxx"),
@@ -430,7 +441,7 @@ class GovernorReserveTest(unittest.TestCase):
         self.assertEqual(logged, [{"model": MODEL_OUT, "output": 321, "max_tokens": 0}])
 
     def test_config_defaults_for_the_output_estimate(self) -> None:
-        self.assertEqual(DEFAULT_CONFIG["output_estimate_pct"], 80)
+        self.assertEqual(DEFAULT_CONFIG["output_estimate_pct"], 0)
         self.assertEqual(DEFAULT_CONFIG["output_estimate_window"], 200)
 
     def test_a_restored_reserve_target_is_clamped_to_the_morph_limit(self) -> None:

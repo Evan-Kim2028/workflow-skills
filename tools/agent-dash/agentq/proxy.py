@@ -100,7 +100,7 @@ DEFAULT_CONFIG = {
     "fast_step_up": 0.05,
     "fast_interval_s": 10.0,
     "default_output_tokens": 800,
-    "output_estimate_pct": 80,
+    "output_estimate_pct": 0,
     "output_estimate_window": 200,
     "give_up_s": 240.0,
     "retry_floor_s": 1.0,
@@ -1464,8 +1464,9 @@ class Governor:
         applicable = [b for b in self.budgets.values() if b.applies(model)]
         mean_output = self.output_estimate(model, max_tokens)
         tail_output = mean_output
-        if any(b.limit_type == "output" and b.reserve is not None for b in applicable):
-            tail_output = self.output_estimate(model, max_tokens, pct=float(self.config["output_estimate_pct"]))
+        pct = float(self.config["output_estimate_pct"])
+        if pct > 0 and any(b.limit_type == "output" and b.reserve is not None for b in applicable):
+            tail_output = self.output_estimate(model, max_tokens, pct=pct)
         uncached = 0
         if any(b.limit_type == "uncached" for b in applicable):
             uncached = self.uncached_estimate(job, length, blocks)
