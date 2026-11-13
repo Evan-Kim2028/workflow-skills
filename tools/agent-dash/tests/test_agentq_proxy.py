@@ -826,10 +826,12 @@ class KeyTest(unittest.TestCase):
         self.assertIn("no Morph key", lines[0])
         self.assertNotIn(KEY, stderr.getvalue())
 
-    def test_plist_throttles_restarts(self) -> None:
+    def test_plist_restarts_quickly_at_interactive_priority(self) -> None:
         plist = plistlib.loads(PLIST.read_bytes())
         self.assertTrue(plist["KeepAlive"])
-        self.assertEqual(plist["ThrottleInterval"], 30)
+        self.assertEqual(plist["ThrottleInterval"], 5)
+        self.assertEqual(plist["ProcessType"], "Interactive")
+        self.assertEqual(plist["ExitTimeOut"], 40)
 
 
 class EstimateTest(unittest.TestCase):

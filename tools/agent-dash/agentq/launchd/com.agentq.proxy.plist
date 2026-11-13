@@ -24,11 +24,11 @@
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>
-    <integer>30</integer>
+    <integer>5</integer>
     <key>ExitTimeOut</key>
     <integer>40</integer>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>__HOME__/.local/state/agentq/logs/proxy.out.log</string>
     <key>StandardErrorPath</key>
