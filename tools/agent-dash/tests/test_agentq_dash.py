@@ -1004,6 +1004,14 @@ class UpstreamLatencyDashTest(unittest.TestCase):
     def test_in_flight_now_is_null_without_a_live_status(self) -> None:
         self.assertIsNone(self.summary(None)["perf_kpis"]["in_flight_now"])
 
+    def test_the_deepseek_limit_pairs_with_the_deepseek_in_flight_count_not_the_total(self) -> None:
+        live = {"ok": True, "budgets": {}, "inflight_limit": 2, "inflight_in_flight": 3,
+                "upstream": {"in_flight": {"morph-dsv41flash-1017": 3, "morph-kimik31": 7}}}
+        perf = self.summary(live)["perf_kpis"]
+        self.assertEqual(perf["in_flight_now"], 10)
+        self.assertEqual(perf["ds_in_flight_now"], 3)
+        self.assertEqual(perf["inflight_limit"], 2)
+
     def test_old_schema_without_latency_columns_still_charts_the_counts(self) -> None:
         tmp = Path(tempfile.mkdtemp())
         home = make_home(tmp, minutes=False, jobs=False)

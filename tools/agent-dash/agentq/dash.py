@@ -2483,7 +2483,6 @@ def perf_kpis(raw: dict[int, dict], since: int, until: int, runs: list[dict], no
         "in_flight_now": in_flight_total(live),
         "ds_in_flight_now": (live or {}).get("inflight_in_flight"),
         "inflight_limit": live_inflight_limit(live),
-        "ds_in_flight_now": (live or {}).get("inflight_in_flight"),
         "inflight_mode": (live or {}).get("inflight_mode"),
         "upstream_median_ms": median_or_none(upstream),
         "r429_rate_60m": window_sum(raw, until, RATE_WINDOW_MINUTES, "r429") / req_60m if req_60m else None,
