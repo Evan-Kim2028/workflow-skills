@@ -468,10 +468,10 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(kpis["cap_deepseek"], 64)
         self.assertEqual(kpis["cap_kimi"], 2)
 
-    def test_runs_seen_in_range_are_distinct_jobs_with_activity_in_range(self) -> None:
+    def test_runs_active_in_window_are_distinct_jobs_with_activity_in_range(self) -> None:
         kpis = self.summary["run_kpis"]
-        self.assertEqual(kpis["seen_in_range"], 4)
-        self.assertEqual(kpis["tokens_in_range"], 4500 + 5200 + 150 + 400)
+        self.assertEqual(kpis["active_in_window"], 4)
+        self.assertEqual(kpis["active_lifetime_tokens"], 4500 + 5200 + 150 + 400)
         self.assertEqual(kpis["median_tokens_per_run"], (400 + 4500) / 2)
         self.assertEqual(kpis["median_requests_per_run"], 3.0)
 
@@ -539,7 +539,7 @@ class MissingRunsTableTest(unittest.TestCase):
             self.assertNotIn("jobs", summary["errors"])
             self.assertEqual(summary["runs"], [])
             self.assertEqual(summary["top_consumers"], [])
-            self.assertEqual(summary["run_kpis"]["seen_in_range"], 0)
+            self.assertEqual(summary["run_kpis"]["active_in_window"], 0)
             self.assertEqual(summary["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
             self.assertIsNone(summary["perf_kpis"]["upstream_median_ms"])
             self.assertEqual(summary["jobs"]["by_state"], {"queued": 1, "running": 1, "done": 3})
@@ -1921,3 +1921,111 @@ class ClientGoneTest(unittest.TestCase):
                 mock.patch.object(dash.sys, "stderr", new=io.StringIO()):
             handler.handle_one_request()
         self.assertTrue(handler.close_connection)
+
+
+class LifetimeRunTokensTest(unittest.TestCase):
+    """proxy_jobs keeps lifetime totals per job, so runs in a window are shown with lifetime tokens and labelled so."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(PROXY_JOBS_DDL)
+        conn.executemany(
+            "INSERT INTO proxy_jobs (job, model, first_ts, last_ts, req, ok, r429, input, cache_read, output, wait_ms_total, upstream_ms_total) "
+            "VALUES (?, 'morph-dsv41flash-1017', ?, ?, 10, 10, 0, 700000, 0, 0, 0, 0)",
+            [("1" * 12, NOW - 3 * 24 * 3600, NOW - 1800), ("2" * 12, NOW - 5 * 24 * 3600, NOW - 3 * 24 * 3600)],
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_a_run_active_in_the_hour_shows_its_lifetime_tokens_and_an_old_run_is_absent(self) -> None:
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=no_proxy)
+        jobs = {row["job"]: row for row in summary["top_consumers"]}
+        self.assertIn("1" * 12, jobs)
+        self.assertEqual(jobs["1" * 12]["total_tokens"], 700000)
+        self.assertNotIn("2" * 12, jobs)
+        self.assertEqual(summary["run_kpis"]["active_in_window"], 1)
+        self.assertEqual(summary["run_kpis"]["active_lifetime_tokens"], 700000)
+
+    def test_the_page_labels_top_consumers_as_lifetime_tokens(self) -> None:
+        self.assertIn("Lifetime tokens of the ", dash.PAGE_HTML)
+        self.assertIn("runs active ", dash.PAGE_HTML)
+
+
+class SmallChartRateTest(unittest.TestCase):
+    """Per-minute values must stay per minute at every bucket size: the 429 chart plots a mean, not a sum."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name), minutes=False, jobs=False)
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(PROXY_MINUTES_DDL)
+        conn.executemany(
+            f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(minute_at(60 * k), "morph-dsv41flash-1017", 1, 1, 1, 100, 0, 0, 0, 0, 500, 0.9) for k in range(1, 121)],
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_429_rate_is_one_per_minute_at_24h_and_7d_buckets(self) -> None:
+        for hours, bucket in ((24, 300), (168, 1800)):
+            with self.subTest(hours=hours):
+                summary = dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)
+                self.assertEqual(summary["bucket_s"], bucket)
+                full = [m for m in summary["minutes"] if m["minutes"] == bucket // 60]
+                self.assertTrue(full)
+                self.assertTrue(all(m["r429_per_min"] == 1.0 for m in summary["minutes"]), summary["minutes"][:3])
+                self.assertTrue(all(m["r429"] == m["minutes"] for m in full))
+
+    def test_429_chart_plots_the_per_minute_rate_and_says_so(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-429"')
+        block = html[start:html.index("registerChart(", start + 1)]
+        self.assertIn('key: "r429_per_min"', block)
+        self.assertIn("429s per minute", block)
+
+    def test_wait_p95_stays_a_worst_minute_at_7d(self) -> None:
+        summary = dash.build_summary(self.home, 168, now=NOW, fetch_live=no_proxy)
+        self.assertTrue(all(m["wait_p95_ms"] == 500 for m in summary["minutes"] if m["wait_p95_ms"] is not None))
+
+
+class ConcurrentMigrationTest(unittest.TestCase):
+    def test_writers_on_an_old_schema_db_lose_no_samples(self) -> None:
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dash_db = Path(tmp) / "dash.db"
+            conn = sqlite3.connect(dash_db)
+            conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
+                         "queue_workers INT, direct_workers INT, queued_jobs INT)")
+            conn.commit()
+            conn.close()
+            rows = [
+                {"ts": NOW + i, "ds_workers": 1, "kimi_workers": 0, "queue_workers": 0, "direct_workers": 0,
+                 "queued_jobs": 0, "ds_queued": 0, "kimi_queued": 0}
+                for i in range(12)
+            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+                list(pool.map(lambda row: dash.write_sample(dash_db, row), rows))
+            conn = sqlite3.connect(dash_db)
+            count = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(samples)")]
+            conn.close()
+        self.assertEqual(count, 12)
+        self.assertIn("ds_queued", columns)
+        self.assertIn("kimi_queued", columns)
+
+
+class LogPollingTest(unittest.TestCase):
+    def test_refresh_log_stamps_its_fetch_so_the_fifteen_second_throttle_applies(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index("function refreshLog()")
+        self.assertIn("log.fetchedAt = Date.now();", html[start:start + 200])
+        self.assertIn("if (Date.now() - log.fetchedAt >= LOG_POLL_MS) refreshLog();", html)

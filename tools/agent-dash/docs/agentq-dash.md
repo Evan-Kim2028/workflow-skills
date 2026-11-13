@@ -32,21 +32,34 @@ A source that fails shows as null or empty in the JSON and is named under
 
 ## Cadence and cost
 
-- The page polls `/api/summary` every 30 s (every 120 s on the 7 d range), and only while the tab is visible.
-  Hiding the tab stops polling; showing it again refreshes at once.
+- The server computes the summary for all four ranges in a background worker
+  and serves the stored JSON. Cadence: 1 h and 6 h every 5 s, 24 h every 15 s,
+  7 d every 60 s. A range nobody has requested for two minutes is not
+  recomputed. The first request for a range computes it on the spot.
+- The page polls `/api/summary` on the same cadence as the range it shows
+  (5 s for 1 h and 6 h, 15 s for 24 h, 60 s for 7 d) and only while the tab is
+  visible. Hiding the tab stops polling; showing it again refreshes at once.
+  The run log refreshes every 15 s.
+- The "updated Ns ago" status counts from the summary's `generated_at`, so it
+  shows the age of the data, not of the last poll.
+- The proxy status probe and the laptop memory reading run on their own threads.
+  The summary carries the last value of each with its age (`source_age_s`).
 - The sampler runs one `ps -E -axo pid=,command=` call and one count query on
   `agentq.db` each minute, whether or not anyone has the page open. That is the
-  only standing work. Nothing else runs between requests.
-- The billed % tiles average the five most recent complete minutes. A minute
-  with no proxy row counts as zero, since the proxy writes rows only for
-  minutes with traffic.
+  only standing work.
+- The "Now" tiles (waiting, in flight, runs active, queued, and the 5 and
+  15 minute activity) read the latest minutes. Every other tile follows the
+  selected range and says so in its label. A minute with no proxy row counts
+  as zero, since the proxy writes rows only for minutes with traffic.
 
 ## Reading the numbers
 
 - A run is `active` when its last proxy activity is within 120 s. A queue run uses the
   jobs-table state instead (`running` is active).
-- `Runs seen today` and the token totals use the local day. A run that spans midnight
-  counts in full on the day it last ran.
+- Tokens, finished verdicts and 429s are summed over the selected range from
+  the billed minutes and queue jobs. Top consumers show lifetime tokens of the
+  runs active in the range: `proxy_jobs` keeps one total per job and model, not
+  per minute, so a run's tokens cannot be cut to the range.
 
 - Billed % is minute usage over the Morph limit: total pool 10M tokens,
   DeepSeek uncached input 400k, Kimi uncached 24,290. The main capacity chart
@@ -58,7 +71,7 @@ A source that fails shows as null or empty in the JSON and is named under
 
 ## Ranges and buckets
 
-- 24 h aggregates to 5-minute buckets and 7 d to 30-minute buckets: counts are summed, the p95 wait is the worst minute, the % of limit is the mean over the bucket's minutes, and worker samples are averaged.
+- 24 h aggregates to 5-minute buckets and 7 d to 30-minute buckets: counts are summed, the p95 wait is the worst minute, the % of limit is the mean over the bucket's minutes, worker samples are averaged, and the 429 chart plots the mean per minute (so "429s per minute" holds at every bucket size).
 - The token chart stacks cache read, uncached input and output per interval, with the running total as a line on the right axis.
 - The total pool % uses tokens admitted in each UTC minute (`proxy_calib.billed`) where that row exists, and falls back to completion-minute totals from `proxy_minutes` otherwise.
 - DeepSeek output is a plain count per minute (activity row). Its stated 70k per minute is not enforced by Morph, so it is not charted as a % of limit. Kimi uncached is an estimate computed by the proxy, not Morph's own tally.

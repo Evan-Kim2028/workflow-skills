@@ -1273,7 +1273,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         x0: win.start, x1: win.end, height: smallLayout.height, points: minutes
       }, cfg);
     };
-    var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
+    var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429_per_min); }, 0);
     var waitPoints = minutes.map(function (p) {
       return { t: p.t, wait: p.wait_p95_ms === null || p.wait_p95_ms === undefined ? null : p.wait_p95_ms / 1000 };
     });
@@ -1305,7 +1305,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     registerChart("c-429", smallChart("c-429", {
       title: "Upstream 429s per minute",
       kind: "bar",
-      series: [{ key: "r429", name: "429s", color: "var(--crit)" }],
+      series: [{ key: "r429_per_min", name: "429s per minute", color: "var(--crit)" }],
       y: labelled(niceTicks(Math.max(maxR, 1), 2), "429s per minute"),
       fmt: intFmt
     }));
@@ -1483,7 +1483,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var none = document.createElement("tr");
       var cell = document.createElement("td");
       cell.colSpan = 3;
-      cell.textContent = "No runs in " + RANGE_LABEL[d.hours];
+      cell.textContent = "No runs active " + RANGE_LABEL[d.hours];
       none.appendChild(cell);
       body.appendChild(none);
     }
@@ -1498,8 +1498,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       body.appendChild(tr);
     });
     var rk = d.run_kpis || {};
-    $("top-total").textContent = rk.tokens_in_range === undefined ? "" :
-      RANGE_LABEL[d.hours] + ": " + tokens(rk.tokens_in_range) + " tokens across " + count(rk.seen_in_range) + " runs";
+    $("top-total").textContent = rk.active_lifetime_tokens === undefined ? "" :
+      "Lifetime tokens of the " + count(rk.active_in_window) + " runs active " + RANGE_LABEL[d.hours] + ": " + tokens(rk.active_lifetime_tokens);
   }
 
   function renderRuns(d) {
@@ -1575,6 +1575,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   function refreshLog() {
     var seq = ++log.seq;
+    log.fetchedAt = Date.now();
     var url = "/api/log?source=" + encodeURIComponent(log.source) + "&page=" + log.page + "&q=" + encodeURIComponent(log.q);
     fetch(url, { cache: "no-store" })
       .then(function (res) { return res.json(); })
@@ -1889,6 +1890,7 @@ def minute_point(t: int, row: dict | None) -> dict:
         "output": int(row.get("output") or 0),
         "ok": int(row.get("ok") or 0),
         "r429": int(row.get("r429") or 0),
+        "r429_per_min": int(row.get("r429") or 0),
         "req": int(row.get("req") or 0),
         "wait_p50_weighted": int(row.get("wait_p50_weighted") or 0),
         "wait_p95_ms": row.get("wait_p95_ms"),
@@ -2160,6 +2162,7 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
         bucket["upstream_p95_ms"] = max(upstream_p95s) if upstream_p95s else None
         for key in PCT_KEYS:
             bucket[key] = round(sum(m[key] for m in members) / len(members), 4)
+        bucket["r429_per_min"] = round(bucket["r429"] / len(members), 2)
         averaged = [m["pct_total_avg5"] for m in members if m.get("pct_total_avg5") is not None]
         bucket["pct_total_avg5"] = round(sum(averaged) / len(averaged), 4) if averaged else None
         buckets.append(bucket)
@@ -2420,18 +2423,22 @@ def run_tier(run: dict) -> str | None:
 
 
 def run_kpis(runs: list[dict], since: int, caps: dict[str, int]) -> dict:
-    """Active runs against their caps now, and the runs and tokens seen since ``since`` (the selected range)."""
+    """Active runs against their caps now, and the runs active since ``since`` with their lifetime totals.
+
+    proxy_jobs keeps one total per job and model, not per minute, so a run's tokens cannot be cut to the
+    selected range. The active-run figures are therefore lifetime totals of runs with activity in the range.
+    """
     active_tiers = [run_tier(run) for run in runs if run["active"]]
-    in_range = [run for run in runs if run["last_ts"] >= since]
+    in_window = [run for run in runs if run["last_ts"] >= since]
     return {
         "active_deepseek": active_tiers.count("deepseek"),
         "active_kimi": active_tiers.count("kimi"),
         "cap_deepseek": caps["deepseek"],
         "cap_kimi": caps["kimi"],
-        "seen_in_range": len(in_range),
-        "tokens_in_range": sum(run["total_tokens"] for run in in_range),
-        "median_tokens_per_run": median_or_none([run["total_tokens"] for run in in_range]),
-        "median_requests_per_run": median_or_none([run["requests"] for run in in_range]),
+        "active_in_window": len(in_window),
+        "active_lifetime_tokens": sum(run["total_tokens"] for run in in_window),
+        "median_tokens_per_run": median_or_none([run["total_tokens"] for run in in_window]),
+        "median_requests_per_run": median_or_none([run["requests"] for run in in_window]),
     }
 
 
@@ -2530,17 +2537,17 @@ def token_axes(mix: list[dict], limit: dict) -> dict:
     }
 
 
-def top_consumers(runs: list[dict], since: int, tokens_in_range: int) -> list[dict]:
-    """The runs with the most tokens since ``since``, each with its share of the tokens of those runs."""
-    in_range = sorted((run for run in runs if run["last_ts"] >= since), key=lambda run: run["total_tokens"], reverse=True)
+def top_consumers(runs: list[dict], since: int, active_lifetime_tokens: int) -> list[dict]:
+    """The runs active since ``since`` with the most lifetime tokens, each with its share of those runs' total."""
+    in_window = sorted((run for run in runs if run["last_ts"] >= since), key=lambda run: run["total_tokens"], reverse=True)
     return [
         {
             "run": run["run"],
             "job": run["job"],
             "total_tokens": run["total_tokens"],
-            "share": run["total_tokens"] / tokens_in_range if tokens_in_range else None,
+            "share": run["total_tokens"] / active_lifetime_tokens if active_lifetime_tokens else None,
         }
-        for run in in_range[:TOP_CONSUMERS]
+        for run in in_window[:TOP_CONSUMERS]
     ]
 
 
@@ -3167,7 +3174,7 @@ def build_summary(
         "activity": activity,
         "laptop": laptop_now,
         "perf_kpis": perf_kpis(raw, since, until, runs, now, live),
-        "top_consumers": top_consumers(runs, since, kpis["tokens_in_range"]),
+        "top_consumers": top_consumers(runs, since, kpis["active_lifetime_tokens"]),
         "errors": errors,
     }
 
@@ -3184,23 +3191,40 @@ def table_runs(runs: list[dict]) -> list[dict]:
 
 
 def ensure_split_columns(connection: sqlite3.Connection) -> None:
-    """Add the per-tier queue columns to a samples table written before they existed."""
+    """Add the per-tier queue columns to a samples table written before they existed.
+
+    Call inside a write transaction. A column another writer added first is not an error.
+    """
     present = {row[1] for row in connection.execute("PRAGMA table_info(samples)").fetchall()}
     for column in SPLIT_COLUMNS:
-        if column not in present:
+        if column in present:
+            continue
+        try:
             connection.execute(f"ALTER TABLE samples ADD COLUMN {column} INT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc):
+                raise
 
 
 def write_sample(dash_db: Path, row: dict) -> None:
-    """Store one worker sample and prune samples older than SAMPLE_KEEP_S. Never touches agentq.db."""
+    """Store one worker sample and prune samples older than SAMPLE_KEEP_S. Never touches agentq.db.
+
+    The schema check, the column migration, the insert and the prune share one IMMEDIATE transaction, so
+    concurrent writers on an old-format file serialize instead of racing the ALTER.
+    """
     dash_db.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(dash_db, timeout=DB_TIMEOUT_S)
+    connection = sqlite3.connect(dash_db, timeout=DB_TIMEOUT_S, isolation_level=None)
     try:
-        connection.execute(SAMPLES_DDL)
-        ensure_split_columns(connection)
-        connection.execute(SAMPLE_INSERT_SQL, tuple(row[column] for column in SAMPLE_COLUMNS))
-        connection.execute("DELETE FROM samples WHERE ts < ?", (row["ts"] - SAMPLE_KEEP_S,))
-        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(SAMPLES_DDL)
+            ensure_split_columns(connection)
+            connection.execute(SAMPLE_INSERT_SQL, tuple(row[column] for column in SAMPLE_COLUMNS))
+            connection.execute("DELETE FROM samples WHERE ts < ?", (row["ts"] - SAMPLE_KEEP_S,))
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
     finally:
         connection.close()
 
