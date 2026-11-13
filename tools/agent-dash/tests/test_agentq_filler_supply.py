@@ -751,3 +751,59 @@ class IndexRetentionTests(Temp):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuotaTests(Temp):
+    """One priority-ordered due list feeds every filler source, and it returns exactly the count the controller asked for."""
+
+    def targets(self, n):
+        return [F.Target(repo="r", module=f"m{i:04d}", workspace=str(self.ws), report_dir=str(self.tmp / "rep"))
+                for i in range(n)]
+
+    def prs(self, n):
+        return [{"number": 1000 + i, "title": f"pr {i}", "url": f"u{i}", "mergedAt": "1970-01-02T00:00:00Z",
+                 "merge_commit": f"c{i}", "repo": "r", "slug": "o/r", "workspace": str(self.ws),
+                 "report_dir": str(self.tmp / "rep")} for i in range(n)]
+
+    def store(self):
+        conn = db.connect(self.home)
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_a_hundred_due_prs_and_six_thousand_pairs_still_give_exactly_the_count_asked(self):
+        conn = self.store()
+        works = F.due_works(conn, self.targets(1500), prs=self.prs(100), head_of=lambda t: "h1", count=4)
+        self.assertEqual(len(works), 4)
+        self.assertEqual([w.kind for w in works], ["pr"] * 4)
+        self.assertEqual([w.pr_number for w in works], [1000, 1001, 1002, 1003])
+
+    def test_with_no_pr_due_the_pairs_spread_across_targets_before_repeating_one(self):
+        conn = self.store()
+        works = F.due_works(conn, self.targets(3), prs=(), head_of=lambda t: "h1", count=4)
+        self.assertEqual(len(works), 4)
+        self.assertEqual(sorted({w.module for w in works}), ["m0000", "m0001", "m0002"])
+        self.assertEqual(len({(w.module, w.kind) for w in works}), 4)
+
+    def test_a_count_of_zero_submits_nothing(self):
+        self.assertEqual(F.due_works(self.store(), self.targets(5), prs=self.prs(5), head_of=lambda t: "h", count=0),
+                         [])
+
+    def test_a_pr_review_is_labelled_as_filler_so_it_counts_as_queued_filler(self):
+        work = F.pr_work(self.prs(1)[0])
+        self.assertTrue(F.is_filler_label("hub-exec-" + work.slug))
+        self.assertIn("-backlog-filler-pr-", "hub-exec-" + work.slug)
+
+    def test_queued_filler_of_any_kind_is_counted_through_its_record(self):
+        conn = self.store()
+        for job_id, label in (("pr-old", "hub-exec-pr-r-1"), ("pr-new", "hub-exec-backlog-filler-pr-r-2")):
+            db.insert_job(conn, {
+                "id": job_id, "lane": "backlog", "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
+                "label": label, "workspace": str(self.ws), "session": "backlog", "harness": "backlog",
+                "prompt_path": "/p",
+            }, NOW)
+            with db.tx(conn):
+                F.record_filler_job(conn, job_id, F.pr_work(self.prs(1)[0]))
+        from agentq import fill as FL
+        counts = FL.job_counts(conn, NOW)
+        self.assertEqual(counts["queued_filler"], 2)
+        self.assertEqual(F.queued_filler_ids(conn), {"pr-old", "pr-new"})

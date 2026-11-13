@@ -192,9 +192,14 @@ instead of letting it swing between idle and burst.
   retained window. Each finding is one
   bullet, ``- **high** `file:line` — title``, and a finding whose file:line and title are
   already in the index is skipped.
-- Each job is a single step: the next unreviewed PR first, then the next due pair. The
-  cursor rotates the targets, and an open job for a pair blocks it until it ends. Labels
-  come from `label make` as `hub-exec-backlog-filler-<kind>-<repo>-<module>`. Report
+- One submission path. The fill controller decides how many filler jobs to submit (its
+  step, refill or level). The generator fills that number, and only that number, from one
+  priority-ordered due list: unreviewed merged PRs first, then target and kind pairs, with
+  the targets rotating from the cursor. Every filler job, whatever its kind, counts as
+  queued filler (its label, or its record in `filler_jobs`) toward the controller's queue
+  and the `max_workers` room, so queued reviews hold the controller until they drain.
+  Labels come from `label make` as `hub-exec-backlog-filler-<kind>-<repo>-<module>`; PR
+  reviews use `hub-exec-backlog-filler-pr-<repo>-<number>`. Report
   paths and labels use a readable slug plus an 8-character hash of the full path
   (`pkg-a-<hash>`), so long paths that share a prefix never collide. Reports written
   under the earlier unhashed names stay where they are.

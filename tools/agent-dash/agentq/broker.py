@@ -812,6 +812,7 @@ class Broker:
         on = adaptive["enabled"]
         pace = self._pacing_gate(conn, now, cfg["pacing"], status)
         filler_paused = filler_lib.paused(conn)
+        paused_filler_ids = filler_lib.queued_filler_ids(conn) if filler_paused else set()
         running = db.select_jobs(conn, "state = 'running'")
         ready = [
             job for job in db.select_jobs(conn, "state = 'queued'") if job["not_before"] <= now
@@ -871,7 +872,7 @@ class Broker:
             if reason is None and on and job["res"] in LAPTOP_GATED:
                 reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), laptop_cfg,
                                      adaptive["tests_floor"])
-            if reason is None and filler_paused and is_filler(job):
+            if reason is None and filler_paused and (is_filler(job) or job["id"] in paused_filler_ids):
                 name, reason = "filler", plain_hold("filler paused")
             paced = reason is None and pace is not None and job["tier"] == fill_lib.DS_TIER
             if paced and pace["left"] <= 0 and not (job["lane"] == "urgent" and pace["urgent_free"]):
@@ -1072,44 +1073,39 @@ class Broker:
             self._saved_controller = state
         if decision.plan.submit <= 0 or now < self._filler_retry:
             return []
+        return self._submit_filler(conn, now, decision.plan.submit)
+
+    def _submit_filler(self, conn, now: float, count: int) -> list[str]:
+        """Queue exactly the filler jobs the controller asked for, from the one priority-ordered due list (PR reviews
+        first, then target and kind pairs). Returns the new job ids. Nothing else submits filler."""
+        settings, prs = self._work.snapshot()
+        works = filler_lib.due_works(
+            conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head, prs=prs, count=count,
+        )
         submitted = []
-        for _ in range(decision.plan.submit):
-            job_id = self._filler_job(conn, now)
-            if job_id is None:
+        for work in works:
+            label = self.labeler("read", work.slug)
+            if label is None:
+                self._filler_retry = now + BACKLOG_RETRY_S
+                self.log(f"filler {work.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
                 break
+            job_id = db.new_job_id()
+            prompt = db.job_dir(self.home, job_id) / "prompt.md"
+            prompt.parent.mkdir(parents=True, exist_ok=True)
+            prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_for(work)), encoding="utf-8")
+            job = {
+                "id": job_id, "lane": "backlog", "kind": "read", "res": "light",
+                "tier": db.default_tier("read"), "label": label, "workspace": work.workspace,
+                "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
+                "max_runtime_s": settings.max_runtime,
+            }  # fmt: skip
+            with db.tx(conn):
+                db.insert_job(conn, job, now)
+                filler_lib.record_work(conn, work, job_id, now)
+                filler_lib.record_filler_job(conn, job_id, work)
+            self.log(f"filler {work.key} submitted {job_id} ({label})")
             submitted.append(job_id)
         return submitted
-
-    def _filler_job(self, conn, now: float) -> str | None:
-        """Queue the next filler job: an unreviewed merged PR, else a due target and kind. Returns the job id, or
-        None when nothing is due or the label is refused."""
-        settings, prs = self._work.snapshot()
-        work = filler_lib.next_work(
-            conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head, prs=prs,
-        )
-        if work is None:
-            return None
-        label = self.labeler("read", work.slug)
-        if label is None:
-            self._filler_retry = now + BACKLOG_RETRY_S
-            self.log(f"filler {work.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
-            return None
-        job_id = db.new_job_id()
-        prompt = db.job_dir(self.home, job_id) / "prompt.md"
-        prompt.parent.mkdir(parents=True, exist_ok=True)
-        prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_for(work)), encoding="utf-8")
-        job = {
-            "id": job_id, "lane": "backlog", "kind": "read", "res": "light",
-            "tier": db.default_tier("read"), "label": label, "workspace": work.workspace,
-            "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
-            "max_runtime_s": settings.max_runtime,
-        }  # fmt: skip
-        with db.tx(conn):
-            db.insert_job(conn, job, now)
-            filler_lib.record_work(conn, work, job_id, now)
-            filler_lib.record_filler_job(conn, job_id, work)
-        self.log(f"filler {work.key} submitted {job_id} ({label})")
-        return job_id
 
     def _proxy_status(self) -> dict | None:
         """The proxy status for this tick (None when down). Logs each change of its saturated flag."""
@@ -1240,7 +1236,7 @@ class Broker:
         dest = db.job_dir(self.home, job["id"]) / "report.md"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
-        if is_filler(job):
+        if job["session"] == backlog_lib.SESSION:
             filler_lib.index_job(conn, job["id"], now, text=text)
         verdict = verdict_of(text)
         note = "; ".join(part for part in (note, worktree_note(job)) if part)
