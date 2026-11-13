@@ -27,6 +27,11 @@
 	<integer>15</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/bash</string>

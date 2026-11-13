@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dash import dataroot, errors, worktrees
@@ -226,15 +227,30 @@ def plan_artifacts(
         elif name in IGNORED_ONLY_DIRS and not git_ignores(path, name):
             row["reason"] = "not listed in .gitignore"
         else:
-            size = dir_size_bytes(target)
-            if size is None:
-                row["reason"] = "du could not measure it"
-            else:
-                row["bytes"] = size
-                row["decision"] = "delete"
-                row["reason"] = "untouched for " + _human_duration(age)
+            row["decision"] = "delete"
+            row["reason"] = "untouched for " + _human_duration(age)
         rows.append(row)
     return rows, ""
+
+
+def measure_rows(rows: list[dict], workers: int = 4) -> None:
+    """Fill ``bytes`` on delete rows with parallel ``du`` calls.
+
+    A folder ``du`` cannot measure is downgraded to keep, so nothing is
+    deleted without a size first. ``du`` is I/O bound, so a few workers
+    cut a sweep of hundreds of dependency checkouts to minutes.
+    """
+    pending = [row for row in rows if row.get("decision") == "delete"]
+    if not pending:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        sizes = list(pool.map(lambda row: dir_size_bytes(row["target"]), pending))
+    for row, size in zip(pending, sizes):
+        if size is None:
+            row["decision"] = "keep"
+            row["reason"] = "du could not measure it"
+        else:
+            row["bytes"] = size
 
 
 def remove_tree(path: str | Path) -> bool:
@@ -531,19 +547,20 @@ def cmd_janitor(argv: list[str]) -> int:
         planned, note = plan_artifacts(path, effective_age_s, now, deadline, skips)
         if note:
             continue
-        for row in planned:
-            if row["decision"] == "delete" and apply:
-                if remove_tree(row["target"]):
-                    row["reason"] = row["reason"] + "; deleted"
-                else:
-                    row["decision"] = "keep"
-                    row["reason"] = "delete failed"
-            artifact_rows.append(row)
-            if row["decision"] == "delete":
-                verb = "would delete" if dry_run else "deleted"
-                lines.append("%s %s %s (%s)" % (verb, row["target"], _human_bytes(row["bytes"]), row["reason"]))
-            elif apply or json_mode:
-                lines.append("kept %s (%s)" % (row["target"], row["reason"]))
+        artifact_rows.extend(planned)
+    measure_rows(artifact_rows)
+    for row in artifact_rows:
+        if row["decision"] == "delete" and apply:
+            if remove_tree(row["target"]):
+                row["reason"] = row["reason"] + "; deleted"
+            else:
+                row["decision"] = "keep"
+                row["reason"] = "delete failed"
+        if row["decision"] == "delete":
+            verb = "would delete" if dry_run else "deleted"
+            lines.append("%s %s %s (%s)" % (verb, row["target"], _human_bytes(row["bytes"]), row["reason"]))
+        elif apply or json_mode:
+            lines.append("kept %s (%s)" % (row["target"], row["reason"]))
 
     reaped_count = sum(1 for row in rows if row.get("decision") == "reap")
     reaped_bytes = sum(int(row.get("bytes") or 0) for row in reaped)
