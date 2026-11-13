@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Worktree disk janitor, every 2 hours. After the worktree sweep it runs `scratch gc --older-than-days 1 --apply`, which removes worker scratch folders whose runs finished and whose newest file is over a day old (live, running, in-use and unowned folders are kept).
+  Worktree disk janitor, every 2 hours. After the worktree sweep it runs `scratch gc --older-than-days 0.21 --apply`, which removes worker scratch folders whose runs finished and whose newest file is over 5 hours old (live, running, in-use and unowned folders are kept).
 
   Template: __HOME__, __PYTHON__ and __REPOS__ are replaced at install
   time (the live copy is ~/Library/LaunchAgents/com.agentq.wtreap.plist;
@@ -42,7 +42,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --daily-maintenance; done; echo "== $(date -u +%FT%TZ) scratch gc"; __PYTHON__ agent_dash.py scratch gc --older-than-days 1 --apply</string>
+		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --daily-maintenance; done; echo "== $(date -u +%FT%TZ) scratch gc"; __PYTHON__ agent_dash.py scratch gc --older-than-days 0.21 --apply</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
