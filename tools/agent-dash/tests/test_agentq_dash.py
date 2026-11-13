@@ -1088,29 +1088,72 @@ class YAxisLabelTest(unittest.TestCase):
         self.assertEqual(html.count("margin: PAIR_LAYOUT.margin"), 3)
 
 
-class TrailingAverageTest(unittest.TestCase):
-    def test_five_minute_trailing_mean_with_gaps_before_the_first_full_window(self) -> None:
-        points = [{"pct_total": v} for v in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)]
-        dash.add_trailing_average(points, "pct_total", "pct_total_avg5", 5)
-        self.assertEqual([p["pct_total_avg5"] for p in points[:4]], [None, None, None, None])
-        self.assertEqual([p["pct_total_avg5"] for p in points[4:]], [0.3, 0.4, 0.5])
+class RangeAverageLineTest(unittest.TestCase):
+    """The dotted average is the mean of the chart's own minute points over the selected range, idle minutes as zero."""
 
-    def test_bucketed_points_average_the_minute_averages_they_contain(self) -> None:
-        minutes = [dash.minute_point(60 * i, {"total": (i + 1) * 1_000_000}) for i in range(10)]
-        dash.add_trailing_average(minutes, "pct_total", "pct_total_avg5", 5)
-        buckets = dash.bucket_minutes(minutes, 300)
-        self.assertEqual([b["pct_total_avg5"] for b in buckets], [0.3, 0.6])
+    AGES = (30 * 60, 2 * 3600, 10 * 3600, 3 * 24 * 3600)
+    TOTALS = (2_000_000, 4_000_000, 6_000_000, 8_000_000)
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        home = Path(self.tmp.name) / "agentq"
+        home.mkdir()
+        conn = sqlite3.connect(home / "agentq.db")
+        conn.execute(PROXY_MINUTES_DDL)
+        conn.executemany(
+            f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(minute_at(age), "morph-dsv41flash-1017", 1, 1, 0, total, 0, 0, 0, 0, 0, 0.9)
+             for age, total in zip(self.AGES, self.TOTALS)],
+        )
+        conn.commit()
+        conn.close()
+        self.home = home
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def expected(self, hours: int) -> float:
+        """Independent of the code under test: the sum of the in-range totals over the minutes from the first recorded one."""
+        in_range = [(age, total) for age, total in zip(self.AGES, self.TOTALS) if age <= hours * 3600]
+        minutes = max(age for age, _ in in_range) // 60
+        return round(sum(total for _, total in in_range) / 10_000_000 / minutes, 4)
+
+    def test_average_line_is_the_range_mean_of_the_minute_points_for_each_range(self) -> None:
+        for hours in (1, 6, 24, 168):
+            with self.subTest(hours=hours):
+                summary = dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)
+                self.assertEqual(summary["range_avg_pct_total"], self.expected(hours))
+
+    def test_each_range_gives_a_different_average(self) -> None:
+        values = [dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)["range_avg_pct_total"] for hours in (1, 6, 24, 168)]
+        self.assertEqual(len(set(values)), 4, values)
+
+    def test_total_pool_tile_uses_the_same_average_as_the_chart(self) -> None:
+        for hours in (1, 6):
+            summary = dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)
+            self.assertEqual(summary["limits"]["total"]["range_avg_frac"], summary["range_avg_pct_total"])
+
+    def test_idle_minutes_inside_the_range_count_as_zero(self) -> None:
+        points = [{"t": 0, "pct_total": 0.6}, {"t": 180, "pct_total": 0.3}]
+        self.assertEqual(dash.range_average_pct(points, 240), round((0.6 + 0 + 0 + 0.3) / 4, 4))
+
+    def test_no_minute_points_means_no_average_line(self) -> None:
+        self.assertIsNone(dash.range_average_pct([], 600))
 
 
 class EnforcedLimitsChartTest(unittest.TestCase):
-    def test_main_billed_chart_has_the_per_minute_line_and_its_five_minute_average(self) -> None:
+    def test_main_billed_chart_has_the_per_minute_line_and_a_dotted_range_average(self) -> None:
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-billed"')
         block = html[start:html.index('registerChart("c-workers"')]
-        self.assertEqual(block.count('key: "pct_'), 2)
+        self.assertEqual(block.count('key: "pct_'), 1)
+        self.assertNotIn("pct_total_avg5", html)
+        self.assertNotIn("5-min average", html)
         self.assertIn('{ key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }', block)
-        self.assertIn('{ key: "pct_total_avg5", name: "5-min average", color: COLORS.s2, width: 2.5 }', block)
-        self.assertIn("Morph limit (10M/min)", block)
+        self.assertIn('color: COLORS.s3, dash: "1 4", width: 2, end: true', block)
+        self.assertIn('"Average, " + RANGE_LABEL[d.hours]', html)
+        self.assertIn('"avg " + RANGE_LABEL[d.hours] + ": "', block)
+        self.assertIn('Morph limit (10M/min)', block)
         self.assertNotIn("pct_ds_uncached", block)
         self.assertNotIn("70k", block)
 
@@ -1884,6 +1927,7 @@ class SummaryCacheTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.cache.stop()
+        self.cache.wait_for_computes()
         self.tmp.cleanup()
 
     def counting_build(self):
@@ -1898,31 +1942,37 @@ class SummaryCacheTest(unittest.TestCase):
         self.assertEqual(generated, generated_again)
         self.assertEqual(json.loads(first)["generated_at"], generated)
         self.assertEqual(json.loads(first)["source_age_s"], {"live": None, "laptop": None})
+        self.assertEqual(json.loads(first)["cadence_s"], dash.RANGE_CADENCE_S[1])
 
     def test_worker_recomputes_each_range_on_its_cadence_while_active(self) -> None:
         with self.counting_build() as build:
             self.cache.touch()
             self.cache.tick()
+            self.cache.wait_for_computes()
             self.assertEqual(build.call_count, 4)
             self.now += 4
             self.cache.tick()
+            self.cache.wait_for_computes()
             self.assertEqual(build.call_count, 4)
             self.now += 1
             self.cache.tick()
+            self.cache.wait_for_computes()
             self.assertEqual(build.call_count, 6)
             self.now += 10
             self.cache.touch()
             self.cache.tick()
+            self.cache.wait_for_computes()
             self.assertEqual(build.call_count, 9)
 
     def test_worker_is_idle_once_nobody_has_asked_for_IDLE_AFTER_S(self) -> None:
         with self.counting_build() as build:
             self.cache.touch()
             self.cache.tick()
+            self.cache.wait_for_computes()
             before = build.call_count
             self.now += dash.IDLE_AFTER_S + 1
             self.cache.tick()
-            self.cache.tick()
+            self.cache.wait_for_computes()
             self.assertEqual(build.call_count, before)
             self.assertFalse(self.cache.active())
 
@@ -1930,6 +1980,7 @@ class SummaryCacheTest(unittest.TestCase):
         with self.counting_build() as build:
             self.cache.touch()
             self.cache.tick()
+            self.cache.wait_for_computes()
             self.now += 10 * 3600
             body, generated = self.cache.get(1)
         self.assertEqual(build.call_count, 4)
@@ -1943,6 +1994,323 @@ class SummaryCacheTest(unittest.TestCase):
         self.now += 7
         self.assertEqual(reader.latest(), {"ok": True})
         self.assertEqual(reader.age(self.now), 7.0)
+
+    def test_a_partial_body_never_replaces_a_full_one(self) -> None:
+        full = dash.Stored(b"full", 100.0, False, 1)
+        self.cache.bodies[6] = full
+        self.assertIs(self.cache._store(6, dash.Stored(b"partial", 200.0, True, 2)), full)
+        self.assertEqual(self.cache.bodies[6], full)
+
+    def test_a_newer_partial_replaces_an_older_partial(self) -> None:
+        self.cache.bodies[6] = dash.Stored(b"old", 100.0, True, 1)
+        newer = dash.Stored(b"new", 200.0, True, 2)
+        self.assertIs(self.cache._store(6, newer), newer)
+
+    def test_a_newer_full_replaces_any_body(self) -> None:
+        self.cache.bodies[6] = dash.Stored(b"partial", 200.0, True, 2)
+        newer_full = dash.Stored(b"full", 300.0, False, 3)
+        self.assertIs(self.cache._store(6, newer_full), newer_full)
+
+    def test_an_older_full_never_replaces_a_newer_full(self) -> None:
+        """The review case: a full compute that started first but finished late, over a newer body."""
+        self.cache.bodies[6] = dash.Stored(b"newer", 200.0, False, 5)
+        older_full = dash.Stored(b"older", 100.0, False, 4)
+        self.assertIs(self.cache._store(6, older_full), self.cache.bodies[6])
+        self.assertEqual(self.cache.bodies[6].body, b"newer")
+
+    def test_an_older_full_never_replaces_a_newer_partial(self) -> None:
+        self.cache.bodies[6] = dash.Stored(b"partial", 200.0, True, 5)
+        self.cache._store(6, dash.Stored(b"full", 100.0, False, 4))
+        self.assertTrue(self.cache.bodies[6].partial)
+        self.assertEqual(self.cache.bodies[6].body, b"partial")
+
+    def test_the_generation_is_taken_when_each_compute_starts(self) -> None:
+        self.cache._start_compute(6)
+        self.cache.wait_for_computes()
+        first = self.cache.bodies[6].generation
+        self.cache._start_compute(6)
+        self.cache.wait_for_computes()
+        self.assertGreater(self.cache.bodies[6].generation, first)
+
+
+class BlockedReaderTest(unittest.TestCase):
+    """A proxy status that never answers, or a locked agentq.db, must not hold up a request."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+
+    def tearDown(self) -> None:
+        self.release.set()
+        self.cache.stop()
+        self.cache.wait_for_computes()
+        self.tmp.cleanup()
+
+    def test_request_returns_under_a_second_while_the_proxy_status_read_is_blocked(self) -> None:
+        self.release = threading.Event()
+
+        def never_answers():
+            self.release.wait(60)
+            raise OSError("released")
+
+        self.cache = dash.SummaryCache(self.home, fetch_live=never_answers)
+        self.cache.start()
+        started = time.monotonic()
+        body, _ = self.cache.get(6)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, elapsed)
+        self.assertIsNone(json.loads(body)["live"])
+
+    def test_request_gets_a_db_only_partial_while_agentq_db_is_locked(self) -> None:
+        self.release = threading.Event()
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy)
+        lock = sqlite3.connect(self.home / "agentq.db", isolation_level=None, timeout=5)
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            started = time.monotonic()
+            body, _ = self.cache.get(6)
+            elapsed = time.monotonic() - started
+        finally:
+            lock.execute("ROLLBACK")
+            lock.close()
+        self.assertLess(elapsed, 1.5, elapsed)
+        summary = json.loads(body)
+        self.assertTrue(summary["partial"])
+        self.assertTrue(any("time budget" in message for message in summary["errors"].values()), summary["errors"])
+        self.assertEqual(summary["hours"], 6)
+
+    def test_a_partial_summary_is_replaced_by_the_full_compute(self) -> None:
+        self.release = threading.Event()
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy)
+        lock = sqlite3.connect(self.home / "agentq.db", isolation_level=None, timeout=5)
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            partial, _ = self.cache.get(6)
+        finally:
+            lock.execute("ROLLBACK")
+            lock.close()
+        self.assertTrue(json.loads(partial)["partial"])
+        self.cache._start_compute(6)
+        self.cache.wait_for_computes()
+        self.assertFalse(json.loads(self.cache.get(6)[0])["partial"])
+
+
+class WatchdogTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        self.now = 1000.0
+        self.release = threading.Event()
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: self.now)
+
+    def tearDown(self) -> None:
+        self.release.set()
+        self.cache.stop()
+        self.cache.wait_for_computes()
+        self.tmp.cleanup()
+
+    def test_a_range_older_than_three_cadences_is_recomputed_on_a_fresh_worker_and_logged_once(self) -> None:
+        real_build = dash.build_summary
+        calls = []
+
+        def stuck_then_fine(home, hours, *args, **kwargs):
+            if hours != 6:
+                return real_build(home, hours, *args, **kwargs)
+            calls.append(threading.current_thread().name)
+            if len(calls) == 1:
+                self.release.wait(30)
+            return real_build(home, hours, *args, **kwargs)
+
+        with mock.patch.object(dash, "build_summary", side_effect=stuck_then_fine), \
+                mock.patch.object(dash.sys, "stderr", new=io.StringIO()) as err:
+            self.cache.touch()
+            self.cache._start_compute(6)
+            time.sleep(0.05)
+            self.cache.bodies[6] = dash.Stored(b"{}", self.now - 3 * dash.RANGE_CADENCE_S[6] - 1, False, 0)
+            self.now += 1
+            self.cache.tick()
+            self.cache.tick()
+            self.cache.wait_for_computes(10)
+            fresh_generated = self.cache.bodies[6].generated_at
+        self.assertEqual(len(calls), 2, calls)
+        self.assertGreater(fresh_generated, self.now - 1)
+        self.assertEqual(err.getvalue().count("recomputing on a fresh worker"), 1, err.getvalue())
+
+    def test_a_fresh_range_is_not_forced(self) -> None:
+        with mock.patch.object(dash, "build_summary", wraps=dash.build_summary) as build, \
+                mock.patch.object(dash.sys, "stderr", new=io.StringIO()) as err:
+            self.cache.touch()
+            self.cache.tick()
+            self.cache.wait_for_computes()
+            first = build.call_count
+            self.cache.tick()
+            self.cache.wait_for_computes()
+        self.assertEqual(build.call_count, first)
+        self.assertNotIn("recomputing", err.getvalue())
+
+
+class ComputeCapTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+
+    def tearDown(self) -> None:
+        self.cache.stop()
+        self.cache.wait_for_computes()
+        self.tmp.cleanup()
+
+    def test_a_persistently_locked_store_keeps_live_computes_within_the_cap_for_sixty_seconds(self) -> None:
+        real_build = dash.build_summary
+
+        def slow_build(*args, **kwargs):
+            time.sleep(0.25)
+            return real_build(*args, **kwargs)
+
+        clock = {"now": 1000.0}
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: clock["now"])
+        lock = sqlite3.connect(self.home / "agentq.db", isolation_level=None, timeout=5)
+        lock.execute("BEGIN EXCLUSIVE")
+        peak = 0
+        peak_per_range = 0
+        try:
+            with mock.patch.object(dash, "build_summary", side_effect=slow_build), \
+                    mock.patch.object(dash.sys, "stderr", new=io.StringIO()):
+                self.cache.touch()
+                for _ in range(60):
+                    self.cache.touch()
+                    self.cache.tick()
+                    peak = max(peak, self.cache.live_computes())
+                    with self.cache.lock:
+                        peak_per_range = max([peak_per_range] + [len(c) for c in self.cache.inflight.values()])
+                    clock["now"] += 1.0
+                    time.sleep(0.02)
+                self.cache.wait_for_computes(30)
+        finally:
+            lock.execute("ROLLBACK")
+            lock.close()
+        self.assertLessEqual(peak, dash.MAX_LIVE_COMPUTES)
+        self.assertLessEqual(peak_per_range, 2)
+        self.assertGreater(peak, 0)
+
+    def test_a_forced_start_never_bypasses_the_cap(self) -> None:
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: 1000.0)
+        gate = threading.Event()
+        with mock.patch.object(dash, "build_summary", side_effect=lambda *a, **k: (gate.wait(10), None)[1]):
+            started = [self.cache._start_compute(h) for h in dash.RANGE_HOURS]
+            forced = [self.cache._start_compute(h, force=True) for h in dash.RANGE_HOURS]
+            gate.set()
+            self.cache.wait_for_computes(10)
+        self.assertLessEqual(sum(started) + sum(forced), dash.MAX_LIVE_COMPUTES)
+        self.assertFalse(all(forced))
+
+    def test_one_ordinary_and_one_forced_compute_per_range_at_a_time(self) -> None:
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: 1000.0)
+        gate = threading.Event()
+        with mock.patch.object(dash, "build_summary", side_effect=lambda *a, **k: (gate.wait(10), None)[1]):
+            self.assertTrue(self.cache._start_compute(1))
+            self.assertFalse(self.cache._start_compute(1))
+            self.assertTrue(self.cache._start_compute(1, force=True))
+            self.assertFalse(self.cache._start_compute(1, force=True))
+            gate.set()
+            self.cache.wait_for_computes(10)
+        self.assertEqual(self.cache.live_computes(), 0)
+
+
+class SamplerGapTest(unittest.TestCase):
+    def test_unreadable_jobs_table_reports_queue_and_direct_as_unknown_not_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            row = dash.sample_once(home, ps_runner=lambda: "  101 /x/launch_pi.py --model morph-dsv41flash-1017\n", now=NOW)
+            stored = sqlite3.connect(home / "dash.db").execute("SELECT ds_workers, queue_workers, direct_workers FROM samples").fetchall()
+        self.assertEqual((row["ds_workers"], row["queue_workers"], row["direct_workers"]), (1, None, None))
+        self.assertEqual(stored, [(1, None, None)])
+
+    def test_readable_jobs_table_still_splits_queue_from_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            row = dash.sample_once(home, ps_runner=lambda: "  101 /x/launch_pi.py --model morph-dsv41flash-1017\n  102 /x/launch_pi.py --tier pi-kimi\n", now=NOW)
+        self.assertEqual((row["queue_workers"], row["direct_workers"]), (1, 1))
+
+
+class RunPsTest(unittest.TestCase):
+    def test_ps_is_called_without_environments_and_with_a_short_timeout(self) -> None:
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["timeout"] = kwargs.get("timeout")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with mock.patch.object(dash.subprocess, "run", side_effect=fake_run):
+            dash.run_ps()
+        self.assertEqual(captured["args"], ["ps", "-axo", "pid=,command="])
+        self.assertLessEqual(captured["timeout"], 5.0)
+
+    def test_queue_workers_come_from_running_queue_jobs_not_the_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            ps_without_env = "  101 /x/launch_pi.py --model morph-dsv41flash-1017\n  102 /x/launch_pi.py --tier pi-kimi\n"
+            row = dash.sample_once(home, ps_runner=lambda: ps_without_env, now=NOW)
+        self.assertEqual(row["queue_workers"], 1)
+        self.assertEqual(row["direct_workers"], 1)
+
+
+class EasternTimeTest(unittest.TestCase):
+    def test_page_formats_every_time_in_america_new_york_not_the_browser_zone(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('timeZone: "America/New_York"', html)
+        self.assertNotIn("getHours()", html)
+        self.assertNotIn("getMinutes()", html)
+        self.assertIn('"updated " + hms(data.generated_at)', html)
+        self.assertIn('"Start (ET)"', html)
+        self.assertIn("Time (UTC)", html)
+
+    def test_eastern_labels_match_the_zoneinfo_reference(self) -> None:
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+
+        html = dash.PAGE_HTML
+        snippet = html[html.index("  function pad(n)"):html.index("  function pct(")]
+        probes = [1794542644, 1794506750, 1794524400]
+        script = snippet + "\n" + "\n".join(
+            f"console.log(hm({sec}) + '|' + hms({sec}) + '|' + dateHM({sec}));" for sec in probes
+        )
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30, check=True)
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(len(lines), len(probes))
+        for sec, line in zip(probes, lines):
+            moment = datetime.fromtimestamp(sec, ZoneInfo("America/New_York"))
+            expected = "|".join([
+                moment.strftime("%H:%M") + " ET",
+                moment.strftime("%H:%M:%S") + " ET",
+                moment.strftime("%m-%d %H:%M") + " ET",
+            ])
+            self.assertEqual(line, expected)
+
+    def test_stale_data_shows_amber_past_twice_its_cadence(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("if (age > 2 * (data.cadence_s || 60))", html)
+        self.assertIn('aged.textContent = " · data " + Math.round(age) + " s old";', html)
+        self.assertIn(".status .aged", html)
+
+
+class FaulthandlerTest(unittest.TestCase):
+    def test_main_registers_a_stack_dump_on_sigusr1(self) -> None:
+        import signal as signal_module
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(dash.faulthandler, "register") as register, \
+                mock.patch.object(dash, "make_server") as make_server, \
+                mock.patch.object(dash, "Sampler") as sampler:
+            make_server.return_value.serve_forever.side_effect = KeyboardInterrupt
+            make_server.return_value.server_address = ("127.0.0.1", 1)
+            dash.main(["--port", "0", "--home", tmp])
+            sampler.return_value.start.assert_called_once()
+        register.assert_called_once()
+        self.assertEqual(register.call_args.args[0], signal_module.SIGUSR1)
+        self.assertTrue(register.call_args.kwargs.get("all_threads"))
 
 
 class ClientGoneTest(unittest.TestCase):

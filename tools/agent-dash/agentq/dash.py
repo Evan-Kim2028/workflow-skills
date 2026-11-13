@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import faulthandler
 import json
 import math
 import os
 import re
+import signal
 import sqlite3
 import statistics
 import subprocess
@@ -23,6 +26,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_PORT = 18791
@@ -85,10 +89,13 @@ RANGE_CADENCE_S = {1: 5.0, 6: 5.0, 24: 15.0, 168: 60.0}
 READER_CADENCE_S = 5.0
 IDLE_AFTER_S = 120.0
 WORKER_TICK_S = 1.0
-FIRST_READ_WAIT_S = LIVE_TIMEOUT_S + 1.0
+REQUEST_BUDGET_S = 0.8
+BACKGROUND_BUDGET_S = 30.0
+WATCHDOG_FACTOR = 3.0
+MAX_LIVE_COMPUTES = 4
 GONE_LOG_S = 60.0
 DB_TIMEOUT_S = 2.0
-PS_TIMEOUT_S = 10.0
+PS_TIMEOUT_S = 5.0
 ERROR_CHARS = 200
 LIMITS = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
 LIMIT_KEYS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
@@ -286,6 +293,7 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .range button[aria-pressed="true"], .seg button[aria-pressed="true"] { color: var(--ink); font-weight: 600; background: var(--page); }
 .status { font-size: 12px; color: var(--ink-2); }
 .status .stale { color: var(--crit); font-weight: 600; }
+.status .aged { color: #c77700; font-weight: 600; }
 
 .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; margin-bottom: 12px; }
 .panel { background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 10px 12px 8px; min-width: 0; }
@@ -435,7 +443,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute; the bold line is the trailing 5-minute average of those minutes (the mean of that minute and the four before it). The dashed line is the limit; carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The dotted line is the average of those minutes over the selected range, from the first recorded minute, with idle minutes counted as zero; it is the same figure as the total pool tile. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -572,7 +580,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Time</th><th>Event</th><th>Fields</th></tr></thead>
+        <thead><tr><th>Time (UTC)</th><th>Event</th><th>Fields</th></tr></thead>
         <tbody id="log-body"></tbody>
       </table>
     </div>
@@ -603,14 +611,18 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   function $(id) { return document.getElementById(id); }
   function setText(id, value) { $(id).textContent = value; }
   function pad(n) { return n < 10 ? "0" + n : String(n); }
-  function hm(sec) {
-    var d = new Date(sec * 1000);
-    return pad(d.getHours()) + ":" + pad(d.getMinutes());
+  var ET_FORMAT = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", hourCycle: "h23", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  });
+  function etParts(sec) {
+    var parts = {};
+    ET_FORMAT.formatToParts(new Date(sec * 1000)).forEach(function (p) { parts[p.type] = p.value; });
+    return parts;
   }
-  function dateHM(sec) {
-    var d = new Date(sec * 1000);
-    return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hm(sec);
-  }
+  function hm(sec) { var p = etParts(sec); return p.hour + ":" + p.minute + " ET"; }
+  function hms(sec) { var p = etParts(sec); return p.hour + ":" + p.minute + ":" + p.second + " ET"; }
+  function dateHM(sec) { var p = etParts(sec); return p.month + "-" + p.day + " " + p.hour + ":" + p.minute + " ET"; }
   function fullTime(sec) {
     if (sec === null || sec === undefined) return "—";
     return dateHM(sec);
@@ -714,6 +726,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       if (s.block) sw.style.background = s.color;
       else sw.style.borderColor = s.color;
       if (s.dashed) sw.style.borderStyle = "dashed";
+      if (s.dotted) sw.style.borderStyle = "dotted";
       key.appendChild(sw);
       key.appendChild(document.createTextNode(s.name));
       el.appendChild(key);
@@ -840,7 +853,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
     var refs = (cfg.refs || []).slice();
     refs.forEach(function (r) {
-      svgEl("line", { x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: "var(--ink-3)", "stroke-width": 1, "stroke-dasharray": "5 4" }, svg);
+      svgEl("line", {
+        x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: r.color || "var(--ink-3)", "stroke-width": r.width || 1,
+        "stroke-dasharray": r.dash || "5 4", "stroke-linecap": r.dash ? "round" : "butt"
+      }, svg);
+      if (r.end) {
+        svgEl("text", {
+          x: W - m.r - 4, y: Y(r.v) - 6, "text-anchor": "end", class: "direct",
+          style: "fill: " + (r.color || "var(--ink-3)") + "; stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
+        }, svg).textContent = r.label;
+      }
     });
     (cfg.offScale || []).forEach(function (text, i) {
       svgEl("text", {
@@ -848,7 +870,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         style: "fill: var(--ink-3); stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
       }, svg).textContent = text;
     });
-    var refPlaced = refs.map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
+    var refPlaced = refs.filter(function (r) { return !r.end; }).map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
       .sort(function (a, b) { return a.y - b.y; });
     refPlaced.forEach(function (r, i) {
       if (i && r.y - refPlaced[i - 1].y < 13) r.y = refPlaced[i - 1].y + 13;
@@ -1215,11 +1237,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: minutes,
       series: [
-        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 },
-        { key: "pct_total_avg5", name: "5-min average", color: COLORS.s2, width: 2.5 }
+        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }
       ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
-      refs: [{ v: 1, label: "Morph limit (10M/min)" }],
+      refs: [{ v: 1, label: "Morph limit (10M/min)" }].concat(
+        d.range_avg_pct_total === null || d.range_avg_pct_total === undefined ? [] : [{
+          v: d.range_avg_pct_total,
+          label: "avg " + RANGE_LABEL[d.hours] + ": " + Math.round(d.range_avg_pct_total * 100) + "%",
+          color: COLORS.s3, dash: "1 4", width: 2, end: true
+        }]
+      ),
       fmt: pctFmt
     });
     registerChart("c-workers", {
@@ -1255,7 +1282,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
       { name: "Per minute", color: COLORS.s1 },
-      { name: "5-min average", color: COLORS.s2 }
+      { name: "Average, " + RANGE_LABEL[d.hours], color: COLORS.s3, dotted: true }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -1369,7 +1396,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     { label: "Finished", value: function (r) { return r.finished_at; }, cell: function (r) { return fullTime(r.finished_at); } }
   ];
   var MINUTE_COLUMNS = [
-    { label: "Start (UTC)", text: true, value: function (r) { return r.t; }, cell: function (r) { return r.minute; } },
+    { label: "Start (ET)", text: true, value: function (r) { return r.t; }, cell: function (r) { return hm(r.t); } },
     { label: "Total pool %", num: true, value: function (r) { return r.pct_total; }, cell: function (r) { return pct(r.pct_total); } },
     { label: "DeepSeek output %", num: true, value: function (r) { return r.pct_ds_output; }, cell: function (r) { return pct(r.pct_ds_output); } },
     { label: "Kimi uncached %", num: true, value: function (r) { return r.pct_kimi_uncached; }, cell: function (r) { return pct(r.pct_kimi_uncached); } },
@@ -1619,12 +1646,21 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       status.appendChild(warn);
       status.appendChild(document.createTextNode(" · " + state.stale + " · "));
     }
-    var text = state.data && state.data.generated_at
-      ? "updated " + Math.max(0, Math.floor(Date.now() / 1000 - state.data.generated_at)) + "s ago"
-      : "loading";
-    var errs = state.data && state.data.errors ? Object.keys(state.data.errors) : [];
+    var data = state.data;
+    var text = data && data.generated_at ? "updated " + hms(data.generated_at) : "loading";
+    var errs = data && data.errors ? Object.keys(data.errors) : [];
+    if (data && data.partial) text += " · partial summary, full one on the way";
     if (errs.length) text += " · partial: " + errs.join(", ");
     status.appendChild(document.createTextNode(text));
+    if (data && data.generated_at) {
+      var age = Date.now() / 1000 - data.generated_at;
+      if (age > 2 * (data.cadence_s || 60)) {
+        var aged = document.createElement("span");
+        aged.className = "aged";
+        aged.textContent = " · data " + Math.round(age) + " s old";
+        status.appendChild(aged);
+      }
+    }
   }
 
   function refresh() {
@@ -1799,9 +1835,13 @@ def parse_workers(ps_text: str) -> dict[str, int]:
 
 
 def run_ps() -> str:
-    """The process table with environments. Raises when ps fails, so no sample is recorded."""
+    """The process table: pid and command per process. Raises when ps fails, so no sample is recorded.
+
+    Environments (``ps -E``) are not read: reading them is the slow part of ps on a loaded laptop. Queue
+    workers are counted from the jobs table instead (see sample_once).
+    """
     result = subprocess.run(
-        ["ps", "-E", "-axo", "pid=,command="],
+        ["ps", "-axo", "pid=,command="],
         capture_output=True,
         text=True,
         timeout=PS_TIMEOUT_S,
@@ -1817,11 +1857,36 @@ def fetch_live_status(url: str = PROXY_STATUS_URL, timeout: float = LIVE_TIMEOUT
     return data if isinstance(data, dict) else None
 
 
+_BUDGET = threading.local()
+
+
+@contextlib.contextmanager
+def time_budget(seconds: float):
+    """Bound the SQLite waits made on this thread inside the block. Reads past the budget raise TimeoutError."""
+    previous = getattr(_BUDGET, "until", None)
+    _BUDGET.until = time.monotonic() + seconds
+    try:
+        yield
+    finally:
+        _BUDGET.until = previous
+
+
+def db_timeout() -> float:
+    """The busy wait for one read: DB_TIMEOUT_S, cut to what is left of the time budget on this thread."""
+    until = getattr(_BUDGET, "until", None)
+    if until is None:
+        return DB_TIMEOUT_S
+    left = until - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("time budget spent")
+    return min(DB_TIMEOUT_S, left)
+
+
 def readonly_connection(path: Path) -> sqlite3.Connection:
     """Open an existing SQLite file read-only. Raises FileNotFoundError when it is missing."""
     if not path.exists():
         raise FileNotFoundError(f"{path.name} not found")
-    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=db_timeout())
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -2131,17 +2196,20 @@ def apply_admitted_totals(points: list[dict], admitted: dict[int, int]) -> None:
             point["total_source"] = "completed"
 
 
-def add_trailing_average(points: list[dict], source: str, target: str, window: int) -> None:
-    """Set ``target`` on each point to the mean of ``source`` over it and the window - 1 minutes before it.
+def range_average_pct(minute_points: list[dict], until: int) -> float | None:
+    """Mean of ``pct_total`` over the selected range's minutes, from the first minute the chart plots to the last complete one.
 
-    Points are consecutive minutes (``minute_series`` fills gaps with zero), so a window is a time window.
-    The first window - 1 points have no full window and get None, which the chart draws as a gap.
+    The same minute points the chart draws: an idle minute between recorded minutes is zero, and so is an idle
+    minute after the last recorded one. None when the range has no minute points.
     """
-    for i, point in enumerate(points):
-        if i < window - 1:
-            point[target] = None
-        else:
-            point[target] = round(sum(p[source] for p in points[i - window + 1:i + 1]) / window, 4)
+    if not minute_points:
+        return None
+    first = minute_points[0]["t"]
+    by_minute = {point["t"]: point["pct_total"] for point in minute_points}
+    stamps = range(first, until, 60)
+    if not stamps:
+        return None
+    return round(sum(by_minute.get(t, 0.0) for t in stamps) / len(stamps), 4)
 
 
 def bucket_minutes(points: list[dict], size: int) -> list[dict]:
@@ -2170,8 +2238,6 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
         for key in PCT_KEYS:
             bucket[key] = round(sum(m[key] for m in members) / len(members), 4)
         bucket["r429_per_min"] = round(bucket["r429"] / len(members), 2)
-        averaged = [m["pct_total_avg5"] for m in members if m.get("pct_total_avg5") is not None]
-        bucket["pct_total_avg5"] = round(sum(averaged) / len(averaged), 4) if averaged else None
         buckets.append(bucket)
     return buckets
 
@@ -3159,21 +3225,21 @@ def build_summary(
     caps = read_caps(home)
     targets = live_targets(live)
     resolved = resolve_limits(live)
+    minute_points = minute_series(raw, since, until)
+    apply_admitted_totals(minute_points, admitted)
+    range_avg_total = range_average_pct(minute_points, until)
     limits = {
         name: {
             "label": LIMIT_LABELS[name],
             "limit": LIMITS[name],
             "last_min_frac": last_minute_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "avg_5m_frac": average_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
-            "range_avg_frac": range_average_fraction(raw, since, until, LIMIT_KEYS[name], LIMITS[name]),
+            "range_avg_frac": range_avg_total if name == "total" else range_average_fraction(raw, since, until, LIMIT_KEYS[name], LIMITS[name]),
             "target_frac": targets[name],
         }
         for name in LIMIT_KEYS
     }
     runs = shape_runs(run_rows, now)
-    minute_points = minute_series(raw, since, until)
-    apply_admitted_totals(minute_points, admitted)
-    add_trailing_average(minute_points, "pct_total", "pct_total_avg5", LIMIT_WINDOW_MINUTES)
     minutes = bucket_minutes(minute_points, bucket)
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
@@ -3219,6 +3285,7 @@ def build_summary(
         "r429_60m": recent_429s(raw, until),
         "ds_uncached_rejections": budget_rejections(calib_429s, "uncached_ds", since, until),
         "ds_output_5m_per_min": deepseek_output_rate(raw, until),
+        "range_avg_pct_total": range_avg_total,
         "bucket_s": bucket,
         "minutes": minutes,
         "token_mix": mix,
@@ -3293,11 +3360,34 @@ def write_sample(dash_db: Path, row: dict) -> None:
         connection.close()
 
 
+def read_running_queue(agentq_db: Path) -> int:
+    """Queue jobs running right now: each one is a queue worker. Read-only."""
+    connection = readonly_connection(agentq_db)
+    try:
+        return int(connection.execute("SELECT COUNT(*) FROM jobs WHERE state = 'running'").fetchone()[0])
+    finally:
+        connection.close()
+
+
 def sample_once(home: Path, ps_runner=run_ps, now: float | None = None) -> dict:
-    """Take one worker sample. Raises when ps fails, so the gap shows instead of a false zero."""
+    """Take one worker sample. Raises when ps fails, so the gap shows instead of a false zero.
+
+    ps no longer reports environments, so queue workers are the running jobs in the jobs table. Direct workers
+    are every other launch_pi process. When the jobs table cannot be read, queue and direct are unknown (None),
+    so the sample shows a gap rather than a classification.
+    """
     home = Path(home)
     now = time.time() if now is None else now
-    row = {"ts": now, **parse_workers(ps_runner()), "queued_jobs": None, "ds_queued": None, "kimi_queued": None}
+    counts = parse_workers(ps_runner())
+    total = counts["queue_workers"] + counts["direct_workers"]
+    row = {"ts": now, "ds_workers": counts["ds_workers"], "kimi_workers": counts["kimi_workers"],
+           "queue_workers": None, "direct_workers": None, "queued_jobs": None, "ds_queued": None, "kimi_queued": None}
+    try:
+        running = read_running_queue(home / "agentq.db")
+        row["queue_workers"] = running
+        row["direct_workers"] = max(0, total - running)
+    except (sqlite3.Error, FileNotFoundError):
+        pass
     try:
         by_tier = read_queued_by_tier(home / "agentq.db")
     except (sqlite3.Error, FileNotFoundError):
@@ -3345,7 +3435,6 @@ class BackgroundReader(threading.Thread):
         self.clock = clock
         self.value = None
         self.at: float | None = None
-        self.ready = threading.Event()
         self.wake = threading.Event()
         self.stop_event = threading.Event()
 
@@ -3362,12 +3451,9 @@ class BackgroundReader(threading.Thread):
         except Exception:
             value = None
         self.value, self.at = value, self.clock()
-        self.ready.set()
 
     def latest(self):
-        """The last value read; waits up to FIRST_READ_WAIT_S for the very first read; ``unread`` when there is none."""
-        if self.at is None and self.is_alive():
-            self.ready.wait(FIRST_READ_WAIT_S)
+        """The last value read, at once. ``unread`` until the first read has finished; never waits on a read."""
         return self.value if self.at is not None else self.unread
 
     def age(self, now: float) -> float | None:
@@ -3378,19 +3464,47 @@ class BackgroundReader(threading.Thread):
         self.wake.set()
 
 
-class SummaryCache:
-    """Serves the summary JSON as stored bytes, and recomputes every range on a cadence while a page is open.
+class Stored(NamedTuple):
+    """One stored summary body. ``generation`` numbers the compute that built it: higher is newer."""
 
-    The first request for a range computes it on the request thread; later requests return the stored bytes.
-    Nothing is recomputed unless a request arrived within IDLE_AFTER_S, so an unattended dashboard costs nothing.
+    body: bytes
+    generated_at: float
+    partial: bool
+    generation: int
+
+
+class Compute:
+    """One in-flight compute: ``kind`` is "ordinary" (the cadence) or "forced" (the watchdog)."""
+
+    def __init__(self, hours: int, kind: str, generation: int) -> None:
+        self.hours = hours
+        self.kind = kind
+        self.generation = generation
+
+
+class SummaryCache:
+    """Serves the summary JSON as stored bytes, computed off the request path.
+
+    Computes run on their own threads and never under a lock: the lock guards only the stored bodies, the
+    generation counters and the in-flight set. Every compute takes a per-range generation when it starts, and
+    a stored body is replaced only by a newer generation (and a partial only by a newer partial). A range
+    with no stored body gets a DB-only partial summary, computed under REQUEST_BUDGET_S. A watchdog starts a
+    forced compute for any range whose data is older than WATCHDOG_FACTOR times its cadence. At most one
+    ordinary and one forced compute per range run at a time, and at most MAX_LIVE_COMPUTES in all, forced
+    starts included. Nothing is computed while nobody has asked for the page in IDLE_AFTER_S.
     """
 
     def __init__(self, home: Path, fetch_live=fetch_live_status, clock=time.time) -> None:
         self.home = Path(home)
         self.clock = clock
         self.last_request: float | None = None
-        self.bodies: dict[int, tuple[bytes, float]] = {}
-        self.compute_lock = threading.Lock()
+        self.bodies: dict[int, Stored] = {}
+        self.generations: dict[int, int] = {}
+        self.inflight: dict[int, set[Compute]] = {}
+        self.stale_logged: set[int] = set()
+        self.forced_at: dict[int, float] = {}
+        self.threads: list[threading.Thread] = []
+        self.lock = threading.Lock()
         self.wake = threading.Event()
         self.stop_event = threading.Event()
         self.live = BackgroundReader("live", fetch_live, self.active, clock=clock)
@@ -3420,50 +3534,119 @@ class SummaryCache:
     def active(self) -> bool:
         return self.last_request is not None and self.clock() - self.last_request <= IDLE_AFTER_S
 
-    def get(self, hours: int) -> tuple[bytes, float]:
-        """The stored JSON bytes and their generated_at for one range; computed here only when nothing is stored yet."""
-        self.touch()
-        entry = self.bodies.get(hours)
-        if entry is None:
-            with self.compute_lock:
-                entry = self.bodies.get(hours) or self._compute(hours)
-        return entry
+    def live_computes(self) -> int:
+        """Compute threads still running, across all ranges."""
+        with self.lock:
+            return sum(len(computes) for computes in self.inflight.values())
 
-    def _compute(self, hours: int) -> tuple[bytes, float]:
+    def get(self, hours: int) -> tuple[bytes, float]:
+        """The stored JSON bytes and generated_at for one range. With nothing stored, a DB-only partial is built now."""
+        self.touch()
+        with self.lock:
+            entry = self.bodies.get(hours)
+            generation = self._next_generation(hours)
+        if entry is None:
+            entry = self._store(hours, self._build(hours, REQUEST_BUDGET_S, generation))
+        return entry.body, entry.generated_at
+
+    def _next_generation(self, hours: int) -> int:
+        """Caller holds the lock."""
+        self.generations[hours] = self.generations.get(hours, 0) + 1
+        return self.generations[hours]
+
+    def _build(self, hours: int, budget: float, generation: int) -> Stored:
+        """One summary as JSON bytes, built with the SQLite waits bounded by ``budget`` seconds."""
         now = self.clock()
-        summary = build_summary(
-            self.home, hours, now=now, fetch_live=self.live.latest, laptop=self.laptop.latest()
-        )
+        with time_budget(budget):
+            summary = build_summary(self.home, hours, now=now, fetch_live=self.live.latest, laptop=self.laptop.latest())
         summary["source_age_s"] = {"live": self.live.age(now), "laptop": self.laptop.age(now)}
-        entry = (json.dumps(summary).encode("utf-8"), now)
-        self.bodies[hours] = entry
-        return entry
+        summary["cadence_s"] = RANGE_CADENCE_S[hours]
+        partial = any("time budget" in message for message in summary["errors"].values())
+        summary["partial"] = partial
+        return Stored(json.dumps(summary).encode("utf-8"), now, partial, generation)
+
+    def _store(self, hours: int, entry: Stored) -> Stored:
+        """Keep the newest generation. A partial replaces only a partial or nothing; a full body replaces any newer-generation body."""
+        with self.lock:
+            current = self.bodies.get(hours)
+            if current is not None and entry.generation < current.generation:
+                return current
+            if current is not None and entry.partial and not current.partial:
+                return current
+            if current is not None and entry.generation == current.generation:
+                return current
+            self.bodies[hours] = entry
+            if not entry.partial:
+                self.stale_logged.discard(hours)
+            return entry
+
+    def _start_compute(self, hours: int, force: bool = False) -> bool:
+        """Start one full compute for a range on its own thread.
+
+        Skipped when the range already has a compute of the same kind running, or when MAX_LIVE_COMPUTES
+        are running. A forced start is subject to both limits too.
+        """
+        kind = "forced" if force else "ordinary"
+        with self.lock:
+            if sum(len(computes) for computes in self.inflight.values()) >= MAX_LIVE_COMPUTES:
+                return False
+            computes = self.inflight.setdefault(hours, set())
+            if any(compute.kind == kind for compute in computes):
+                return False
+            compute = Compute(hours, kind, self._next_generation(hours))
+            computes.add(compute)
+        worker = threading.Thread(target=self._run_compute, args=(compute,), name=f"agentq-dash-{hours}h-{kind}", daemon=True)
+        self.threads = [t for t in self.threads if t.is_alive()] + [worker]
+        worker.start()
+        return True
+
+    def _run_compute(self, compute: Compute) -> None:
+        try:
+            self._store(compute.hours, self._build(compute.hours, BACKGROUND_BUDGET_S, compute.generation))
+        except Exception as exc:
+            sys.stderr.write(f"agentq dash: {compute.hours}h summary skipped: {type(exc).__name__}: {exc}\n")
+        finally:
+            with self.lock:
+                self.inflight.get(compute.hours, set()).discard(compute)
+
+    def wait_for_computes(self, timeout: float = 30.0) -> None:
+        """Wait for the compute threads started so far (tests use this; the server never waits)."""
+        for worker in list(self.threads):
+            worker.join(timeout)
 
     def tick(self) -> None:
-        """One worker pass: recompute each range whose cadence has run out, but only while a page is in use."""
+        """One worker pass: start the computes that are due, and run the watchdog. Never blocks on a compute."""
         if not self.active():
             return
+        now = self.clock()
         for hours in RANGE_HOURS:
             if self.stop_event.is_set():
                 return
-            if not self._due(hours):
-                continue
-            with self.compute_lock:
-                if self._due(hours):
-                    try:
-                        self._compute(hours)
-                    except Exception as exc:
-                        sys.stderr.write(f"agentq dash: {hours}h summary skipped: {type(exc).__name__}: {exc}\n")
+            cadence = RANGE_CADENCE_S[hours]
+            with self.lock:
+                entry = self.bodies.get(hours)
+            age = None if entry is None else now - entry.generated_at
+            if entry is None or entry.partial or age >= cadence:
+                self._start_compute(hours)
+            if age is not None and age > WATCHDOG_FACTOR * cadence:
+                self._watchdog(hours, age, cadence, now)
+
+    def _watchdog(self, hours: int, age: float, cadence: float, now: float) -> None:
+        """A range older than WATCHDOG_FACTOR x cadence: log it once per episode and recompute on a fresh thread."""
+        if hours not in self.stale_logged:
+            self.stale_logged.add(hours)
+            sys.stderr.write(
+                f"agentq dash: {hours}h summary is {age:.0f} s old (over {WATCHDOG_FACTOR:g}x its {cadence:g} s cadence); "
+                "recomputing on a fresh worker\n"
+            )
+        if now - self.forced_at.get(hours, float("-inf")) >= cadence and self._start_compute(hours, force=True):
+            self.forced_at[hours] = now
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
             self.tick()
             self.wake.wait(WORKER_TICK_S)
             self.wake.clear()
-
-    def _due(self, hours: int) -> bool:
-        entry = self.bodies.get(hours)
-        return entry is None or self.clock() - entry[1] >= RANGE_CADENCE_S[hours]
 
 
 def laptop_unread() -> dict:
@@ -3565,6 +3748,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--home", default=os.environ.get("AGENTQ_HOME", DEFAULT_HOME))
     args = parser.parse_args(argv)
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     home = Path(os.path.expanduser(args.home))
     server = make_server(home, args.port)
     Sampler(home).start()
