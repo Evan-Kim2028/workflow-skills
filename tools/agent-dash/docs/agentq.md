@@ -30,6 +30,7 @@ agentq status
 agentq backlog add NAME PROMPT_FILE --every 6h [--kind read|write|review]
               [--res light|tests|ssh] [--workspace PATH] [--tier T] [--max-runtime 2h]
 agentq backlog ls | rm NAME | pause NAME | resume NAME
+agentq gc [--runs-older-than 7d] [--apply]       # reclaim finished run streams
 agentq daemon                                    # the broker loop; launchd runs this
 ```
 
@@ -50,6 +51,34 @@ agentq daemon                                    # the broker loop; launchd runs
 
 Typical use from a harness: `agentq submit prompt.md --kind review`, then
 `agentq wait <id>`. For "escalate this subagent work", run `agentq escalate`.
+
+## Streams and disk
+
+Each run keeps its worker's pi event stream at
+`$AGENTQ_HOME/jobs/<id>/runs/<n>/pi/stream-<label>.ndjson`. Delta events
+dominated that file (57,117 of 61,802 lines in the largest measured stream), so
+`dash/logfilter.py` now batches them instead of writing line by line:
+
+- writes reach the file at most once every two seconds
+  (`AGENTQ_STREAM_FLUSH_S`, default `2`), when the buffer is full, and at process
+  exit; only whole lines are written, so a reader polling the file never sees half
+  a JSON line;
+- back-to-back token deltas of the same event and `contentIndex` are joined into
+  one `message_update` line, keeping the object shape (the `delta` field is the
+  concatenation); every reader that joins deltas sees the same text, and
+  `pi.parse_stream` / `pi.final_text` return what they returned before. Set
+  `AGENTQ_STREAM_COALESCE=0` to keep every delta line.
+
+`agentq gc` removes the stream files of jobs that finished more than N days ago
+(`30m`, `12h`, `7d`, `2w`, or a bare number of days); `report.md` and the run's
+`out-*.md` stay. It is a dry run unless `--apply`, and it never touches a job
+that is not `done`/`failed`/`cancelled`, a run folder with a live pid in
+`running/`, or a stream modified after the cutoff. A candidate must also be a
+plain-hex job id whose `runs` folder resolves inside `$AGENTQ_HOME/jobs`, and
+every unlink is re-confined to that folder, so a crafted id or a symlinked
+folder cannot reach outside the jobs tree.
+
+The proxy's own log is size-rotated (see [agentq-proxy.md](agentq-proxy.md)).
 
 ## Backlog templates
 

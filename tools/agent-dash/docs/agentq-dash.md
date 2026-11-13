@@ -7,7 +7,7 @@ each limit, worker counts, 429s, queue wait and recent jobs.
 
 - Page: `http://127.0.0.1:18791/` (bound to loopback only; `--port` overrides).
 - JSON: `http://127.0.0.1:18791/api/summary?hours=1|6|24|168` (default 6; 168 is the 7 d range, other values return 400).
-- Log: `http://127.0.0.1:18791/api/log?source=proxy|broker&page=N&q=text` returns 100 lines a page, newest first, read from the last 5 MB of `$AGENTQ_HOME/logs/proxy.err.log` or `logs/broker.log`. Lines naming an Authorization header or an api key are dropped with their continuation lines. Only those two fixed files are readable.
+- Log: `http://127.0.0.1:18791/api/log?source=proxy|broker&page=N&q=text` returns 100 lines a page, newest first, read from the last 5 MB of `$AGENTQ_HOME/logs/proxy.err.log` or `logs/broker.log` (the proxy log is size-rotated at 10 MB with three backups, so only the live file is shown). Lines naming an Authorization header or an api key are dropped with their continuation lines. Only those two fixed files are readable.
 - Page: `/?range=1h|6h|24h|7d` selects the range on load.
 - Run: `python3 tools/agent-dash/agentq/dash.py`. Launchd unit template:
   `tools/agent-dash/agentq/launchd/com.agentq.dash.plist` (placeholders

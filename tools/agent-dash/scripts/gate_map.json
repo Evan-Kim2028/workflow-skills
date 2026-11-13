@@ -9,6 +9,8 @@
     "test_server"
   ],
   "map": {
+    "agentq/gc.py": ["test_agentq_gc"],
+    "agentq/proxy.py": ["test_agentq_proxy"],
     "scripts/perf_probe.py": ["test_perf_stage3", "test_perf_stage2"],
     "agent_dash.py": [
       "test_server",

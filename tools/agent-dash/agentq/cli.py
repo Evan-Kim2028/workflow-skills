@@ -1,7 +1,7 @@
 """agentq command line.
 
-Commands: submit, wait, escalate, ls, result, cancel, daemon, status, slots and
-backlog (add, ls, rm, pause, resume). Every
+Commands: submit, wait, escalate, ls, result, cancel, daemon, status, slots, gc
+and backlog (add, ls, rm, pause, resume). Every
 command prints its output and ends with one ``ANSWER:`` line. Exit codes:
 0 ok, 1 negative fact (unknown job, nothing to escalate, a failed job), 3
 timeout or the store unreachable.
@@ -24,6 +24,7 @@ from agentq import fill as fill_lib
 from agentq import filler as filler_lib
 from agentq import broker as broker_lib
 from agentq import db
+from agentq import gc as gc_lib
 from agentq import slots as slots_lib
 
 HARNESS_VARS = (
@@ -243,6 +244,37 @@ def cmd_cancel(args, ctx: Context) -> int:
     return answer(ctx, f"cancelled {args.id}: {action}", 0)
 
 
+def cmd_gc(args, ctx: Context) -> int:
+    """Reclaim stream files of finished jobs older than N. Dry run unless --apply."""
+    try:
+        older_than_s = gc_lib.parse_duration(args.runs_older_than)
+    except gc_lib.DurationError as exc:
+        return answer(ctx, str(exc), 2)
+    conn = db.connect(ctx.home)
+    jobs = db.select_jobs(conn, "state IN (?, ?, ?)", gc_lib.TERMINAL)
+    items, skipped = gc_lib.plan(ctx.home, jobs, older_than_s=older_than_s, now=ctx.now())
+    for line in gc_lib.summarize(items):
+        ctx.print(line)
+    if not args.apply:
+        ctx.print("dry run: nothing removed (add --apply to remove these files)")
+        return answer(
+            ctx,
+            f"would remove {len(items)} stream file(s), {gc_lib.human_bytes(sum(int(i['size']) for i in items))}"
+            f" (finished jobs older than {args.runs_older_than})",
+            0,
+        )
+    removed, freed, errors = gc_lib.apply(items)
+    for err in errors:
+        ctx.print(f"failed: {err['path']} ({err['error']})")
+    return answer(
+        ctx,
+        f"removed {removed} stream file(s), freed {gc_lib.human_bytes(freed)}"
+        + (f", {len(errors)} error(s)" if errors else "")
+        + (f", {len(skipped)} job(s)/run folder(s) skipped" if skipped else ""),
+        1 if errors else 0,
+    )
+
+
 def cmd_daemon(args, ctx: Context) -> int:
     try:
         broker_lib.Broker(ctx.home).run_forever()
@@ -445,6 +477,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hours", type=float, default=4.0)
     p.set_defaults(func=cmd_inflight_report)
     sub.add_parser("slots", help="ssh and pytest slots held by pi workers, with holder pid and label").set_defaults(func=cmd_slots)
+
+    p = sub.add_parser("gc", help="reclaim stream files of finished jobs (dry run unless --apply)")
+    p.add_argument("--runs-older-than", default=gc_lib.DEFAULT_DURATION, metavar="DURATION",
+                   help="keep runs that finished within this window: 30m, 12h, 7d (default 7d)")
+    p.add_argument("--apply", action="store_true", help="remove the files; without it, only report")
+    p.set_defaults(func=cmd_gc)
 
     p = sub.add_parser("backlog", help="recurring low-priority jobs that fill idle Morph capacity")
     bsub = p.add_subparsers(dest="backlog_cmd", required=True)
