@@ -5,6 +5,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +28,8 @@ from agentq.proxy import (
     Client,
     Entry,
     Governor,
+    LOG_PATH,
+    RotatingLog,
     INFLIGHT,
     LANE_CACHE_S,
     ARMED,
@@ -35,7 +38,9 @@ from agentq.proxy import (
     InflightLimiter,
     Proxy,
     body_snippet,
+    default_log,
     family_of,
+    file_log,
     load_key,
     main,
     merge_config,
@@ -2516,3 +2521,102 @@ class LoopLagTest(unittest.TestCase):
         now[0] += 61
         gov.note_loop_lag(0.01)
         self.assertEqual(gov.status()["loop_lag_ms"], {"last_ms": 10, "max_60s_ms": 10})
+class LogRotationTest(unittest.TestCase):
+    """The proxy log must be bounded by size, not by launchd's stderr redirect."""
+
+    def line(self, tag: str, size: int = 600) -> str:
+        return f"{tag} {'x' * max(0, size - len(tag) - 1)}\n"
+
+    def test_the_live_file_rotates_to_a_backup_at_the_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "logs" / "proxy.err.log"
+            writer = RotatingLog(path, max_bytes=1024, backups=3)
+            writer.write(self.line("first"))
+            self.assertTrue(path.exists())
+            self.assertEqual(writer.backup_path(1).exists(), False)
+            writer.write(self.line("second"))
+            writer.close()
+            self.assertEqual(path.read_text(), "")
+            self.assertIn("second", writer.backup_path(1).read_text())
+            self.assertIn("first", writer.backup_path(1).read_text())
+
+    def test_backups_are_capped_and_keep_the_newest_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proxy.err.log"
+            writer = RotatingLog(path, max_bytes=1024, backups=2)
+            for index in range(6):
+                writer.write(self.line(f"line{index}"))
+            writer.close()
+            self.assertTrue(writer.backup_path(2).exists())
+            self.assertFalse(writer.backup_path(3).exists())
+            newest = writer.backup_path(1).read_text()
+            self.assertIn("line4", newest)
+            self.assertIn("line5", newest)
+            self.assertIn("line3", writer.backup_path(2).read_text())
+
+    def test_an_existing_oversized_file_rotates_on_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proxy.err.log"
+            path.write_text(self.line("old", size=2048))
+            writer = RotatingLog(path, max_bytes=1024, backups=3)
+            writer.write(self.line("new"))
+            writer.close()
+            self.assertEqual(path.read_text(), self.line("new"))
+            self.assertIn("old", writer.backup_path(1).read_text())
+
+    def test_an_unwritable_path_records_the_error_instead_of_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocked"
+            blocker.write_text("a file where a directory is needed\n")
+            writer = RotatingLog(blocker / "proxy.err.log", max_bytes=1024)
+            writer.write("hello\n")  # must not raise into the governor
+            self.assertIsInstance(writer.error, OSError)
+            writer.write("again\n")
+            self.assertIsInstance(writer.error, OSError)
+            writer.flush()
+            writer.close()
+
+    def test_a_line_keeps_the_format_the_dashboard_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            log = file_log(home, config_with())
+            log("request", job="j1", model=MODEL_OUT, lane="normal", status=200, attempts=1)
+            log.writer.close()
+            text = (home / LOG_PATH).read_text()
+            match = re.match(
+                r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) agentq-proxy request "
+                r"job=j1 model=\S+ lane=normal status=200 attempts=1\n$",
+                text,
+            )
+            self.assertIsNotNone(match, text)
+
+    def test_an_empty_log_path_falls_back_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertIs(file_log(home, config_with(log_path="")), default_log)
+            self.assertFalse((home / "logs").exists())
+
+    def test_the_governor_opens_the_rotating_file_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            gov = Governor(home, config_with())
+            self.addCleanup(gov.log.writer.close)
+            gov.log("request", job="j2", model=MODEL_OUT, lane="normal", status=200, attempts=1)
+            text = (home / LOG_PATH).read_text()
+            self.assertIn(" agentq-proxy request job=j2 ", text)
+            self.assertTrue(text.endswith("\n"))
+
+
+class LogPathConfigTest(unittest.TestCase):
+    def test_rotation_settings_come_from_the_config(self) -> None:
+        config = config_with(log_path="logs/custom.log", log_max_bytes=2048, log_backups=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = file_log(Path(tmp), config)
+            self.assertEqual(log.writer.max_bytes, 2048)
+            self.assertEqual(log.writer.backups, 1)
+            log.writer.close()
+
+    def test_defaults_bound_the_file_at_ten_megabytes_and_three_backups(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["log_path"], LOG_PATH)
+        self.assertEqual(DEFAULT_CONFIG["log_max_bytes"], 10 * 1024 * 1024)
+        self.assertEqual(DEFAULT_CONFIG["log_backups"], 3)

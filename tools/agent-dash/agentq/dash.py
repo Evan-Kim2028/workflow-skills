@@ -2668,14 +2668,36 @@ def live_ttfb_baseline(live: dict | None, baseline_raw: dict[int, dict], until: 
     return round(statistics.median(values)) if values else None
 
 
+def read_log_recent(path: Path, max_bytes: int = LOG_MAX_BYTES) -> tuple[bytes, bool]:
+    """The recent lines of a rotating log: the live file, preceded by its newest backup (``.1``).
+
+    ``RotatingLog`` renames the live file to ``.1`` and starts an empty one, so right after a
+    rotation the newest lines (a 429 from a minute ago) are in the backup, not the live file.
+    Readers that need the last few minutes read both, live lines last, so line order is
+    preserved. ``truncated`` is True whenever a backup exists: older history in ``.2``/``.3``
+    was not read, so the window may not reach back to the start of the log.
+    """
+    data, truncated = read_log_tail(path, max_bytes)
+    backup = path.with_name(path.name + ".1")
+    if not backup.exists():
+        return data, truncated
+    try:
+        older, _ = read_log_tail(backup, max_bytes)
+    except OSError:
+        return data, truncated
+    return older + data, True
+
+
 def read_calib_429s(home: Path) -> dict | None:
     """Calib log lines that name a 429 budget, from the proxy log tail: ``events`` as (budget, minute epoch) pairs.
 
-    ``events`` is empty when the log holds no such line, which means the proxy did not record rejections.
-    ``truncated`` says the tail does not reach back to the start of the log. None when the log is unreadable.
+    The live file and its newest rotated backup are read, so a 429 written just before a
+    rotation is still counted. ``events`` is empty when the log holds no such line, which
+    means the proxy did not record rejections. ``truncated`` says the tail does not reach
+    back to the start of the log. None when the log is unreadable.
     """
     try:
-        data, truncated = read_log_tail(Path(home) / "logs" / LOG_SOURCES["proxy"])
+        data, truncated = read_log_recent(Path(home) / "logs" / LOG_SOURCES["proxy"])
     except OSError:
         return None
     events: list[tuple[str, int]] = []

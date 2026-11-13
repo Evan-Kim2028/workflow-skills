@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import http.client
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -1567,6 +1568,46 @@ class BudgetRateLimitLogTest(unittest.TestCase):
             )
             found = dash.budget_429_minutes(home, UNTIL)
         self.assertEqual(found, {"total": {UNTIL - 60}})
+
+    def test_a_calib_429_written_just_before_a_rotation_is_still_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            logs = home / "logs"
+            logs.mkdir()
+            live = logs / "proxy.err.log"
+            this = dash.minute_stamp(UNTIL - 60)
+            live.write_text(
+                f"{this}:30Z agentq-proxy calib minute={this} budget=uncached_ds sec=30.0\n",
+                encoding="utf-8",
+            )
+            # RotatingLog rotates by renaming the live file to .1 and starting an empty one.
+            os.replace(live, live.with_name(live.name + ".1"))
+            live.write_text("", encoding="utf-8")
+            read = dash.read_calib_429s(home)
+            found = dash.budget_429_minutes(home, UNTIL)
+        self.assertEqual(read["events"], [("uncached_ds", UNTIL - 60)])
+        self.assertEqual(found, {"uncached_ds": {UNTIL - 60}})
+
+    def test_the_live_file_is_read_after_the_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            logs = home / "logs"
+            logs.mkdir()
+            live = logs / "proxy.err.log"
+            old = dash.minute_stamp(UNTIL - 180)
+            this = dash.minute_stamp(UNTIL - 60)
+            live.with_name(live.name + ".1").write_text(
+                f"{old}:30Z agentq-proxy calib minute={old} budget=total sec=30.0\n",
+                encoding="utf-8",
+            )
+            live.write_text(
+                f"{this}:30Z agentq-proxy request job=a1b2c3d4e5f0 status=200\n"
+                f"{this}:31Z agentq-proxy calib minute={this} budget=uncached_ds sec=31.0\n",
+                encoding="utf-8",
+            )
+            read = dash.read_calib_429s(home)
+        self.assertEqual(read["events"], [("total", UNTIL - 180), ("uncached_ds", UNTIL - 60)])
+        self.assertTrue(read["truncated"], "the older backups were not read, so the window is partial")
 
 
 class RunsAxisTest(unittest.TestCase):

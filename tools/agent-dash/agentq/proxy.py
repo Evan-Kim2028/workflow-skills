@@ -30,6 +30,7 @@ import ssl
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -67,6 +68,12 @@ PROMPT_PLUS_MAX = "prompt_plus_max"
 CHARGE_BASES = (BILLED, PROMPT_PLUS_MAX)
 MINUTE_S = 60.0
 CALIB_KEEP_S = 180.0
+#: The governor's own log file, relative to the agentq home unless absolute.
+#: Empty means stderr (the pre-rotation behaviour).
+LOG_PATH = "logs/proxy.err.log"
+#: Rotate the log at this size, keeping this many old files (``…log.1`` … ``…log.3``).
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUPS = 3
 
 DEFAULT_CONFIG = {
     "port": 18790,
@@ -93,6 +100,9 @@ DEFAULT_CONFIG = {
     "charge_basis": "billed",
     "calendar_jitter_s": 1.5,
     "backlog_max_frac": 0.9,
+    "log_path": LOG_PATH,
+    "log_max_bytes": LOG_MAX_BYTES,
+    "log_backups": LOG_BACKUPS,
     "budgets": {
         "total": {"limit_type": "total", "limit": 10_000_000},
         "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
@@ -278,10 +288,126 @@ def failure_kind(exc: BaseException) -> str:
 
 def default_log(event: str, **fields: object) -> None:
     """Write one structured line to stderr. Callers pass only ids and counts."""
+    sys.stderr.write(_log_line(event, fields))
+    sys.stderr.flush()
+
+
+def _log_line(event: str, fields: dict) -> str:
+    """One log line. The format is parsed by the dashboard and the calibration
+    scripts (``<stamp> agentq-proxy <event> <key>=<value>…``), so it is fixed."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     pairs = "".join(f" {key}={value}" for key, value in fields.items())
-    sys.stderr.write(f"{stamp} agentq-proxy {event}{pairs}\n")
-    sys.stderr.flush()
+    return f"{stamp} agentq-proxy {event}{pairs}\n"
+
+
+class RotatingLog:
+    """A size-based rotating log writer, opened by path.
+
+    The governor used to write every line to stderr, which launchd appends to
+    ``logs/proxy.err.log`` with no bound (measured: 7.9 MB, about 100 lines a
+    minute, no rotation). The governor now opens that file itself and rotates
+    it at ``log_max_bytes`` (default 10 MB), keeping ``log_backups`` old files
+    (default 3) as ``proxy.err.log.1`` … ``.3``.
+
+    Stderr stays the startup-error sink: launchd still redirects it to the
+    same path, so a failure before this writer exists (a missing key, a
+    traceback) still reaches the file. Once the writer is open it owns
+    rotation, and a stderr line launchd writes into a renamed file stays in
+    that old file, which is why stderr is used for startup errors only.
+    """
+
+    def __init__(self, path, *, max_bytes: int = LOG_MAX_BYTES, backups: int = LOG_BACKUPS) -> None:
+        self.path = Path(os.path.expanduser(str(path)))
+        self.max_bytes = max(1024, int(max_bytes))
+        self.backups = max(1, int(backups))
+        self.error = None
+        self._fh = None
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def backup_path(self, index: int) -> Path:
+        return self.path.with_name(f"{self.path.name}.{index}")
+
+    def write(self, text: str) -> None:
+        """Append one line, rotating first when the file is at its limit."""
+        data = text.encode("utf-8", "replace")
+        with self._lock:
+            try:
+                if self._fh is None:
+                    self._open()
+                self._fh.write(data)
+                self._fh.flush()
+                self._size += len(data)
+                if self._size >= self.max_bytes:
+                    self._rotate()
+            except OSError as exc:  # a full disk must not stop the proxy
+                self.error = exc
+                self._fh = None
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                except OSError as exc:
+                    self.error = exc
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+
+    def _open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "ab")
+        try:
+            self._size = self.path.stat().st_size
+        except OSError:
+            self._size = 0
+        if self._size >= self.max_bytes:
+            self._rotate()
+
+    def _rotate(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        for index in range(self.backups, 1, -1):
+            older = self.backup_path(index - 1)
+            if older.exists():
+                os.replace(older, self.backup_path(index))
+        if self.path.exists():
+            os.replace(self.path, self.backup_path(1))
+        self._fh = open(self.path, "ab")
+        self._size = 0
+
+
+def file_log(home, config: dict):
+    """A governor log callback writing to the rotating file (``log_path``), or stderr
+    when ``log_path`` is empty. Same line format as ``default_log``."""
+    path = str(config.get("log_path", LOG_PATH) or "").strip()
+    if not path:
+        return default_log
+    target = Path(path)
+    if not target.is_absolute():
+        target = Path(home) / target
+    writer = RotatingLog(
+        target,
+        max_bytes=int(config.get("log_max_bytes", LOG_MAX_BYTES)),
+        backups=int(config.get("log_backups", LOG_BACKUPS)),
+    )
+
+    def _log(event: str, **fields: object) -> None:
+        writer.write(_log_line(event, fields))
+
+    _log.writer = writer  # so a shutdown can close the file
+    return _log
 
 
 def merge_config(base: dict, overrides: dict) -> dict:
@@ -871,13 +997,13 @@ class Governor:
         *,
         clock=time.monotonic,
         wall=time.time,
-        log=default_log,
+        log=None,
     ) -> None:
         self.home = Path(home)
         self.config = config
         self.clock = clock
         self.wall = wall
-        self.log = log
+        self.log = log or file_log(self.home, config)
         self.window = float(config["window_s"])
         self.backlog_max_frac = float(config.get("backlog_max_frac", DEFAULT_CONFIG["backlog_max_frac"]))
         start = clock()
@@ -2494,7 +2620,13 @@ def main(argv: list[str] | None = None) -> int:
             f"exit {EX_CONFIG}, launchd throttles the restart\n"
         )
         return EX_CONFIG
-    asyncio.run(run(Governor(home, config), upstream, key, port))
+    governor = Governor(home, config)
+    try:
+        asyncio.run(run(governor, upstream, key, port))
+    finally:
+        writer = getattr(governor.log, "writer", None)
+        if writer is not None:
+            writer.close()
     return 0
 
 

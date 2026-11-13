@@ -176,7 +176,9 @@ A request that is already streaming upstream is not cancelled.
 `target_step_up`, `target_ceiling`, `fast_until`, `fast_step_up`, `fast_interval_s`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
 `retry_jitter_s`, `aging_s`, `connect_timeout_s` (10), `upstream_idle_s` (120),
 `drain_s` (20), `budgets`, `max_tokens_cap`, `window_mode` (`rolling`),
-`charge_basis` (`billed`) and `calendar_jitter_s` (1.5). Environment variables:
+`charge_basis` (`billed`), `calendar_jitter_s` (1.5) and the log file settings
+`log_path` (`logs/proxy.err.log`, relative to `$AGENTQ_HOME`; empty means
+stderr), `log_max_bytes` (10 MB) and `log_backups` (3). Environment variables:
 
 - `AGENTQ_HOME` (default `~/.local/state/agentq`)
 - `AGENTQ_PROXY_PORT` (default 18790)
@@ -194,6 +196,17 @@ The key is read once at start from
 `security find-generic-password -a "$USER" -s morph-api-key -w`. The proxy strips
 the client's `Authorization` header and never logs, prints or writes the key.
 Log lines carry only event names, job ids, models and counts.
+
+The log is a file the proxy opens itself (`log_path`), rotating at
+`log_max_bytes` and keeping `log_backups` old files (`proxy.err.log.1` …
+`.3`); restarting it does not lose the file. launchd's stderr redirect still
+points at the same path, so a startup failure (a missing key, a traceback
+before the governor exists) still lands there. A line launchd writes after the
+proxy has rotated goes into the rotated file, which is why stderr carries
+startup errors only. Readers of the recent window (the dashboard's 429 minutes
+from `calib` lines) read the live file preceded by `proxy.err.log.1`, so a 429
+written just before a rotation is still counted; the interactive log viewer
+reads the live file only.
 
 ## Running
 
