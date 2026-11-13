@@ -3,6 +3,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agentq import reserve_replay
 from agentq.proxy import (
     CAPACITY,
+    nearest_rank,
     DEFAULT_CONFIG,
     EMPTY,
     PROXY_MINUTES_DDL,
@@ -387,6 +389,49 @@ class GovernorReserveTest(unittest.TestCase):
         self.gov.pump()
         self.assertTrue(oldest.holds)
         self.assertFalse(newer.holds)
+
+    def test_output_estimate_is_the_mean_for_the_recent_minute_and_the_p80_for_the_reserve_budget(self) -> None:
+        self.gov.output_history[MODEL_OUT] = deque([2_500] * 50 + [600] * 150, maxlen=200)
+        ticket = self.gov.make_ticket(
+            job="o", lane="normal", model=MODEL_OUT, length=4, blocks=prefix_blocks("xxxx"),
+            max_tokens=None, now=self.wall[0],
+        )
+        self.assertEqual(ticket.estimates["output"], 2_500)
+        self.assertEqual(ticket.estimates["total"], 1 + 600)
+
+    def test_the_output_estimate_is_still_capped_by_max_tokens(self) -> None:
+        self.gov.output_history[MODEL_OUT] = deque([2_500] * 50 + [600] * 150, maxlen=200)
+        ticket = self.gov.make_ticket(
+            job="o2", lane="normal", model=MODEL_OUT, length=4, blocks=prefix_blocks("xxxx"),
+            max_tokens=1_000, now=self.wall[0],
+        )
+        self.assertEqual(ticket.estimates["output"], 1_000)
+
+    def test_nearest_rank_picks_the_smallest_value_at_or_above_the_percentile(self) -> None:
+        values = list(range(1, 11))
+        self.assertEqual(nearest_rank(values, 80), 8)
+        self.assertEqual(nearest_rank(values, 100), 10)
+        self.assertEqual(nearest_rank(values, 1), 1)
+
+    def test_the_output_window_is_bounded_and_completions_are_logged(self) -> None:
+        events = []
+        gov = Governor(self.home, self.gov.config, clock=lambda: self.wall[0], wall=lambda: self.wall[0],
+                       log=lambda event, **fields: events.append((event, fields)))
+        self.assertEqual(gov.config["output_estimate_window"], 200)
+        ticket = gov.make_ticket(
+            job="done", lane="normal", model=MODEL_OUT, length=4, blocks=prefix_blocks("xxxx"),
+            max_tokens=None, now=self.wall[0],
+        )
+        gov.enqueue(ticket)
+        gov.pump()
+        gov.finish_ok(ticket, {"prompt_tokens": 5, "completion_tokens": 321})
+        self.assertEqual(gov.output_history[MODEL_OUT].maxlen, 200)
+        logged = [fields for event, fields in events if event == "request_output"]
+        self.assertEqual(logged, [{"model": MODEL_OUT, "output": 321, "max_tokens": 0}])
+
+    def test_config_defaults_for_the_output_estimate(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["output_estimate_pct"], 80)
+        self.assertEqual(DEFAULT_CONFIG["output_estimate_window"], 200)
 
     def test_a_restored_reserve_target_is_clamped_to_the_morph_limit(self) -> None:
         (self.home / "proxy_state.json").write_text(json.dumps({
