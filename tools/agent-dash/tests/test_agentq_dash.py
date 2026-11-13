@@ -1251,7 +1251,8 @@ class EnforcedLimitsChartTest(unittest.TestCase):
         self.assertNotIn("hourlyPartial", html)
         self.assertNotIn("This hour so far", html)
         self.assertIn('"Hourly average"', html)
-        self.assertIn('text: lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%"', block)
+        self.assertNotIn("notes:", block)
+        self.assertIn('"Hourly average" + (lastComplete ? " · last full hour " + lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%" : "")', html)
         self.assertNotIn("range_avg_pct_total", block)
         self.assertIn('Morph limit (10M/min)', block)
         self.assertNotIn("pct_ds_uncached", block)
@@ -1759,17 +1760,25 @@ class RunsAxisTest(unittest.TestCase):
         self.assertIn('labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs")', block)
         self.assertNotIn("niceTicks(Math.max(caps.deepseek", block)
         self.assertIn("c.on_scale", block)
-        self.assertIn("(off scale)", block)
+        self.assertNotIn("offScale", block)
+        self.assertIn('note.textContent = c.label + " \\u2191 (off scale)";', html)
         self.assertIn("height: PAIR_LAYOUT.height", block)
         self.assertIn("margin: PAIR_LAYOUT.margin", block)
 
-    def test_draw_chart_places_off_scale_labels_top_right_without_a_line(self) -> None:
+    def test_off_scale_notices_are_in_the_legend_row_not_the_plot(self) -> None:
         html = dash.PAGE_HTML
-        start = html.index("(cfg.offScale || []).forEach")
-        block = html[start:html.index("var refPlaced", start)]
-        self.assertIn('"text-anchor": "end"', block)
-        self.assertIn("y: m.t + 13", block)
-        self.assertNotIn('"stroke-dasharray"', block)
+        self.assertNotIn("(cfg.offScale || [])", html)
+        self.assertNotIn("y: m.t + 13", html)
+        self.assertIn('$("lg-workers").appendChild(note);', html)
+
+    def test_every_remaining_in_plot_label_has_a_surface_halo(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index("var refPlaced")
+        block = html[start:html.index("if (cfg.kind === \"bar\")", start)]
+        self.assertIn("paint-order: stroke", block)
+        self.assertIn("stroke: var(--surface)", block)
+        token = html[html.index("function drawTokenCombo"):]
+        self.assertIn("paint-order: stroke", token[:token.index("\n  }\n")] if "\n  }\n" in token else token[:4000])
 
 
 class SmallChartRowTest(unittest.TestCase):
@@ -1794,7 +1803,10 @@ class SmallChartRowTest(unittest.TestCase):
         html = dash.PAGE_HTML
         self.assertIn("var smallLayout = { height: 200, margin: { l: 48, r: 12, t: 26, b: 24 } };", html)
         self.assertIn("xSteps: 2", html)
-        self.assertIn('{ v: 1, label: "limit" }', html)
+        self.assertIn("{ v: 1 }", html)
+        self.assertNotIn('label: "limit"', html)
+        self.assertIn('id="kimi-limit"', html)
+        self.assertIn('id="dsu-limit"', html)
         self.assertIn("var smallPctAxis = { min: 0, max: 2, clip: 2, ticks: [0, 1, 2], fmt: pctFmt };", html)
 
     def test_small_cards_have_no_legend_and_the_rejection_subtitle_is_short(self) -> None:

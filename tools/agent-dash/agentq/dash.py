@@ -492,12 +492,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   <section class="grid3">
     <div class="card" aria-labelledby="h-kimi">
       <div class="card-head"><h2 id="h-kimi">Kimi uncached (est.)</h2></div>
-      <div class="note-line"><span class="rng">last 6 h</span></div>
+      <div class="note-line"><span class="rng">last 6 h</span> · <span id="kimi-limit">limit: 100% = —</span></div>
       <div class="chart" id="c-kimi"></div>
     </div>
     <div class="card" aria-labelledby="h-dsu">
       <div class="card-head"><h2 id="h-dsu">DeepSeek uncached (est.)</h2></div>
-      <div class="note-line" id="dsu-sub">—</div>
+      <div class="note-line"><span id="dsu-limit">limit: 100% = —</span> · <span id="dsu-sub">—</span></div>
       <div class="chart" id="c-dsu"></div>
     </div>
     <div class="card" aria-labelledby="h-429">
@@ -910,12 +910,6 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     if (cfg.y.label) svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = cfg.y.label;
 
     var refs = (cfg.refs || []).slice();
-    (cfg.notes || []).forEach(function (note) {
-      svgEl("text", {
-        x: X(note.t) - 6, y: Yc(note.v) - 7, "text-anchor": "end", class: "direct",
-        style: "fill: " + note.color + "; stroke: var(--surface); stroke-width: 3px; paint-order: stroke; font-weight: 600"
-      }, svg).textContent = note.text;
-    });
     refs.forEach(function (r) {
       svgEl("line", {
         x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: r.color || "var(--ink-3)", "stroke-width": r.width || 1,
@@ -928,13 +922,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         }, svg).textContent = r.label;
       }
     });
-    (cfg.offScale || []).forEach(function (text, i) {
-      svgEl("text", {
-        x: W - m.r - 6, y: m.t + 13 + i * 15, "text-anchor": "end", class: "direct",
-        style: "fill: var(--ink-3); stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
-      }, svg).textContent = text;
-    });
-    var refPlaced = refs.filter(function (r) { return !r.end; }).map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
+    var refPlaced = refs.filter(function (r) { return !r.end && r.label; }).map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
       .sort(function (a, b) { return a.y - b.y; });
     refPlaced.forEach(function (r, i) {
       if (i && r.y - refPlaced[i - 1].y < 13) r.y = refPlaced[i - 1].y + 13;
@@ -1352,10 +1340,6 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
       refs: [{ v: 1, label: "Morph limit (10M/min)" }],
-      notes: lastComplete ? [{
-        t: lastComplete.t + 3600, v: lastComplete.avg,
-        text: lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%", color: COLORS.s3
-      }] : [],
       fmt: pctFmt
     });
     registerChart("c-workers", {
@@ -1373,7 +1357,6 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       ],
       y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
-      offScale: axis.caps.filter(function (c) { return !c.on_scale; }).map(function (c) { return c.label + " \u2191 (off scale)"; }),
       fmt: intFmt
     });
     var mix = d.token_mix || [];
@@ -1392,7 +1375,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
       { name: "Per minute", color: COLORS.s1 },
-      { name: "Hourly average", color: COLORS.s3 }
+      { name: "Hourly average" + (lastComplete ? " · last full hour " + lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%" : ""), color: COLORS.s3 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -1400,6 +1383,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       { name: "DeepSeek queued", color: COLORS.s3, block: true },
       { name: "Kimi queued", color: COLORS.kimiQueue, block: true }
     ]);
+    axis.caps.filter(function (c) { return !c.on_scale; }).forEach(function (c) {
+      var note = document.createElement("span");
+      note.className = "key";
+      note.textContent = c.label + " \u2191 (off scale)";
+      $("lg-workers").appendChild(note);
+    });
     legendFor($("lg-tokens"), [
       { name: "Tokens billed", color: COLORS.s1, block: true },
       { name: "Cumulative (right axis)", color: COLORS.muted }
@@ -1427,9 +1416,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       title: "Kimi uncached, estimated percent of 24,290 per minute",
       series: [{ key: "pct_kimi_uncached", name: "Kimi uncached (estimate)", color: COLORS.s3 }],
       y: labelled(smallPctAxis, "% of 24,290 tokens/min"),
-      refs: [{ v: 1, label: "limit" }],
+      refs: [{ v: 1 }],
       fmt: pctFmt
     }));
+    var kimiCap = ((d.limits || {}).uncached || {}).limit;
+    setText("kimi-limit", kimiCap ? "limit: 100% = " + count(kimiCap) + "/min" : "limit: 100% = —");
+    var dsCap = ((d.limits || {}).uncached_ds || {}).limit;
+    setText("dsu-limit", dsCap ? "limit: 100% = " + count(dsCap) + "/min" : "limit: 100% = —");
     var rej = d.ds_uncached_rejections || {};
     setText("dsu-sub", rej.count === null || rej.count === undefined
       ? "rejections not recorded"
@@ -1438,7 +1431,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       title: "DeepSeek uncached input, estimated percent of 400k per minute",
       series: [{ key: "pct_ds_uncached", name: "DeepSeek uncached (estimate)", color: COLORS.s2 }],
       y: labelled(smallPctAxis, "% of 400k tokens/min"),
-      refs: [{ v: 1, label: "limit" }],
+      refs: [{ v: 1 }],
       fmt: pctFmt
     }));
     registerChart("c-429", smallChart("c-429", {
