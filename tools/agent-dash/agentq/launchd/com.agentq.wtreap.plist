@@ -12,6 +12,12 @@
   `uv cache prune` and, when the installed agentq supports it,
   `agentq gc --apply --runs-older-than 7d`, at most once per 24h.
 
+  --apply-cooldown 1h makes the scheduled run a dry run when the previous
+  --apply run on that repo is under an hour old. RunAtLoad stays on so the
+  janitor reports at login, but a run right after load cannot delete again
+  on top of a run that just happened: it reports instead. A fresh install
+  (no stamp yet) still runs --apply, which is the desired first sweep.
+
   Install (do not run from a worker):
     launchctl bootout gui/$(id -u)/com.agentq.wtreap 2>/dev/null
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentq.wtreap.plist
@@ -36,7 +42,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --min-age 4h --daily-maintenance; done</string>
+		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --daily-maintenance; done</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

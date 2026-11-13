@@ -284,15 +284,20 @@ def detached_state(repo: str | Path, head: str) -> tuple[bool, str]:
     return False, "detached HEAD is not on " + MAIN_REF + " (unmerged)"
 
 
-def _proc_pids() -> list[int]:
-    """Bounded pid list from procfs, else one ps call. Never raises."""
+def _proc_scan() -> tuple[list[int], bool]:
+    """Bounded pid list plus a partial flag. Never raises.
+
+    ``partial`` is True when the list hit :data:`MAX_PIDS`, so processes
+    beyond the cap were never examined. A truncated list must never read
+    as a complete scan: callers keep every candidate in that case.
+    """
     try:
         entries = os.listdir("/proc")
     except OSError:
         entries = []
     pids = [int(name) for name in entries if name.isdigit()]
     if pids:
-        return pids[:MAX_PIDS]
+        return pids[:MAX_PIDS], len(pids) > MAX_PIDS
     try:
         proc = subprocess.run(
             ["ps", "-eo", "pid="],
@@ -302,18 +307,25 @@ def _proc_pids() -> list[int]:
             timeout=PS_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return [], False
     if proc.returncode != 0:
-        return []
+        return [], False
     out: list[int] = []
+    partial = False
     for token in (proc.stdout or "").split():
         try:
             out.append(int(token))
         except ValueError:
             continue
         if len(out) >= MAX_PIDS:
+            partial = True
             break
-    return out
+    return out, partial
+
+
+def _proc_pids() -> list[int]:
+    """Bounded pid list from procfs, else one ps call. Never raises."""
+    return _proc_scan()[0]
 
 
 def _has_procfs() -> bool:
@@ -399,7 +411,12 @@ def busy_map(paths: list[str]) -> dict[str, str]:
     """Worktree paths holding a live process, each mapped to its reason."""
     targets = {os.path.realpath(path): path for path in paths}
     mine = os.getpid()
-    pids = [pid for pid in _proc_pids() if pid != mine]
+    pids, partial = _proc_scan()
+    if partial:
+        # The pid list was truncated, so a busy process may sit past the
+        # cap. Keep every candidate rather than delete on a partial scan.
+        return {path: "process scan hit its pid cap" for path in paths}
+    pids = [pid for pid in pids if pid != mine]
     try:
         cwds = _cwd_table(pids)
     except Exception:

@@ -234,6 +234,103 @@ class JanitorTest(unittest.TestCase):
         self.assertTrue(venv.exists())
         self.assertEqual(answer_field(text, "artifacts"), "0")
 
+    def test_branch_skip_protects_the_artifacts_too(self):
+        """A branch-only --skip keeps the worktree and its .venv."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-skip")
+        commit_in(path, "lane.txt")
+        venv = add_venv(path)
+        make_old_tree(path, 30)
+        code, text = run_janitor(repo, "--apply", "--skip", "lane-skip")
+        self.assertEqual(code, 0)
+        self.assertTrue(Path(path).exists())
+        self.assertTrue(venv.exists())
+        self.assertEqual(answer_field(text, "artifacts"), "0")
+
+    def test_activity_during_measurement_prevents_deletion(self):
+        """A process that starts after the busy scan keeps the artifacts."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-race")
+        commit_in(path, "lane.txt")
+        venv = add_venv(path)
+        make_old_tree(path, 30)
+        real_measure = wtjanitor.measure_rows
+
+        def measuring(rows, workers=4):
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=str(path),
+            )
+            self.procs.append(proc)
+            time.sleep(1.0)
+            self.assertIsNone(proc.poll())
+            real_measure(rows, workers)
+
+        with mock.patch.object(wtjanitor, "measure_rows", side_effect=measuring):
+            code, text = run_janitor(repo, "--apply")
+        self.assertEqual(code, 0)
+        self.assertTrue(venv.exists())
+        self.assertEqual(answer_field(text, "artifacts"), "0")
+        self.assertIn("became busy", text)
+
+    def test_source_scan_error_reads_as_unknown(self):
+        """An unreadable subdirectory makes source_mtime unknown, so nothing goes."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-perm")
+        commit_in(path, "lane.txt")
+        sub = Path(path) / "sub"
+        sub.mkdir()
+        (sub / "file.txt").write_text("x", encoding="utf-8")
+        venv = add_venv(path)
+        make_old_tree(path, 30)
+        real_scandir = os.scandir
+
+        def fake_scandir(target):
+            if os.path.realpath(str(target)) == os.path.realpath(str(sub)):
+                raise PermissionError(13, "permission denied", str(target))
+            return real_scandir(target)
+
+        with mock.patch.object(wtjanitor.os, "scandir", side_effect=fake_scandir):
+            self.assertIsNone(wtjanitor.source_mtime(path, time.monotonic() + 30.0))
+            rows, note = wtjanitor.plan_artifacts(
+                str(path), wtjanitor.DEFAULT_ARTIFACT_AGE_S, time.time(),
+                time.monotonic() + 30.0, set(), "lane-perm",
+            )
+        self.assertEqual(rows, [])
+        self.assertEqual(note, "source scan did not finish")
+        self.assertTrue(venv.exists())
+
+    def test_source_scan_deadline_overrun_reads_as_unknown(self):
+        """An expired deadline keeps the worktree instead of reporting an old mtime."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-deadline")
+        commit_in(path, "lane.txt")
+        self.assertIsNone(wtjanitor.source_mtime(path, time.monotonic() - 1.0))
+
+    def test_apply_cooldown_downgrades_a_second_apply_run(self):
+        """--apply-cooldown runs dry after a recent apply and deletes after zero."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-cool")
+        commit_in(path, "lane.txt")
+        add_venv(path)
+        make_old_tree(path, 30)
+        state = Path(tempfile.mkdtemp(prefix="dash-janitor-cool-")) / "janitor_state.json"
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(state.parent)], check=False, timeout=60))
+        code, text = run_janitor(repo, "--apply", "--state-file", str(state), "--apply-cooldown", "1h")
+        self.assertEqual(code, 0)
+        self.assertEqual(answer_field(text, "apply"), "1")
+        venv = add_venv(path)
+        make_old_tree(path, 30)
+        code, text = run_janitor(repo, "--apply", "--state-file", str(state), "--apply-cooldown", "1h")
+        self.assertEqual(code, 0)
+        self.assertIn("apply cooldown", text)
+        self.assertEqual(answer_field(text, "apply"), "0")
+        self.assertTrue(venv.exists())
+        code, text = run_janitor(repo, "--apply", "--state-file", str(state), "--apply-cooldown", "0s")
+        self.assertEqual(code, 0)
+        self.assertEqual(answer_field(text, "apply"), "1")
+        self.assertFalse(venv.exists())
+
     def test_usage_and_wiring(self):
         """The janitor is reachable through agent_dash and refuses bad flags."""
         repo = self._repo()

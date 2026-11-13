@@ -10,10 +10,14 @@ touched for ``--artifact-age`` (24h by default).
 
 Guards, all of which must hold before a folder is deleted:
 
-- the worktree is not the main checkout and is not on the skip list;
-- no process has its cwd inside it or names it on a command line;
+- the worktree is not the main checkout and is not on the skip list
+  (a path or a branch name);
+- no process has its cwd inside it or names it on a command line, both
+  when planning and again right before its artifacts are deleted;
 - the worktree has no tracked or untracked source file modified inside
-  the artifact window (artifact folders themselves are ignored);
+  the artifact window (artifact folders themselves are ignored), checked
+  when planning and again right before deletion;
+- the process scan was complete (a capped scan keeps every candidate);
 - the folder name is a known artifact name (``.venv``, ``node_modules``,
   ``.pytest_cache``, ``.ruff_cache``, ``.mypy_cache``, ``__pycache__``,
   ``.tox``; ``dist``/``build`` only when git ignores them);
@@ -48,7 +52,7 @@ JANITOR_USAGE = """agent-dash worktrees janitor
   python3 agent_dash.py worktrees janitor --repo <path> [--apply]
       [--min-age 4h] [--artifact-age 24h] [--pressure-pct 12]
       [--pressure-age 6h] [--skip <path-or-branch>] [--daily-maintenance]
-      [--state-file <path>] [--json]
+      [--apply-cooldown <dur>] [--state-file <path>] [--json]
 
 Dry-run by default: prints what would go, removes nothing. Pass --apply
 to reap merged worktrees (as `worktrees reap` does) and delete stale
@@ -58,9 +62,13 @@ file in it changed inside --artifact-age (default 24h). When free space
 on the volume is below --pressure-pct (default 12%), the artifact age
 drops to --pressure-age (default 6h) and the run says so. A worktree
 with a live process inside it is never touched, and nothing git tracks
-is ever deleted. --daily-maintenance adds `uv cache prune` and, when
-the installed agentq supports it, `agentq gc --apply --runs-older-than
-7d`, at most once per 24h.
+is ever deleted. --skip takes a path or a branch name; skipping either
+keeps the worktree and its artifacts. --apply-cooldown <dur> turns an
+--apply run into a dry run when the previous --apply run on that
+checkout is younger than <dur>; the scheduled launchd job passes 1h so
+a run right after load cannot delete a second time. --daily-maintenance
+adds `uv cache prune` and, when the installed agentq supports it,
+`agentq gc --apply --runs-older-than 7d`, at most once per 24h.
 """
 
 ARTIFACT_DIRS = (
@@ -128,7 +136,9 @@ def source_mtime(path: str | Path, deadline: float) -> float | None:
     Artifact folders (and ``.git``) are skipped, so a dependency checkout
     cannot make a worktree look used. Returns None when the scan fails or
     runs past ``deadline`` (``time.monotonic()`` timestamp); callers keep
-    the worktree in that case.
+    the worktree in that case. Any unreadable directory or entry makes the
+    whole scan unknown: a partial walk could report an old timestamp for a
+    worktree that is in fact in use.
     """
     root = str(path)
     try:
@@ -142,11 +152,13 @@ def source_mtime(path: str | Path, deadline: float) -> float | None:
             return None
         current = stack.pop()
         try:
-            entries = list(os.scandir(current))
+            with os.scandir(current) as scan:
+                entries = list(scan)
         except OSError:
-            if current == root:
-                return None
-            continue
+            return None
+        # One slow directory must not overrun the deadline unnoticed.
+        if time.monotonic() > deadline:
+            return None
         for entry in entries:
             name = entry.name
             if name in ALL_ARTIFACT_NAMES or name == ".git":
@@ -158,7 +170,7 @@ def source_mtime(path: str | Path, deadline: float) -> float | None:
                     stack.append(entry.path)
                 stamp = entry.stat(follow_symlinks=False).st_mtime
             except OSError:
-                continue
+                return None
             if newest is None or stamp > newest:
                 newest = stamp
     # A worktree with no source files at all falls back to its own mtime.
@@ -204,9 +216,14 @@ def plan_artifacts(
     now: float,
     deadline: float,
     skips: set[str],
+    branch: str | None = None,
 ) -> tuple[list[dict], str]:
-    """Artifact plan for one worktree plus a note when it was skipped whole."""
-    if path in skips:
+    """Artifact plan for one worktree plus a note when it was skipped whole.
+
+    ``skips`` holds both paths and branch names, so a branch-only
+    ``--skip`` protects the worktree's artifacts as well as the worktree.
+    """
+    if path in skips or (branch and branch in skips):
         return [], "on the skip list"
     names = artifact_names(path)
     if not names:
@@ -251,6 +268,41 @@ def measure_rows(rows: list[dict], workers: int = 4) -> None:
             row["reason"] = "du could not measure it"
         else:
             row["bytes"] = size
+
+
+def revalidate_rows(rows: list[dict], path: str, artifact_age_s: float, now: float) -> None:
+    """Downgrade the delete rows of one worktree when it changed since planning.
+
+    The busy scan and the source scan run before the (slow) ``du``
+    measurement, so a process can start inside a worktree, or a file can
+    be touched, between planning and deleting. Re-check one worktree
+    immediately before its artifacts go, and keep everything on any
+    doubt: a busy worktree, an unfinished scan, or a fresh mtime.
+    """
+    group = [
+        row for row in rows
+        if row.get("decision") == "delete" and row.get("path") == path
+    ]
+    if not group:
+        return
+    reason = ""
+    try:
+        busy = worktrees.busy_map([path])
+    except Exception:
+        busy = {path: "process scan could not run here"}
+    if busy.get(path):
+        reason = "became busy: " + busy[path]
+    else:
+        deadline = time.monotonic() + SCAN_DEADLINE_S
+        newest = source_mtime(path, deadline)
+        if newest is None:
+            reason = "source re-check did not finish"
+        elif now - newest < artifact_age_s:
+            reason = "touched " + _human_duration(now - newest) + " ago"
+    if reason:
+        for row in group:
+            row["decision"] = "keep"
+            row["reason"] = reason
 
 
 def remove_tree(path: str | Path) -> bool:
@@ -300,6 +352,23 @@ def _human_duration(seconds: float) -> str:
 def default_state_file() -> Path:
     """State file for the once-a-day maintenance runs."""
     return Path(dataroot.state_dir()) / STATE_FILE_NAME
+
+
+def apply_stamp_key(top: str) -> str:
+    """State key holding the last ``--apply`` run time for one checkout."""
+    return "last_apply:" + top
+
+
+def apply_cooldown_left(state_file: str | Path, top: str, cooldown_s: float, now: float) -> float:
+    """Seconds left before another ``--apply`` run is allowed, or 0."""
+    if cooldown_s <= 0:
+        return 0.0
+    last = load_state(state_file).get(apply_stamp_key(top))
+    last_ts = float(last) if isinstance(last, (int, float)) else 0.0
+    if not last_ts:
+        return 0.0
+    left = cooldown_s - (now - last_ts)
+    return left if left > 0 else 0.0
 
 
 def load_state(path: str | Path) -> dict:
@@ -434,6 +503,7 @@ def cmd_janitor(argv: list[str]) -> int:
     pressure_age_raw = "6h"
     pressure_raw = str(DEFAULT_PRESSURE_PCT)
     state_file: str | None = None
+    cooldown_raw: str | None = None
     skips: set[str] = set()
     args = list(argv or [])
     index = 0
@@ -470,6 +540,9 @@ def cmd_janitor(argv: list[str]) -> int:
         elif token == "--state-file" and index + 1 < len(args):
             state_file = args[index + 1]
             index += 2
+        elif token == "--apply-cooldown" and index + 1 < len(args):
+            cooldown_raw = args[index + 1]
+            index += 2
         else:
             print(JANITOR_USAGE, end="", file=sys.stderr)
             return errors.USAGE
@@ -484,17 +557,20 @@ def cmd_janitor(argv: list[str]) -> int:
     artifact_age_s = worktrees.parse_duration(artifact_age_raw)
     pressure_age_s = worktrees.parse_duration(pressure_age_raw)
     pressure_pct = _parse_pct(pressure_raw)
+    cooldown_s = 0.0 if cooldown_raw is None else worktrees.parse_duration(cooldown_raw)
     for label, value in (
         ("--min-age", min_age_s),
         ("--artifact-age", artifact_age_s),
         ("--pressure-age", pressure_age_s),
         ("--pressure-pct", pressure_pct),
+        ("--apply-cooldown", 0.0 if cooldown_raw is None else cooldown_s),
     ):
         if value is None:
             print(
                 "bad " + label + " " + repr(
                     {"--min-age": min_age_raw, "--artifact-age": artifact_age_raw,
-                     "--pressure-age": pressure_age_raw, "--pressure-pct": pressure_raw}[label]
+                     "--pressure-age": pressure_age_raw, "--pressure-pct": pressure_raw,
+                     "--apply-cooldown": cooldown_raw}[label]
                 ) + ". Durations look like 30s, 90m, 3h, 2d; the percentage is 0-100. "
                 "Run: python3 agent_dash.py worktrees janitor --repo <path>",
                 file=sys.stderr,
@@ -509,11 +585,22 @@ def cmd_janitor(argv: list[str]) -> int:
         )
         return errors.NOT_FOUND
     now = time.time()
+    state_target = state_file or str(default_state_file())
+    cooldown_left = apply_cooldown_left(state_target, top, cooldown_s, now) if apply else 0.0
+    if cooldown_left > 0:
+        # A scheduled run right after load or another apply run must not
+        # delete again: fall back to a dry run instead of skipping.
+        apply = False
     dry_run = not apply
     free_pct = disk_free_pct(top)
     pressure = free_pct is not None and free_pct < pressure_pct
     effective_age_s = min(artifact_age_s, pressure_age_s) if pressure else artifact_age_s
     lines: list[str] = []
+    if cooldown_left > 0:
+        lines.append(
+            "apply cooldown: another --apply run was less than %s ago, running as a dry run"
+            % _human_duration(cooldown_s)
+        )
     if pressure:
         lines.append(
             "disk pressure: %.1f%% free below %.1f%%, artifact age %s -> %s"
@@ -531,31 +618,41 @@ def cmd_janitor(argv: list[str]) -> int:
         lines.append("%s %s %s (%s)" % (verb, row["path"], _human_bytes(row.get("bytes", 0)), row.get("reason", "")))
 
     remaining = [
-        row["path"]
+        row
         for row in rows
         if row.get("decision") != "reap" and os.path.isdir(row.get("path", ""))
     ]
     try:
-        busy = worktrees.busy_map(remaining)
+        busy = worktrees.busy_map([row["path"] for row in remaining])
     except Exception:
-        busy = {path: "process scan could not run here" for path in remaining}
+        busy = {row["path"]: "process scan could not run here" for row in remaining}
     artifact_rows: list[dict] = []
-    for path in remaining:
+    for row in remaining:
+        path = row["path"]
         if busy.get(path):
             continue
         deadline = time.monotonic() + SCAN_DEADLINE_S
-        planned, note = plan_artifacts(path, effective_age_s, now, deadline, skips)
+        planned, note = plan_artifacts(
+            path, effective_age_s, now, deadline, skips, row.get("branch")
+        )
         if note:
             continue
         artifact_rows.extend(planned)
     measure_rows(artifact_rows)
+    checked: set[str] = set()
     for row in artifact_rows:
         if row["decision"] == "delete" and apply:
-            if remove_tree(row["target"]):
-                row["reason"] = row["reason"] + "; deleted"
-            else:
-                row["decision"] = "keep"
-                row["reason"] = "delete failed"
+            if row["path"] not in checked:
+                checked.add(row["path"])
+                # ``du`` above can take minutes, so re-check this worktree
+                # right before its artifacts go.
+                revalidate_rows(artifact_rows, row["path"], effective_age_s, now)
+            if row["decision"] == "delete":
+                if remove_tree(row["target"]):
+                    row["reason"] = row["reason"] + "; deleted"
+                else:
+                    row["decision"] = "keep"
+                    row["reason"] = "delete failed"
         if row["decision"] == "delete":
             verb = "would delete" if dry_run else "deleted"
             lines.append("%s %s %s (%s)" % (verb, row["target"], _human_bytes(row["bytes"]), row["reason"]))
@@ -571,12 +668,18 @@ def cmd_janitor(argv: list[str]) -> int:
 
     maintenance: list[dict] = []
     if daily:
-        state_target = state_file or str(default_state_file())
         maintenance = run_maintenance(state_target, apply, now)
         for row in maintenance:
             lines.append("%s %s (%s)" % (row["decision"], row["command"], row["reason"]))
         if not apply:
             lines.append("maintenance runs are planned only; rerun with --apply")
+    if apply and cooldown_s > 0:
+        # Remember this apply run so --apply-cooldown can see it. Only runs
+        # that ask for a cooldown write the stamp, so a plain --apply never
+        # touches the state file.
+        stamp_state = load_state(state_target)
+        stamp_state[apply_stamp_key(top)] = now
+        save_state(state_target, stamp_state)
 
     payload = {
         "repo": top,

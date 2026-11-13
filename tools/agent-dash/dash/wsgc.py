@@ -837,8 +837,11 @@ def snapshot_processes() -> dict | None:
     from dash import worktrees as _worktrees
 
     try:
-        pids = _worktrees._proc_pids()
+        pids, partial = _worktrees._proc_scan()
     except Exception:
+        return None
+    if partial:
+        # A truncated pid list may hide a live process; keep every worktree.
         return None
     if not pids:
         return None
