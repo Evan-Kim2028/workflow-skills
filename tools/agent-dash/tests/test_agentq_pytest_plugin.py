@@ -2,7 +2,9 @@
 
 Offline. Every test uses a temp AGENTQ_HOME. The live-interpreter tests run
 ``sys.executable -m pytest`` (an absolute-path interpreter, as a pi worker runs
-a venv) on a trivial test file in a temp folder, so no project suite runs.
+a venv) on a trivial test file in a temp folder, so no project suite runs. The
+xdist cap tests run real ``-n`` runs on a temp module and count the distinct
+``PYTEST_XDIST_WORKER`` values the tests write.
 """
 
 import importlib.util
@@ -150,6 +152,34 @@ class PluginSlotTests(PluginBase):
         self.assertEqual(slots.holders(self.home, "pytest", 16), [])
 
 
+class XdistCapUnitTests(unittest.TestCase):
+    """The cap value and the clamp, without a subprocess."""
+
+    def test_cap_defaults_to_two_and_ignores_blank_or_invalid_values(self):
+        self.assertEqual(plugin._xdist_cap({}), 2)
+        self.assertEqual(plugin._xdist_cap({"LOR_CI_XDIST": "  "}), 2)
+        self.assertEqual(plugin._xdist_cap({"LOR_CI_XDIST": "nope"}), 2)
+        self.assertEqual(plugin._xdist_cap({"LOR_CI_XDIST": "0"}), 2)
+        self.assertEqual(plugin._xdist_cap({"LOR_CI_XDIST": "3"}), 3)
+
+    def test_clamp_lowers_numprocesses_and_tx(self):
+        config = SimpleNamespace(option=SimpleNamespace(numprocesses=8, tx=["popen"] * 8))
+        self.assertEqual(plugin._clamp_xdist(config, {}), (8, 2))
+        self.assertEqual(config.option.numprocesses, 2)
+        self.assertEqual(config.option.tx, ["popen", "popen"])
+
+    def test_clamp_leaves_zero_one_and_no_n_alone(self):
+        for num, tx in ((0, []), (1, ["popen"]), (None, None)):
+            config = SimpleNamespace(option=SimpleNamespace(numprocesses=num, tx=tx))
+            self.assertIsNone(plugin._clamp_xdist(config, {}))
+            self.assertEqual(config.option.numprocesses, num)
+            self.assertEqual(config.option.tx, tx)
+
+    def test_clamp_skips_a_config_without_xdist_options(self):
+        self.assertIsNone(plugin._clamp_xdist(SimpleNamespace(option=SimpleNamespace()), {}))
+        self.assertIsNone(plugin._clamp_xdist(SimpleNamespace(), {}))
+
+
 def probe_script():
     """A temp test that records which pytest slots are busy, as the holder's JSON records."""
     return (
@@ -211,12 +241,109 @@ class LiveInterpreterTests(unittest.TestCase):
         self.assertTrue(busy[0]["command"].startswith("pytest"))
         self.assertEqual(slots.holders(self.home, "pytest", 16), [])
 
-    def test_xdist_is_capped_at_two_workers_in_the_env(self):
-        env = self.pi_env()
-        self.assertEqual(env["PYTEST_XDIST_AUTO_NUM_WORKERS"], "2")
-        self.assertEqual(env["LOR_CI_XDIST"], "2")
-        self.assertIn("-p agentq_pytest_slot", env["PYTEST_ADDOPTS"])
-        self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(PLUGIN_DIR))
+
+def worker_script(count):
+    """A temp test module whose tests append their ``PYTEST_XDIST_WORKER`` to ``WORKERS_OUT``."""
+    body = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "def _record():\n"
+        "    with open(os.environ['WORKERS_OUT'], 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(os.environ.get('PYTEST_XDIST_WORKER', 'main') + '\\n')\n"
+    )
+    for index in range(count):
+        body += f"def test_{index}():\n    _record()\n"
+    return body
+
+
+class XdistCapTests(unittest.TestCase):
+    """Real xdist runs: the plugin caps the workers xdist actually creates, not just ``-n auto``.
+
+    Each run is ``sys.executable -m pytest`` on a temp module of 8 trivial tests that append
+    their ``PYTEST_XDIST_WORKER`` to a file, so the distinct values are the workers created.
+    ``AGENTQ_PYTEST_SLOT_HELD=1`` keeps the slot out of these runs; the cap is a separate hook.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        (self.home / "broker.json").write_text(json.dumps({"adaptive": {"enabled": False}}), encoding="utf-8")
+        self.work = self.tmp / "work"
+        self.work.mkdir()
+        (self.work / "test_workers.py").write_text(worker_script(8), encoding="utf-8")
+        self.out = self.tmp / "workers.txt"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def env(self, extra=None, plugin=True):
+        base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", str(self.tmp))}
+        env = launch.shim_environ(base, shims_dir=SHIMS, python=sys.executable) if plugin else dict(base)
+        env.update({
+            "AGENTQ_HOME": str(self.home),
+            "AGENTQ_RUN": "ws9-exec-xdist",
+            "AGENTQ_PYTEST_SLOT_HELD": "1",
+            "WORKERS_OUT": str(self.out),
+        })
+        for key in ("PYTEST_XDIST_AUTO_NUM_WORKERS", "LOR_CI_XDIST"):
+            env.pop(key, None)
+        env.update(extra or {})
+        return env
+
+    def run_pytest(self, args, env):
+        command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args]
+        return subprocess.run(command, cwd=str(self.work), env=env, capture_output=True, text=True, timeout=180)
+
+    def workers(self):
+        if not self.out.exists():
+            return []
+        return sorted({line for line in self.out.read_text(encoding="utf-8").split() if line})
+
+    def assert_capped(self, result, cap):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        workers = self.workers()
+        self.assertTrue(workers, result.stdout + result.stderr)
+        self.assertLessEqual(len(workers), cap, workers)
+        return workers
+
+    def test_explicit_n_eight_is_capped_at_two(self):
+        result = self.run_pytest(["-n", "8"], self.env())
+        self.assert_capped(result, 2)
+        self.assertIn("xdist workers lowered from 8 to 2 (LOR_CI_XDIST)", result.stderr)
+        self.assertEqual(result.stderr.count("xdist workers lowered"), 1)
+
+    def test_n_auto_with_a_large_environment_value_is_capped(self):
+        result = self.run_pytest(["-n", "auto"], self.env({"PYTEST_XDIST_AUTO_NUM_WORKERS": "8"}))
+        self.assert_capped(result, 2)
+        self.assertIn("xdist workers lowered from 8 to 2 (LOR_CI_XDIST)", result.stderr)
+
+    def test_n_logical_is_capped(self):
+        result = self.run_pytest(["-n", "logical"], self.env())
+        self.assert_capped(result, 2)
+
+    def test_cap_is_configurable_through_the_launcher_variable(self):
+        result = self.run_pytest(["-n", "8"], self.env({"LOR_CI_XDIST": "3"}))
+        self.assert_capped(result, 3)
+        self.assertIn("xdist workers lowered from 8 to 3 (LOR_CI_XDIST)", result.stderr)
+
+    def test_n_one_and_no_n_are_left_alone(self):
+        one = self.run_pytest(["-n", "1"], self.env())
+        self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
+        self.assertEqual(self.workers(), ["gw0"])
+        self.assertNotIn("xdist workers lowered", one.stderr)
+        self.out.unlink()
+        plain = self.run_pytest([], self.env())
+        self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+        self.assertEqual(self.workers(), ["main"])
+        self.assertNotIn("xdist workers lowered", plain.stderr)
+
+    def test_without_the_plugin_the_same_run_creates_more_than_two_workers(self):
+        """Control: the worker count above is real, not an artefact of the temp module."""
+        result = self.run_pytest(["-n", "4"], self.env(plugin=False))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.workers()), 4, self.workers())
 
 
 class ShimHandoffTests(unittest.TestCase):
@@ -298,13 +425,13 @@ class LaunchPiPluginEnvTests(unittest.TestCase):
         env = self.env({"PATH": "/bin"})
         self.assertEqual(env["PYTEST_ADDOPTS"], "-p agentq_pytest_slot")
 
-    def test_xdist_caps_default_to_two_and_respect_existing_values(self):
+    def test_xdist_cap_defaults_to_two_and_keeps_an_explicit_cap(self):
         env = self.env({"PATH": "/bin"})
         self.assertEqual(env["PYTEST_XDIST_AUTO_NUM_WORKERS"], "2")
         self.assertEqual(env["LOR_CI_XDIST"], "2")
-        kept = self.env({"PATH": "/bin", "PYTEST_XDIST_AUTO_NUM_WORKERS": "4", "LOR_CI_XDIST": "8"})
+        kept = self.env({"PATH": "/bin", "PYTEST_XDIST_AUTO_NUM_WORKERS": "4", "LOR_CI_XDIST": "3"})
         self.assertEqual(kept["PYTEST_XDIST_AUTO_NUM_WORKERS"], "4")
-        self.assertEqual(kept["LOR_CI_XDIST"], "8")
+        self.assertEqual(kept["LOR_CI_XDIST"], "3")
 
     def test_empty_xdist_value_counts_as_unset(self):
         env = self.env({"PATH": "/bin", "LOR_CI_XDIST": "  "})

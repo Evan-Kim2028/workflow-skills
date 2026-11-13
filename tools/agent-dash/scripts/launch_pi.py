@@ -63,8 +63,10 @@ the plugin instead. ``shim_environ`` sets, on the pi child:
 
 - ``PYTHONPATH``: the plugin folder prepended to any existing value.
 - ``PYTEST_ADDOPTS``: ``-p agentq_pytest_slot`` appended to any existing value.
-- ``PYTEST_XDIST_AUTO_NUM_WORKERS=2`` and ``LOR_CI_XDIST=2``, each only when unset,
-  so xdist runs cap at two workers and a shared laptop is not oversubscribed.
+- ``PYTEST_XDIST_AUTO_NUM_WORKERS=2`` and ``LOR_CI_XDIST=2``, each only when unset.
+  ``LOR_CI_XDIST`` is the worker cap the plugin enforces on xdist's parsed count
+  (explicit ``-n``, ``-n auto``, ``-n logical``), so a shared laptop is not
+  oversubscribed; ``PYTEST_XDIST_AUTO_NUM_WORKERS`` only makes ``-n auto`` cheap.
 
 ``AGENT_DASH_PI_ENV_FILE`` names an env file to source before the run:
 ``run_worker.py`` sets it for a tier that declares ``standby_env_file``, so

@@ -267,6 +267,13 @@ and several such runs at 44-71% CPU each were seen on a laptop at load 38-44 on 
   `PYTHONPATH` (plugin folder prepended), `PYTEST_ADDOPTS` (`-p agentq_pytest_slot` appended),
   and `PYTEST_XDIST_AUTO_NUM_WORKERS=2` and `LOR_CI_XDIST=2` when unset. Any project venv
   then loads the plugin with no change to the project.
+- **xdist worker cap.** `LOR_CI_XDIST` (default 2) is the cap, and the plugin enforces it on
+  xdist's parsed worker count, not on the environment: its `pytest_cmdline_main` runs after
+  xdist's `tryfirst` one, which resolves `-n auto` / `-n logical` (from
+  `PYTEST_XDIST_AUTO_NUM_WORKERS` or the CPU count) and builds `config.option.tx`. So an
+  explicit `-n 8`, `-n auto` with a large environment value, and `-n logical` all end up at
+  the cap; `-n 0`, `-n 1` and no `-n` are left alone. One `agentq pytest slot: xdist workers
+  lowered from N to M (LOR_CI_XDIST)` line goes to stderr when it lowers a value.
 - **Skips.** xdist workers (`workerinput` or `PYTEST_XDIST_WORKER`), so the main process
   holds the one slot for the whole run; a run with `AGENTQ_PYTEST_SLOT_HELD` set. The shim
   sets that variable for its child, so a shim-gated pytest takes no second slot. The plugin
@@ -281,7 +288,8 @@ and several such runs at 44-71% CPU each were seen on a laptop at load 38-44 on 
 
 Tests: `tests/test_agentq_pytest_plugin.py` (slot acquire and release, skips, error paths,
 a live `sys.executable -m pytest` run that checks the slot is held during the run, shim
-handoff, launcher env composition).
+handoff, launcher env composition, and real xdist runs that count the workers created for
+`-n 8`, `-n auto` with `PYTEST_XDIST_AUTO_NUM_WORKERS=8`, `-n logical` and a raised cap).
 
 ## Known limits
 
