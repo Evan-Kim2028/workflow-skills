@@ -43,6 +43,9 @@ class HealTest(unittest.TestCase):
         self.launchd = RUNNING
         self.kick_rc = 0
         self.kick_text = ""
+        self.kick_seconds = 0.0
+        self.state_path_for_test: Path | None = None
+        self.seen_during_kick: list[dict] = []
         self.calls: list[list[str]] = []
         self.logs: list[str] = []
 
@@ -50,6 +53,9 @@ class HealTest(unittest.TestCase):
         self.calls.append(list(args))
         if args[0] == "print":
             return self.launchd
+        self.clock.at += self.kick_seconds
+        if self.state_path_for_test is not None and self.state_path_for_test.exists():
+            self.seen_during_kick.append(json.loads(self.state_path_for_test.read_text()))
         return (self.kick_rc, self.kick_text)
 
     def healer(self, **overrides) -> B.ProxyHealer:
@@ -64,7 +70,8 @@ class HealTest(unittest.TestCase):
             log=self.logs.append,
             state_path=self.home / B.HEAL_STATE_FILE,
         )
-        self.addCleanup(healer.stop)
+        self.state_path_for_test = self.home / B.HEAL_STATE_FILE
+        self.addCleanup(healer.shutdown)
         return healer
 
     def kicks(self) -> list[list[str]]:
@@ -163,6 +170,189 @@ class DecisionTest(HealTest):
         healer.step()
         self.assertEqual(probes, [])
         self.assertEqual(self.calls, [])
+
+
+class IntervalAfterCompletionTest(HealTest):
+    def test_the_reviewer_case_is_spaced_from_the_completion_not_the_attempt(self) -> None:
+        self.hang()
+        self.kick_seconds = 30
+        first = self.healer()
+        for at in (1000, 1090):
+            self.clock.at = at
+            first.step()
+        self.assertEqual(len(self.kicks()), 1)
+        self.assertEqual(first.last_success, 1120)
+        second = self.healer()
+        self.clock.at = 1600
+        second.step()
+        self.clock.at = 1700
+        second.step()
+        self.assertEqual(len(self.kicks()), 1)
+        self.clock.at = 1725
+        second.step()
+        self.assertEqual(len(self.kicks()), 2)
+
+    def test_a_failed_attempt_is_spaced_from_the_attempt(self) -> None:
+        self.hang()
+        self.kick_rc = 1
+        first = self.healer()
+        for at in (1000, 1090):
+            self.clock.at = at
+            first.step()
+        self.kick_rc = 0
+        second = self.healer()
+        self.clock.at = 1600
+        second.step()
+        self.clock.at = 1700
+        second.step()
+        self.assertEqual(len(self.kicks()), 2)
+
+    def test_the_attempt_is_on_disk_before_the_kickstart_runs(self) -> None:
+        self.hang()
+        healer = self.healer()
+        for at in (1000, 1090):
+            self.clock.at = at
+            healer.step()
+        self.assertEqual(self.seen_during_kick[0]["last_result"], "attempting")
+        self.assertEqual(self.seen_during_kick[0]["last_attempt"], 1090)
+        self.assertIsNone(self.seen_during_kick[0]["last_success"])
+
+
+class StateValidationTest(HealTest):
+    def write_state(self, text: str) -> None:
+        (self.home / B.HEAL_STATE_FILE).write_text(text)
+
+    def load(self):
+        healer = self.healer()
+        return healer.last_attempt, healer.last_success, healer.last_result
+
+    def test_damaged_or_non_object_files_are_ignored(self) -> None:
+        for text in ("{not json", "[1, 2]", '"text"', ""):
+            with self.subTest(text=text):
+                self.logs.clear()
+                self.write_state(text)
+                self.assertEqual(self.load(), (None, None, None))
+                self.assertTrue(self.logs)
+
+    def test_non_finite_numbers_are_ignored_and_healing_still_works(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity", "1e400"):
+            with self.subTest(value=value):
+                self.logs.clear()
+                self.write_state('{"last_attempt": %s}' % value)
+                self.hang()
+                self.calls.clear()
+                healer = self.healer()
+                for at in (1000, 1095):
+                    self.clock.at = at
+                    healer.step()
+                self.assertEqual(len(self.kicks()), 1)
+                self.assertIn("proxy heal state ignored: last_attempt is not finite", self.logs)
+                (self.home / B.HEAL_STATE_FILE).unlink()
+
+    def test_an_integer_too_large_for_a_float_is_ignored_without_raising(self) -> None:
+        self.write_state('{"last_attempt": %s}' % ("1" + "0" * 400))
+        self.assertEqual(self.load(), (None, None, None))
+        self.assertIn("proxy heal state ignored: last_attempt is not finite", self.logs)
+
+    def test_strings_and_booleans_are_ignored(self) -> None:
+        for value in ('"1095"', "true", "[]"):
+            with self.subTest(value=value):
+                self.logs.clear()
+                self.write_state('{"last_attempt": %s}' % value)
+                self.assertEqual(self.load()[0], None)
+                self.assertIn("proxy heal state ignored: last_attempt is not a number", self.logs)
+
+    def test_a_timestamp_dated_more_than_a_minute_ahead_is_ignored(self) -> None:
+        self.write_state('{"last_attempt": %s}' % (self.clock.at + 3600))
+        self.assertEqual(self.load()[0], None)
+        self.assertIn("proxy heal state ignored: last_attempt is dated in the future", self.logs)
+
+    def test_a_timestamp_a_little_ahead_is_kept(self) -> None:
+        self.write_state('{"last_attempt": %s}' % (self.clock.at + 30))
+        self.assertEqual(self.load()[0], self.clock.at + 30)
+
+    def test_each_bad_field_is_ignored_on_its_own(self) -> None:
+        self.write_state('{"last_attempt": "x", "last_success": 990, "last_result": 7}')
+        attempt, success, result = self.load()
+        self.assertEqual((attempt, success, result), (None, 990, None))
+
+    def test_bad_state_is_logged_once_per_load(self) -> None:
+        self.write_state('{"last_attempt": NaN, "last_success": "x"}')
+        self.load()
+        self.assertEqual(len(self.logs), 2)
+
+
+class LifecycleTest(HealTest):
+    def healer_for_lifecycle(self) -> B.ProxyHealer:
+        self.kind, self.doc = "timeout", None
+        healer = self.healer()
+        healer.probe_s = 0.05
+        return healer
+
+    def test_a_second_daemon_rejected_by_the_lock_never_probes_or_kickstarts(self) -> None:
+        from unittest import mock
+
+        held = B.acquire_lock(self.home)
+        self.addCleanup(held.close)
+        probes: list[int] = []
+        self.kick_seconds = 0.0
+        healer = self.healer_for_lifecycle()
+        healer.probe = lambda: probes.append(1) or ("timeout", None)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+        with self.assertRaises(B.DaemonRunning):
+            broker.run_forever(tick_s=0.01)
+        time.sleep(0.2)
+        self.assertEqual(probes, [])
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(healer._thread)
+
+    def test_the_daemon_command_exits_cleanly_when_the_lock_is_held(self) -> None:
+        from unittest import mock
+        import io
+        from agentq import cli
+
+        held = B.acquire_lock(self.home)
+        self.addCleanup(held.close)
+        probes: list[int] = []
+        healer = self.healer_for_lifecycle()
+        healer.probe = lambda: probes.append(1) or ("timeout", None)
+        out = io.StringIO()
+        with mock.patch.object(B.ProxyHealer, "for_home", return_value=healer):
+            code = cli.main(["daemon"], env={"AGENTQ_HOME": str(self.home)}, out=out, now=time.time)
+        time.sleep(0.2)
+        self.assertEqual(code, 0)
+        self.assertEqual(probes, [])
+        self.assertEqual(self.kicks(), [])
+        self.assertIsNone(healer._thread)
+
+    def test_the_healer_thread_is_stopped_and_joined_on_interrupt_and_on_exit(self) -> None:
+        from unittest import mock
+
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                healer = self.healer_for_lifecycle()
+                broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+                with mock.patch.object(broker, "tick", side_effect=exc):
+                    with self.assertRaises(exc):
+                        broker.run_forever(tick_s=0.01)
+                self.assertTrue(healer._stop.is_set())
+                self.assertFalse(healer._thread.is_alive())
+
+    def test_the_healer_thread_runs_only_while_the_daemon_holds_the_lock(self) -> None:
+        from unittest import mock
+
+        healer = self.healer_for_lifecycle()
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+        seen: list[bool] = []
+
+        def tick_once():
+            seen.append(healer._thread is not None and healer._thread.is_alive())
+            raise KeyboardInterrupt
+
+        with mock.patch.object(broker, "tick", side_effect=tick_once):
+            with self.assertRaises(KeyboardInterrupt):
+                broker.run_forever(tick_s=0.01)
+        self.assertEqual(seen, [True])
 
 
 class CorroborationTest(HealTest):

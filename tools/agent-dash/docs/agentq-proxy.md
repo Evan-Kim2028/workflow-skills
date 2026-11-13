@@ -249,9 +249,14 @@ code, or one that times out (code 124), is logged as `proxy restart failed: rc=<
 kickstart clears the episode.
 
 Attempts are recorded in `$AGENTQ_HOME/proxy_heal.json` (`last_attempt`,
-`last_result`). They are at least `min_interval_s` (600 s) apart across broker
-restarts, and after each restart the proxy must fail for another `fail_s` before the
-next one. A job that is not loaded, or has no pid, is never touched.
+`last_success`, `last_result`). The attempt is written before the kickstart runs. A
+restart may run only `min_interval_s` (600 s) after the last successful kickstart
+completed, and only after the last attempt, so a failed attempt also counts. The
+spacing holds across broker restarts. After each restart the proxy must fail for
+another `fail_s` before the next one. A job that is not loaded, or has no pid, is
+never touched. A state field that is not a finite number, is a string or boolean, or is
+dated more than 60 s in the future is ignored and logged, and healing carries on. A
+backwards clock step can lengthen the wait by the size of the step.
 
 Settings live in `broker.json` under `proxy_heal`: `{"enabled": true, "fail_s": 90,
 "min_interval_s": 600, "probe_s": 10, "corroborate_lag_ms": 2000}`. Only the daemon
