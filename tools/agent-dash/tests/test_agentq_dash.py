@@ -1266,12 +1266,12 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["chip"], "Morph slow")
         self.assertEqual(
             result["text"],
-            "Morph is slow: first byte 11.2 s vs 5.0 s usual; extra workers would only queue at Morph (limit 28 in flight).",
+            "Morph is slow: first byte 11.2 s vs 5.0 s usual; requests above 28 in flight wait at the proxy.",
         )
 
     def test_morph_slow_names_the_would_be_limit_in_shadow(self) -> None:
         result = verdict_for(five_minutes(total=1_000_000), live=dict(IDLE_LIVE, inflight_mode="shadow"), slow=slow_ttfb())
-        self.assertIn("(shadow: would limit to 28 in flight)", result["text"])
+        self.assertIn("(advisory in-flight limit 28, not enforced)", result["text"])
 
     def test_morph_slow_needs_an_empty_budget_queue(self) -> None:
         result = verdict_for(five_minutes(total=1_000_000), live=live_queued(output=3), slow=slow_ttfb())

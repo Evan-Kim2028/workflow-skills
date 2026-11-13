@@ -748,9 +748,9 @@ class InflightFillGateTest(unittest.TestCase):
     def test_enforced_limit_with_nothing_held_does_not_hold_filler(self) -> None:
         self.assertIsNone(F.inflight_gate(self.status(inflight_queued=0)))
 
-    def test_shadow_limit_is_named_as_would_be_when_deepseek_is_at_it(self) -> None:
-        reason = F.inflight_gate(self.status(inflight_enforcing=False, inflight_mode="shadow", inflight_queued=0))
-        self.assertEqual(reason, "Morph slow: in-flight limit 28 reached (shadow: would limit to 28)")
+    def test_shadow_limit_never_holds_filler_even_at_the_limit(self) -> None:
+        """An advisory limit is too conservative to gate on (2026-11-13 A/B: enforce cost 19% of throughput)."""
+        self.assertIsNone(F.inflight_gate(self.status(inflight_enforcing=False, inflight_mode="shadow", inflight_queued=0)))
 
     def test_shadow_below_the_limit_does_not_hold_filler(self) -> None:
         self.assertIsNone(F.inflight_gate(self.status(inflight_enforcing=False, inflight_in_flight=10)))

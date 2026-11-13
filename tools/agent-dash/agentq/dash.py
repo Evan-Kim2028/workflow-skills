@@ -3061,10 +3061,10 @@ def slow_text(slow: dict, *, shadow: bool) -> str:
     """The Morph slow headline. In shadow mode the limit is named as what it would be, not what it is."""
     base = f"Morph is slow: first byte {slow['ttfb_ms'] / 1000:.1f} s vs {slow['baseline_ms'] / 1000:.1f} s usual"
     if slow.get("limit") is None:
-        return f"{base}; extra workers would only queue at Morph."
+        return f"{base}."
     if shadow:
-        return f"{base}; extra workers would only queue at Morph (shadow: would limit to {slow['limit']} in flight)."
-    return f"{base}; extra workers would only queue at Morph (limit {slow['limit']} in flight)."
+        return f"{base} (advisory in-flight limit {slow['limit']}, not enforced)."
+    return f"{base}; requests above {slow['limit']} in flight wait at the proxy."
 
 
 def budget_429_in_window(budget_429s: dict[str, set[int]] | None, minutes: range) -> bool:
