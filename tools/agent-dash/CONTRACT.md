@@ -35,6 +35,7 @@ The Linear source (`dash/sources/linear.py`) is the one outbound network call. I
 | `dash/buildinfo.py` (build id + process start time) | core |
 | `dash/deploy.py` (clean-release deploy, rollback, `releases/`) | core |
 | `dash/worktrees.py` (safe worktree reaper: `worktrees reap --repo <path>` lists linked worktrees and, with `--apply`, removes only clean merged idle old ones via `worktree remove` plus `branch -d`; dry-run by default) | core |
+| `dash/wtjanitor.py` (disk janitor: `worktrees janitor --repo <path>` runs the reap, then deletes stale regenerable artifact folders — `.venv`, `node_modules`, tool caches — from the worktrees that remain, never touching tracked files or busy worktrees; 6h artifact age under disk pressure, `--daily-maintenance` for `uv cache prune` and capability-checked `agentq gc`; dry-run by default) | core |
 | `dash/server.py` (HTTP + SSE, routes below) | core |
 | `dash/actions.py` (the page write actions: guarded `POST /api/workstreams/archive|restore|state|bulk` through the CLI lifecycle functions, local-only, read-only switch; `allowed_actions_for` names each row's legal buttons) | core |
 | `dash/linear.py` (Linear link and outbox files, stable ids, status mapping, description render; pure, no network) | linear |

@@ -428,6 +428,9 @@
     "dash/worktrees.py": [
       "test_worktrees"
     ],
+    "dash/wtjanitor.py": [
+      "test_wtjanitor"
+    ],
     "dash/linear.py": [
       "test_linear",
       "test_linear_sync"

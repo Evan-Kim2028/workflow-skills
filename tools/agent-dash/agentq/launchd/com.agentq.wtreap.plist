@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Worktree disk janitor, every 2 hours.
+
+  Template: __HOME__, __PYTHON__ and __REPOS__ are replaced at install
+  time (the live copy is ~/Library/LaunchAgents/com.agentq.wtreap.plist;
+  __REPOS__ is the space-separated list of repo checkouts to sweep). It runs
+  `worktrees janitor --apply` for each repo, which reaps merged lanes and
+  deletes stale regenerable artifact folders (.venv, node_modules, tool
+  caches) from the worktrees that remain. --daily-maintenance adds
+  `uv cache prune` and, when the installed agentq supports it,
+  `agentq gc --apply --runs-older-than 7d`, at most once per 24h.
+
+  Install (do not run from a worker):
+    launchctl bootout gui/$(id -u)/com.agentq.wtreap 2>/dev/null
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentq.wtreap.plist
+    launchctl kickstart -k gui/$(id -u)/com.agentq.wtreap
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agentq.wtreap</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>15</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --min-age 4h --daily-maintenance; done</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.local/state/agentq/logs/wtreap.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.local/state/agentq/logs/wtreap.log</string>
+	<key>StartInterval</key>
+	<integer>7200</integer>
+</dict>
+</plist>

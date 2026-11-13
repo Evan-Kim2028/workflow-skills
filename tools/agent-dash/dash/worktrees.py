@@ -25,6 +25,11 @@ Removal uses ``git worktree remove`` without ``--force`` and
 unexpected. Process checks read per-process cwd entries with bounded
 timeouts and a capped pid list, falling back across Linux procfs and
 the ``lsof`` tool found on other systems.
+
+``worktrees janitor`` (see :mod:`dash.wtjanitor`) wraps this sweep: it
+reaps first, then deletes only stale regenerable artifact folders from
+the worktrees that remain, so kept lanes stop holding hundreds of
+gigabytes of dependency checkouts.
 """
 
 from __future__ import annotations
@@ -39,9 +44,10 @@ from pathlib import Path
 
 from dash import errors
 
-WORKTREES_USAGE = """agent-dash worktrees reaper
+WORKTREES_USAGE = """agent-dash worktrees reaper and disk janitor
 
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
+  python3 agent_dash.py worktrees janitor --repo <path> [--apply] [--min-age 4h] [--artifact-age 24h] [--pressure-pct 12] [--daily-maintenance] [--json]
 
 Dry-run by default: prints what would go, removes nothing. Pass --apply
 to remove worktrees and delete their branches. Every guard must hold:
@@ -49,6 +55,10 @@ clean status, branch merged into origin/main with a real contribution
 (or a merged pull request; a detached HEAD on origin/main), no process
 cwd or command line points at it, older than --min-age (default 3h, the
 worker timeout), and not on the skip list. Durations look like 30s, 90m, 3h, 2d, or bare seconds.
+
+`janitor` runs the same reap, then deletes stale regenerable artifact
+folders (.venv, node_modules, tool caches) from the worktrees that
+remain. See `worktrees janitor --help` for its guards.
 """
 
 MAIN_REF = "origin/main"
@@ -586,6 +596,13 @@ def cmd_worktrees(argv: list[str]) -> int:
     if not args or args[0] in ("-h", "--help"):
         print(WORKTREES_USAGE, end="")
         return 0 if args and args[0] in ("-h", "--help") else errors.USAGE
+    if args[0] == "janitor":
+        from dash import wtjanitor
+
+        if len(args) > 1 and args[1] in ("-h", "--help"):
+            print(wtjanitor.JANITOR_USAGE, end="")
+            return 0
+        return wtjanitor.cmd_janitor(args[1:])
     if args[0] != "reap":
         print(WORKTREES_USAGE, end="", file=sys.stderr)
         return errors.USAGE
