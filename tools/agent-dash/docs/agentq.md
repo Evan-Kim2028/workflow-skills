@@ -98,7 +98,10 @@ instead of letting it swing between idle and burst.
   ceiling. Each probe is judged `step_interval_s` (300 s) later, by the billed gain per
   worker it actually started, against the long-run per-worker rate (median over
   `rate_window_s`, 1800 s, of samples taken before the probe). A gain counts as good
-  only if it is positive and at least `min_marginal_frac` (0.5) of that rate. A poor
+  only if it is positive and at least `min_marginal_frac` (0.5) of that rate. The gain
+  is attributed to the filler the probe started, never to total busy workers. If real
+  DeepSeek work changes during the probe, or the probe's filler falls short, the window
+  is extended once; a probe still unclean after that is judged poor, never good. A poor
   probe records a ceiling of max(the count before the probe, the current ceiling),
   never below the real (non-filler) DeepSeek count, for `ceiling_ttl_s` (1800 s). The
   ceiling survives a broker restart. Refills at or below the peak are plain launches:
