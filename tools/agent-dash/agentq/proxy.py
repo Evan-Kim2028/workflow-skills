@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
@@ -115,6 +116,8 @@ DEFAULT_CONFIG = {
 
 SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
+DB_WORKERS = 2
+LAG_WINDOW_S = 60.0
 LANE_CACHE_MAX = 10_000
 PREFIX_STORE_JOBS = 256
 ANONYMOUS_JOBS = frozenset({"", "none"})
@@ -912,6 +915,7 @@ class Governor:
         self.in_flight: dict[str, int] = {}
         self.upstream_recent: deque[tuple[float, str, float]] = deque()
         self.inflight = InflightLimiter(config.get("inflight"), start)
+        self.loop_lag: deque[tuple[float, float]] = deque()
         self.ds_flight = 0
         self.dirty: set[tuple[str, str]] = set()
         self.job_rows: dict[tuple[str, str], dict] = {}
@@ -994,6 +998,31 @@ class Governor:
 
     def count_error(self, kind: str) -> None:
         self.errors[kind] = self.errors.get(kind, 0) + 1
+
+    def cached_lane(self, job: str) -> str | None:
+        """The job's lane when it is known without touching the store, else None. Never does I/O, so the
+        request path only goes to a worker thread for a job it has not seen in the last LANE_CACHE_S."""
+        if is_anonymous(job):
+            return "normal"
+        cached = self.lane_cache.get(job)
+        if cached is not None and self.clock() - cached[1] < LANE_CACHE_S:
+            return cached[0]
+        return None
+
+    def note_loop_lag(self, seconds: float) -> None:
+        """Record how late the event loop ran one maintenance tick. A loop that is blocked shows up here."""
+        now = self.clock()
+        self.loop_lag.append((now, max(0.0, seconds)))
+        while self.loop_lag and self.loop_lag[0][0] < now - LAG_WINDOW_S:
+            self.loop_lag.popleft()
+
+    def loop_lag_status(self) -> dict:
+        now = self.clock()
+        recent = [lag for t, lag in self.loop_lag if t >= now - LAG_WINDOW_S]
+        return {
+            "last_ms": round(self.loop_lag[-1][1] * 1000) if self.loop_lag else None,
+            "max_60s_ms": round(max(recent) * 1000) if recent else None,
+        }
 
     def lane_for(self, job: str) -> str:
         if is_anonymous(job):
@@ -1748,6 +1777,7 @@ class Governor:
             "errors": dict(self.errors),
             "budgets": budgets,
             "upstream": self.upstream_status(now),
+            "loop_lag_ms": self.loop_lag_status(),
             "inflight_limit": self.inflight_limit(),
             "inflight_max": self.inflight.max_limit if self.inflight.measuring else None,
             "inflight_mode": self.inflight.mode,
@@ -2060,6 +2090,28 @@ class Proxy:
         self.ssl_context = ssl.create_default_context() if scheme == "https" else None
         self.maintenance: asyncio.Task | None = None
         self.active: set[asyncio.Task] = set()
+        self.flush_task: asyncio.Task | None = None
+        self.flush_lock = asyncio.Lock()
+        self.db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="agentq-db")
+
+    async def run_db(self, fn, *args):
+        """Run one store or state write on the dedicated writer threads, never on the default executor the
+        request path uses for lane lookups and body parsing."""
+        return await asyncio.get_running_loop().run_in_executor(self.db_executor, fn, *args)
+
+    def schedule_flush(self) -> None:
+        """Start a flush in the background unless one is already running, so no write can hold up admission."""
+        if self.flush_task is None or self.flush_task.done():
+            self.flush_task = asyncio.create_task(self.flush_all())
+            self.flush_task.add_done_callback(self._flush_finished)
+
+    def _flush_finished(self, task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self.gov.log("flush_error", kind=type(task.exception()).__name__)
+
+    async def flush_all(self) -> None:
+        await self.flush()
+        await self.flush_state()
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> asyncio.Server:
         self.maintenance = asyncio.create_task(self.maintain())
@@ -2081,48 +2133,63 @@ class Proxy:
             self.maintenance.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.maintenance
+        if self.flush_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.flush_task
         await self.flush()
         await self.flush_state(force=True)
+        self.db_executor.shutdown(wait=False)
 
     async def maintain(self) -> None:
+        loop = asyncio.get_running_loop()
         last_flush = self.gov.clock()
+        last_tick = loop.time()
         while True:
             await asyncio.sleep(MAINTAIN_S)
+            now = loop.time()
+            self.gov.note_loop_lag(now - last_tick - MAINTAIN_S)
+            last_tick = now
             try:
                 self.gov.pump()
                 self.gov.tick()
                 self.gov.adjust_inflight()
-                if self.gov.clock() - last_flush >= FLUSH_S:
+                due = self.gov.clock() - last_flush >= FLUSH_S
+                if due:
                     last_flush = self.gov.clock()
                     self.gov.state_dirty = True
-                    await self.flush()
-                await self.flush_state()
+                if due or self.gov.state_dirty:
+                    self.schedule_flush()
             except Exception as exc:
                 self.gov.log("maintain_error", kind=type(exc).__name__)
 
     async def flush(self) -> None:
+        """Write everything the governor has pending. Serialized, so two flushes never take and write the same counters."""
+        async with self.flush_lock:
+            await self._write_pending()
+
+    async def _write_pending(self) -> None:
         rows = self.gov.take_minute_rows()
         if rows:
             try:
-                await asyncio.to_thread(write_minute_rows, self.gov.db_path, rows)
+                await self.run_db(write_minute_rows, self.gov.db_path, rows)
             except sqlite3.Error as exc:
                 self.gov.log("flush_error", kind=type(exc).__name__)
         record = [self.gov.inflight_minute_row()]
         try:
-            await asyncio.to_thread(write_inflight_minute_rows, self.gov.db_path, record)
+            await self.run_db(write_inflight_minute_rows, self.gov.db_path, record)
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
         calib_rows = self.gov.take_calib_rows()
         if calib_rows:
             try:
-                await asyncio.to_thread(write_calib_rows, self.gov.db_path, calib_rows)
+                await self.run_db(write_calib_rows, self.gov.db_path, calib_rows)
             except sqlite3.Error as exc:
                 self.gov.log("flush_error", kind=type(exc).__name__)
         job_rows, snapshot = self.gov.take_job_rows()
         if not job_rows:
             return
         try:
-            await asyncio.to_thread(write_job_rows, self.gov.db_path, job_rows)
+            await self.run_db(write_job_rows, self.gov.db_path, job_rows)
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
             return
@@ -2134,7 +2201,7 @@ class Proxy:
         snapshot = self.gov.snapshot_state()
         self.gov.state_dirty = False
         try:
-            await asyncio.to_thread(write_state_file, self.gov.state_path, snapshot)
+            await self.run_db(write_state_file, self.gov.state_path, snapshot)
         except OSError as exc:
             self.gov.state_dirty = True
             self.gov.log("state_error", kind=type(exc).__name__)
@@ -2262,7 +2329,9 @@ class Proxy:
             model = str(payload.get("model") or "")
             max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
             streaming = payload.get("stream") is True
-        lane = await asyncio.to_thread(gov.lane_for, job)
+        lane = gov.cached_lane(job)
+        if lane is None:
+            lane = await asyncio.to_thread(gov.lane_for, job)
         ticket = gov.make_ticket(
             job=job,
             lane=lane,
