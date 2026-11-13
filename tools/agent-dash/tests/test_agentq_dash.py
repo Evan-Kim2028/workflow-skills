@@ -1043,13 +1043,28 @@ class YAxisLabelTest(unittest.TestCase):
         self.assertEqual(html.count("margin: PAIR_LAYOUT.margin"), 3)
 
 
+class TrailingAverageTest(unittest.TestCase):
+    def test_five_minute_trailing_mean_with_gaps_before_the_first_full_window(self) -> None:
+        points = [{"pct_total": v} for v in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)]
+        dash.add_trailing_average(points, "pct_total", "pct_total_avg5", 5)
+        self.assertEqual([p["pct_total_avg5"] for p in points[:4]], [None, None, None, None])
+        self.assertEqual([p["pct_total_avg5"] for p in points[4:]], [0.3, 0.4, 0.5])
+
+    def test_bucketed_points_average_the_minute_averages_they_contain(self) -> None:
+        minutes = [dash.minute_point(60 * i, {"total": (i + 1) * 1_000_000}) for i in range(10)]
+        dash.add_trailing_average(minutes, "pct_total", "pct_total_avg5", 5)
+        buckets = dash.bucket_minutes(minutes, 300)
+        self.assertEqual([b["pct_total_avg5"] for b in buckets], [0.3, 0.6])
+
+
 class EnforcedLimitsChartTest(unittest.TestCase):
-    def test_main_billed_chart_has_exactly_one_series_the_total_pool(self) -> None:
+    def test_main_billed_chart_has_the_per_minute_line_and_its_five_minute_average(self) -> None:
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-billed"')
         block = html[start:html.index('registerChart("c-workers"')]
-        self.assertEqual(block.count('key: "pct_'), 1)
-        self.assertIn('key: "pct_total"', block)
+        self.assertEqual(block.count('key: "pct_'), 2)
+        self.assertIn('{ key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }', block)
+        self.assertIn('{ key: "pct_total_avg5", name: "5-min average", color: COLORS.s2, width: 2.5 }', block)
         self.assertIn("Morph limit (10M/min)", block)
         self.assertNotIn("pct_ds_uncached", block)
         self.assertNotIn("70k", block)
@@ -1090,11 +1105,26 @@ def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_jobs_waiting=0, budget
 
 
 class LimitedByTest(unittest.TestCase):
-    def test_morph_limit_when_an_enforced_budget_averages_90_percent(self) -> None:
-        result = verdict_for(five_minutes(total=1_000_000, ds_uncached=380_000))
+    def test_morph_limit_when_the_total_pool_averages_90_percent(self) -> None:
+        result = verdict_for(five_minutes(total=9_500_000))
         self.assertEqual(result["key"], "morph_limit")
         self.assertEqual(result["chip"], "Morph limit")
-        self.assertIn("DeepSeek uncached input averaged 95% of its limit over the last 5 minutes", result["text"])
+        self.assertIn("Total pool averaged 95% of its limit over the last 5 minutes", result["text"])
+
+    def test_deepseek_uncached_average_alone_is_not_morph_limit(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000, ds_uncached=380_000))
+        self.assertNotEqual(result["key"], "morph_limit")
+        self.assertNotIn("uncached", result["text"])
+
+    def test_morph_limit_when_deepseek_uncached_gets_429s_in_two_minutes(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=40_000)
+        result = verdict_for(raw, budget_429s={"uncached_ds": {UNTIL - 60, UNTIL - 180}})
+        self.assertEqual(result["key"], "morph_limit")
+        self.assertIn("DeepSeek uncached input returned 429s in 2 of the last 5 minutes", result["text"])
+
+    def test_one_deepseek_uncached_429_minute_is_not_enough(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), budget_429s={"uncached_ds": {UNTIL - 60}})
+        self.assertNotEqual(result["key"], "morph_limit")
 
     def test_a_single_peak_minute_with_a_low_average_is_not_morph_limit(self) -> None:
         raw = five_minutes(total=1_000_000, ds_uncached=40_000)
@@ -1104,8 +1134,8 @@ class LimitedByTest(unittest.TestCase):
         self.assertNotIn("peak minute 127%", result["text"])
 
     def test_peak_minute_is_context_in_the_sentence_when_morph_limit_holds_on_average(self) -> None:
-        raw = five_minutes(total=1_000_000, ds_uncached=370_000)
-        raw[UNTIL - 120] = {"total": 1_000_000, "ds_uncached": 507_000}
+        raw = five_minutes(total=9_000_000)
+        raw[UNTIL - 120] = {"total": 12_700_000}
         result = verdict_for(raw)
         self.assertEqual(result["key"], "morph_limit")
         self.assertIn("peak minute 127%", result["text"])
@@ -1120,12 +1150,20 @@ class LimitedByTest(unittest.TestCase):
         result = verdict_for(five_minutes(total=1_000_000), budget_429s={"total": {UNTIL - 60}})
         self.assertNotEqual(result["key"], "morph_limit")
 
-    def test_kimi_uncached_counts_only_while_kimi_jobs_wait(self) -> None:
-        raw = five_minutes(total=0, kimi_uncached=24_290)
-        self.assertNotEqual(verdict_for(raw, kimi_jobs_waiting=0)["key"], "morph_limit")
-        waiting = verdict_for(raw, kimi_jobs_waiting=1)
-        self.assertEqual(waiting["key"], "morph_limit")
-        self.assertIn("Kimi uncached averaged 100%", waiting["text"])
+    def test_saturated_kimi_never_makes_the_headline_morph_limit(self) -> None:
+        raw = five_minutes(total=5_000_000, kimi_uncached=24_290)
+        for waiting in (0, 1):
+            with self.subTest(kimi_jobs_waiting=waiting):
+                result = verdict_for(raw, kimi_jobs_waiting=waiting, budget_429s={"uncached": {UNTIL - 60, UNTIL - 180}})
+                self.assertNotEqual(result["key"], "morph_limit")
+                self.assertNotIn("Kimi", result["text"])
+        self.assertEqual(verdict_for(raw, kimi_jobs_waiting=0)["key"], "headroom")
+
+    def test_kimi_waits_are_only_the_secondary_line(self) -> None:
+        result = verdict_for(five_minutes(total=5_000_000, kimi_uncached=24_290), kimi_jobs_waiting=1)
+        self.assertEqual(result["key"], "headroom")
+        self.assertEqual(result["secondary"], "Kimi reviews waiting: 1 (Kimi's own 24,290/min uncached limit).")
+        self.assertIsNone(verdict_for(five_minutes(total=5_000_000))["secondary"])
 
     def test_morph_slow_when_deepseek_p50_doubles_and_proxy_queue_is_empty(self) -> None:
         result = verdict_for(five_minutes(total=1_000_000), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
