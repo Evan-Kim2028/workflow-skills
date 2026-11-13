@@ -277,7 +277,9 @@ def cmd_gc(args, ctx: Context) -> int:
 
 def cmd_daemon(args, ctx: Context) -> int:
     try:
-        broker_lib.Broker(ctx.home, healer=broker_lib.ProxyHealer.for_home(ctx.home)).run_forever()
+        healer = broker_lib.ProxyHealer.for_home(ctx.home)
+        healer.start()
+        broker_lib.Broker(ctx.home, healer=healer).run_forever()
     except broker_lib.DaemonRunning as exc:
         broker_lib.log_line(ctx.home, f"second daemon exits: {exc}")
         return answer(ctx, f"{exc}; this instance exits", 0)

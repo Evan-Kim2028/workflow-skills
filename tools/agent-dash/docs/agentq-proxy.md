@@ -228,15 +228,34 @@ The template `agentq/launchd/com.agentq.proxy.plist` has `__PYTHON__` and
 
 ## Hang auto-heal
 
-The broker probes `GET /agentq/status` on every tick, with a 5 s limit. If the probe
-fails, or takes longer than 5 s, for `proxy_heal.fail_s` (90 s) without a break, and the
-launchd job `com.agentq.proxy` reports a running pid, the broker logs
-`proxy unresponsive for N s; restarting` once and runs
-`launchctl kickstart -k gui/<uid>/com.agentq.proxy`. Restarts are at least
-`min_interval_s` (600 s) apart, and after each restart the proxy must fail for another
-`fail_s` before the next one. A job that is not loaded, or has no pid, is never touched.
+The healer runs on its own thread inside the broker daemon and probes
+`GET /agentq/status` every `probe_s` (10 s). The broker tick reads its latest result
+and never waits on the probe or on launchd.
+
+A probe is unhealthy only if the proxy refuses or resets the connection, or does not
+answer within 10 s. Any HTTP answer is healthy, however slow. After `fail_s` (90 s) of
+continuous unhealthy probes, the healer restarts the proxy only when the failure is
+corroborated, by one of:
+
+- the TCP port does not accept a connection, or
+- the last successful status reported a loop lag (`loop_lag_ms.max_60s_ms`) of at least
+  `corroborate_lag_ms` (2000 ms).
+
+A restart also needs the launchd job `com.agentq.proxy` to report a running pid. The
+healer then logs `proxy unresponsive for N s; restarting` once for the episode and runs
+`launchctl kickstart -k gui/<uid>/com.agentq.proxy`. A kickstart with a nonzero return
+code, or one that times out (code 124), is logged as `proxy restart failed: rc=<code>
+<output>`. It still counts as an attempt, and the episode continues. Only a successful
+kickstart clears the episode.
+
+Attempts are recorded in `$AGENTQ_HOME/proxy_heal.json` (`last_attempt`,
+`last_result`). They are at least `min_interval_s` (600 s) apart across broker
+restarts, and after each restart the proxy must fail for another `fail_s` before the
+next one. A job that is not loaded, or has no pid, is never touched.
+
 Settings live in `broker.json` under `proxy_heal`: `{"enabled": true, "fail_s": 90,
-"min_interval_s": 600}`. Only the daemon started by `agentq.cli daemon` runs the healer.
+"min_interval_s": 600, "probe_s": 10, "corroborate_lag_ms": 2000}`. Only the daemon
+started by `agentq.cli daemon` runs the healer.
 
 The launch agent restarts quickly after a crash: `ThrottleInterval` is 5 s and the job
 runs at `Interactive` priority.
@@ -290,8 +309,8 @@ error, a client that left, a timeout, a truncated stream).
 ## Missing key
 
 If the Keychain has no Morph key, the proxy writes one line to stderr and exits
-with status 78 (EX_CONFIG). The plist sets `ThrottleInterval` to 30 s, so a
-missing key shows as a slow restart loop with one clear line in the log.
+with status 78 (EX_CONFIG). The plist sets `ThrottleInterval` to 5 s, so a
+missing key shows as a restart loop about every 5 s, with one clear line in the log each time.
 
 ## Requests
 
