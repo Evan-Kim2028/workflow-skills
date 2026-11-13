@@ -49,6 +49,7 @@ MINUTE_S = 60.0
 PS_TIMEOUT_S = 10.0
 MEASURED_CLAMP = (10_000, 200_000)
 UNCACHED_BUDGET = "uncached_ds"
+MINUTE_GATE_BUDGETS = ("output", UNCACHED_BUDGET)
 
 DEFAULT_FILL = {
     "enabled": False,
@@ -59,7 +60,6 @@ DEFAULT_FILL = {
     "step_workers": 4,
     "step_interval_s": 120.0,
     "gate_429_window_s": 120.0,
-    "output_hold_frac": 0.85,
 }
 DEFAULT_PACING = {
     "enabled": True,
@@ -150,29 +150,38 @@ def inflight_gate(status: dict) -> str | None:
     return None
 
 
-def output_gate(status: dict | None, fill: dict) -> str | None:
-    """Hold filler while the DeepSeek output budget's current-minute use is at or above ``output_hold_frac`` of its
-    target (its limit times target_frac). Reports name the output budget. None when the budget is unreadable or clear."""
-    budget = ((status or {}).get("budgets") or {}).get("output") if isinstance(status, dict) else None
-    if not isinstance(budget, dict):
+def minute_gate(status: dict | None) -> str | None:
+    """Hold filler while a DeepSeek per-minute budget (output or uncached input) has used its free allowance this
+    calendar minute. Usage past the free allowance would drain the burst reserve, which only real work may spend,
+    so filler waits at the allowance. The allowance is the budget's ``free`` field (limit times target), with
+    limit times target_frac as the fallback for a proxy that does not report it. None when clear or unreadable."""
+    budgets = (status or {}).get("budgets") if isinstance(status, dict) else None
+    if not isinstance(budgets, dict):
         return None
-    used, limit = budget.get("used_60s"), budget.get("limit")
-    frac = budget.get("target_frac", 1.0)
-    if not isinstance(used, (int, float)) or not isinstance(limit, (int, float)) or not isinstance(frac, (int, float)):
-        return None
-    cap = limit * frac
-    threshold = fill["output_hold_frac"] * cap
-    if cap <= 0 or used < threshold:
-        return None
-    return (f"Morph gate: output budget at {used:,.0f} output tokens this minute, at or above "
-            f"{threshold:,.0f} ({fill['output_hold_frac']:.0%} of its {cap:,.0f} target)")
+    for name in MINUTE_GATE_BUDGETS:
+        budget = budgets.get(name)
+        if not isinstance(budget, dict):
+            continue
+        used = budget.get("used_60s")
+        free = budget.get("free")
+        if not isinstance(free, (int, float)):
+            limit, frac = budget.get("limit"), budget.get("target_frac", 1.0)
+            if not isinstance(limit, (int, float)) or not isinstance(frac, (int, float)):
+                continue
+            free = limit * frac
+        if not isinstance(used, (int, float)) or free <= 0:
+            continue
+        if used >= free:
+            return (f"Morph gate: {name} budget at {used:,.0f} this minute, at its {free:,.0f} free allowance "
+                    f"(reserve kept for real work)")
+    return None
 
 
 def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headroom | None, laptop_cfg: dict,
                 fill: dict) -> str | None:
     """Why filler must wait now, or None. Any one of these holds filler: the proxy status is unavailable,
     DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window (output 429s included: the
-    proxy's per-budget 429 record is in its log, not its status), the DeepSeek output budget near its target,
+    proxy's per-budget 429 record is in its log, not its status), a DeepSeek output or uncached per-minute budget at its free allowance,
     the DeepSeek in-flight limit reached, or the laptop past the filler bars (CPU busy, memory free or swap used;
     stricter than the real-work bars so filler never pushes real work out). An unreadable measure does not hold
     on its own."""
@@ -183,9 +192,9 @@ def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headr
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
     if recent_429 > 0:
         return f"Morph gate: {recent_429} DeepSeek 429s in the last {int(fill['gate_429_window_s'])} s"
-    output = output_gate(status, fill)
-    if output is not None:
-        return output
+    minute = minute_gate(status)
+    if minute is not None:
+        return minute
     slow = inflight_gate(status)
     if slow is not None:
         return slow

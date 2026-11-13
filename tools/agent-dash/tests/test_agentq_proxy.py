@@ -87,6 +87,24 @@ def config_with(**overrides):
     return merge_config(DEFAULT_CONFIG, overrides)
 
 
+def legacy_config(**overrides):
+    """The pre-reserve budgets: rolling windows unless an override says otherwise, no burst reserve, and no
+    Kimi output or request budgets. For the tests that drive the rolling-window admission path."""
+    config = config_with(**overrides)
+    explicit = overrides.get("budgets", {})
+    default_mode = overrides.get("window_mode", "rolling")
+    config["budgets"] = {
+        name: {
+            **spec,
+            "window_mode": explicit.get(name, {}).get("window_mode", default_mode),
+            "reserve": None,
+        }
+        for name, spec in config["budgets"].items()
+        if name in ("total", "output", "uncached", "uncached_ds")
+    }
+    return config
+
+
 def make_ticket(gov, *, job="j", model=MODEL_OUT, text="x", max_tokens=None, now=None, lane="normal"):
     return gov.make_ticket(
         job=job,
@@ -248,7 +266,7 @@ class ProxyCase(unittest.IsolatedAsyncioTestCase):
             "give_up_s": 30.0,
         }
         settings.update(self.overrides)
-        self.config = config_with(**settings)
+        self.config = legacy_config(**settings)
         self.gov = Governor(self.home, self.config, log=self.capture)
         self.proxy = Proxy(self.gov, f"http://127.0.0.1:{upstream_port}/v1", KEY)
         self.server = await self.proxy.start("127.0.0.1", 0)
@@ -566,7 +584,7 @@ class PerBudgetQueueTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.gov = Governor(Path(tmp.name), config_with(start_target=0.95), log=quiet)
+        self.gov = Governor(Path(tmp.name), legacy_config(start_target=0.95), log=quiet)
 
     def occupy(self, budget: str, amount: int, lane: str = "normal") -> None:
         self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane=lane))
@@ -658,7 +676,7 @@ class PerFamilyBlockTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.gov = Governor(Path(tmp.name), config_with(start_target=0.95), log=quiet)
+        self.gov = Governor(Path(tmp.name), legacy_config(start_target=0.95), log=quiet)
 
     def occupy(self, budget: str, amount: int) -> None:
         self.gov.budgets[budget].entries.append(Entry(at=self.gov.clock(), amount=amount, lane="normal"))
@@ -837,7 +855,7 @@ class KeyTest(unittest.TestCase):
 class EstimateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.gov = Governor(Path(self.tmp.name), config_with(), log=quiet)
+        self.gov = Governor(Path(self.tmp.name), legacy_config(), log=quiet)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -906,7 +924,7 @@ class PerModelUncachedTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "agentq"
         self.events: list[tuple[str, dict]] = []
-        self.gov = Governor(self.home, config_with(), log=lambda event, **fields: self.events.append((event, fields)))
+        self.gov = Governor(self.home, legacy_config(), log=lambda event, **fields: self.events.append((event, fields)))
 
     def admit(self, ticket) -> None:
         self.gov.enqueue(ticket)
@@ -984,7 +1002,7 @@ class PerModelUncachedTest(unittest.TestCase):
         owner = Governor(self.home, config_with(budgets={"total": {"window_mode": "calendar"}}), log=quiet)
         self.assertEqual(owner.budgets["total"].window_mode, "calendar")
         self.assertEqual(owner.budgets["total"].limit, 10_000_000)
-        self.assertEqual(owner.budgets["uncached_ds"].window_mode, "rolling")
+        self.assertEqual(owner.budgets["uncached_ds"].window_mode, "calendar")
         self.assertEqual(owner.budgets["uncached_ds"].limit, 400_000)
 
     def test_unknown_limit_type_is_refused_at_start(self) -> None:
@@ -1033,7 +1051,7 @@ class TargetCeilingTest(unittest.TestCase):
         return Governor(self.home, config, clock=lambda: self.now[0], log=quiet)
 
     def test_tick_raises_past_one_and_stops_at_the_ceiling(self) -> None:
-        gov = self.governor(config_with(fast_until=0.9))
+        gov = self.governor(legacy_config(fast_until=0.9))
         output = gov.budgets["output"]
         output.target = 1.4
         output.saturated = True
@@ -1046,7 +1064,7 @@ class TargetCeilingTest(unittest.TestCase):
         self.assertEqual(output.target, 1.5)
 
     def test_tick_stops_at_one_when_an_older_config_has_no_ceiling(self) -> None:
-        config = config_with(fast_until=0.9)
+        config = legacy_config(fast_until=0.9)
         del config["target_ceiling"]
         gov = self.governor(config)
         output = gov.budgets["output"]
@@ -1057,7 +1075,7 @@ class TargetCeilingTest(unittest.TestCase):
         self.assertEqual(output.target, 1.0)
 
     def test_429_above_one_cuts_by_target_cut(self) -> None:
-        gov = self.governor(config_with())
+        gov = self.governor(legacy_config())
         gov.budgets["output"].target = 1.4
         gov.learn_from_429(make_ticket(gov, max_tokens=800), "Limit: 60000 output tokens/minute.")
         self.assertAlmostEqual(gov.budgets["output"].target, 1.4 * 0.97, places=6)
@@ -1065,7 +1083,7 @@ class TargetCeilingTest(unittest.TestCase):
     def test_state_file_target_clamps_to_floor_and_ceiling(self) -> None:
         state = {"budgets": {"output": {"target_frac": 1.3}, "total": {"target_frac": 9.0}}}
         (self.home / "proxy_state.json").write_text(json.dumps(state))
-        gov = self.governor(config_with())
+        gov = self.governor(legacy_config())
         self.assertEqual(gov.budgets["output"].target, 1.3)
         self.assertEqual(gov.budgets["total"].target, 1.5)
 
@@ -1639,7 +1657,7 @@ class CalendarWindowTest(unittest.TestCase):
         gov, _ = timed_governor(self.home, WALL_MINUTE_START, budgets={"total": {"window_mode": "calendar"}})
         self.assertEqual(gov.budgets["total"].window_mode, "calendar")
         self.assertEqual(gov.budgets["total"].limit, 10_000_000)
-        self.assertEqual(gov.budgets["output"].window_mode, "rolling")
+        self.assertEqual(gov.budgets["output"].window_mode, "calendar")
         self.assertEqual(gov.budgets["output"].charge_basis, "billed")
 
     def test_unknown_modes_are_refused_at_start(self) -> None:
