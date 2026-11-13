@@ -65,6 +65,7 @@ UNCACHED_RATIO_FLOOR = 0.25
 UNCACHED_RATIO_CEIL = 1.25
 UNCACHED_RATIO_ALPHA = 0.05
 UNCACHED_LOG_EVERY = 50
+OUTPUT_MEAN_WINDOW = 20
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
 KEYCHAIN_SERVICE = "morph-api-key"
@@ -99,6 +100,8 @@ DEFAULT_CONFIG = {
     "fast_step_up": 0.05,
     "fast_interval_s": 10.0,
     "default_output_tokens": 800,
+    "output_estimate_pct": 0,
+    "output_estimate_window": 200,
     "give_up_s": 240.0,
     "retry_floor_s": 1.0,
     "retry_jitter_s": 2.0,
@@ -596,6 +599,12 @@ def reserved_for(limit_type: str, prompt: int, requested: int, uncached: int) ->
     if limit_type == "requests":
         return 1
     return prompt + requested
+
+
+def nearest_rank(sorted_values: list[float], pct: float) -> float:
+    """The nearest-rank percentile of an ascending list: the smallest value at or above pct percent of the list."""
+    rank = max(1, math.ceil(pct / 100.0 * len(sorted_values)))
+    return sorted_values[min(rank, len(sorted_values)) - 1]
 
 
 def clamp_ratio(value: float) -> float:
@@ -1391,10 +1400,18 @@ class Governor:
         self.lane_cache[job] = (lane, now)
         return lane
 
-    def output_estimate(self, model: str, max_tokens: int | None) -> int:
+    def output_estimate(self, model: str, max_tokens: int | None, pct: float | None = None) -> int:
+        """The output tokens a request is expected to produce: the mean of the last OUTPUT_MEAN_WINDOW completions,
+        or with pct the nearest-rank percentile of the whole output window. Capped by max_tokens."""
         history = self.output_history.get(model)
-        mean = sum(history) / len(history) if history else float(self.config["default_output_tokens"])
-        estimate = int(round(mean))
+        if not history:
+            value = float(self.config["default_output_tokens"])
+        elif pct is None:
+            recent = list(history)[-OUTPUT_MEAN_WINDOW:]
+            value = sum(recent) / len(recent)
+        else:
+            value = nearest_rank(sorted(history), pct)
+        estimate = int(round(value))
         if max_tokens:
             estimate = min(estimate, int(max_tokens))
         return max(estimate, 1)
@@ -1444,14 +1461,19 @@ class Governor:
     ) -> Ticket:
         prompt = tokens_for_chars(length)
         requested = _as_int(max_tokens)
-        output = self.output_estimate(model, max_tokens)
         applicable = [b for b in self.budgets.values() if b.applies(model)]
+        mean_output = self.output_estimate(model, max_tokens)
+        tail_output = mean_output
+        pct = float(self.config["output_estimate_pct"])
+        if pct > 0 and any(b.limit_type == "output" and b.reserve is not None for b in applicable):
+            tail_output = self.output_estimate(model, max_tokens, pct=pct)
         uncached = 0
         if any(b.limit_type == "uncached" for b in applicable):
             uncached = self.uncached_estimate(job, length, blocks)
         admitted_uncached = round(uncached * self.uncached_factor(model))
         estimates: dict[str, int] = {}
         for b in applicable:
+            output = tail_output if b.limit_type == "output" and b.reserve is not None else mean_output
             if b.charge_basis == PROMPT_PLUS_MAX:
                 estimates[b.name] = reserved_for(b.limit_type, prompt, requested, admitted_uncached)
             else:
@@ -1737,7 +1759,8 @@ class Governor:
             self.learn_uncached(ticket.model, ticket.uncached_est, prompt - cached)
         self.note_calib_billed(ticket, prompt + output)
         if output > 0:
-            self.output_history.setdefault(ticket.model, deque(maxlen=20)).append(output)
+            self.output_history.setdefault(ticket.model, deque(maxlen=int(self.config["output_estimate_window"]))).append(output)
+            self.log("request_output", model=ticket.model, output=output, max_tokens=ticket.requested)
         row = self.row(ticket.model)
         row["ok"] += 1
         row["input"] += prompt - cached
