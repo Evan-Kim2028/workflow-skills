@@ -5,8 +5,10 @@ import io
 import json
 import os
 import plistlib
+import shutil
 import re
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -56,6 +58,11 @@ from agentq.proxy import (
     read_request,
     seconds_to_next_minute,
     tokens_for_chars,
+    write_calib_rows,
+    FINAL_RESERVE_S,
+    UpstreamPool,
+    read_minute_counts,
+    read_only_uri,
     write_calib_rows,
     write_inflight_minute_rows,
     write_minute_rows,
@@ -2439,6 +2446,7 @@ class StalledUpstreamTest(ProxyCase):
 
         with mock.patch("agentq.proxy.write_minute_rows", recorder):
             self.gov.row(MODEL_OUT)["req"] += 1
+            await settle_seeds(self.gov)
             await self.proxy.flush()
         self.assertTrue(seen and seen[0].startswith("agentq-db"))
 
@@ -2620,3 +2628,521 @@ class LogPathConfigTest(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["log_path"], LOG_PATH)
         self.assertEqual(DEFAULT_CONFIG["log_max_bytes"], 10 * 1024 * 1024)
         self.assertEqual(DEFAULT_CONFIG["log_backups"], 3)
+
+
+async def settle_seeds(gov: Governor, timeout: float = 5.0) -> None:
+    """Wait until every seed requested off the loop has been merged."""
+    deadline = time.monotonic() + timeout
+    while gov.pending_seeds:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"seeds still pending: {gov.pending_seeds}")
+        await asyncio.sleep(0.01)
+
+
+def block_loop(seconds: float) -> None:
+    """A synchronous call that holds the event loop, as a slow blocking helper would."""
+    time.sleep(seconds)
+
+
+class LoopStallWatchdogTest(ProxyCase):
+    overrides = {"stall_dump_s": 0.3}
+
+    def stalls(self) -> list[dict]:
+        return [fields for event, fields in self.logs if event == "loop_stall"]
+
+    async def test_a_blocked_loop_is_reported_once_with_the_stack_that_blocked_it(self) -> None:
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.stalls(), [])
+        block_loop(1.2)
+        await asyncio.sleep(0.6)
+        stalls = self.stalls()
+        self.assertEqual(len(stalls), 1)
+        self.assertGreaterEqual(stalls[0]["ms"], 300)
+        self.assertIn("block_loop", stalls[0]["stack"])
+        self.assertNotIn("\n", stalls[0]["stack"])
+
+    async def test_each_stall_episode_is_reported_once_and_a_recovered_loop_is_not(self) -> None:
+        block_loop(1.0)
+        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.6)
+        self.assertEqual(len(self.stalls()), 1)
+        block_loop(1.0)
+        await asyncio.sleep(0.6)
+        self.assertEqual(len(self.stalls()), 2)
+
+
+class SeedOffLoopTest(ProxyCase):
+    """A new minute counts at once; its stored seed is read on a writer thread and merged when it lands."""
+
+    def stored_minute(self, req: int, minute: str | None = None) -> str:
+        minute = minute or minute_stamp(self.gov.wall())
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, req, req, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        return minute
+
+    async def test_counting_starts_at_once_and_the_seed_is_read_on_a_writer_thread(self) -> None:
+        self.stored_minute(5)
+        threads: list[str] = []
+        real = read_minute_counts
+
+        def recorder(path, minute, model):
+            threads.append(threading.current_thread().name)
+            return real(path, minute, model)
+
+        with mock.patch("agentq.proxy.read_minute_counts", recorder):
+            row = self.gov.row(MODEL_OUT)
+            self.assertEqual(row["req"], 0)
+            row["req"] += 2
+            await settle_seeds(self.gov)
+        self.assertEqual(row["req"], 7)
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0].startswith("agentq-db"))
+
+    async def test_a_pending_minute_is_not_flushed_until_its_seed_lands(self) -> None:
+        minute = self.stored_minute(5)
+        row = self.gov.row(MODEL_OUT)
+        row["req"] += 2
+        written: list[list] = []
+        real = write_minute_rows
+
+        def recorder(path, rows):
+            written.append(list(rows))
+            return real(path, rows)
+
+        with mock.patch("agentq.proxy.write_minute_rows", recorder):
+            await self.proxy.flush()
+            self.assertEqual([r for batch in written for r in batch if r[0] == minute], [])
+            await settle_seeds(self.gov)
+            await self.proxy.flush()
+        stored = [r for batch in written for r in batch if r[0] == minute]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0][2], 7)
+
+    async def test_a_calibration_seed_is_merged_into_the_minute(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_calib_rows(self.gov.db_path, [(minute, 3, 300, 900, 1200, 12.5, 2)])
+        record = self.gov.calib_record(minute)
+        self.assertEqual(record["overall"]["req"], 0)
+        record["overall"]["req"] += 1
+        record["r429"] += 1
+        await settle_seeds(self.gov)
+        self.assertEqual(record["overall"]["req"], 4)
+        self.assertEqual(record["overall"]["billed"], 1200)
+        self.assertEqual(record["r429"], 3)
+        self.assertEqual(record["first_429_s"], 12.5)
+
+    async def test_a_failed_seed_read_releases_the_minute_and_is_logged(self) -> None:
+        with mock.patch("agentq.proxy.read_minute_counts", side_effect=RuntimeError("boom")):
+            row = self.gov.row(MODEL_OUT)
+            row["req"] += 4
+            await settle_seeds(self.gov)
+        self.assertIn("seed_error", self.events())
+        self.assertEqual(row["req"], 4)
+        self.assertEqual(self.gov.pending_seeds, set())
+
+    def test_the_resolved_store_path_is_computed_once(self) -> None:
+        read_only_uri.cache_clear()
+        read_only_uri(self.gov.db_path)
+        read_only_uri(self.gov.db_path)
+        self.assertEqual(read_only_uri.cache_info().hits, 1)
+
+
+class KeepAliveMorph:
+    """Upstream that serves many requests per connection, as Morph does. Each script item applies to one request:
+    "ok" (a JSON 200), "truncate" (a stream cut short), "500" (an error), or "ok-close" (a 200 that closes the connection)."""
+
+    def __init__(self) -> None:
+        self.accepted = 0
+        self.requests = 0
+        self.modes: list[str] = []
+        self.last_headers: dict[str, str] = {}
+
+    async def handle(self, reader, writer) -> None:
+        self.accepted += 1
+        try:
+            while True:
+                try:
+                    request = await read_request(reader)
+                except (ConnectionError, ValueError, asyncio.IncompleteReadError):
+                    break
+                if request is None:
+                    break
+                self.requests += 1
+                self.last_headers = request[2]
+                mode = self.modes.pop(0) if self.modes else "ok"
+                if mode == "drop":
+                    break
+                if mode == "truncate":
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                    await writer.drain()
+                    break
+                if mode == "500":
+                    writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno")
+                    await writer.drain()
+                    break
+                body = json.dumps({"usage": {"prompt_tokens": 10, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 0}}}).encode()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+                await writer.drain()
+                if mode == "ok-close":
+                    break
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+
+class KeepAliveCase(ProxyCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.fake_server.close()
+        self.morph = KeepAliveMorph()
+        self.fake_server = await asyncio.start_server(self.morph.handle, "127.0.0.1", 0)
+        self.proxy.upstream_url = f"http://127.0.0.1:{self.fake_server.sockets[0].getsockname()[1]}/v1"
+
+    async def send(self, stream: bool = False):
+        return await self.post(self.chat(MODEL_OUT, stream=stream, max_tokens=8), job="ka")
+
+
+class UpstreamKeepAliveTest(KeepAliveCase):
+    async def test_sequential_requests_share_one_upstream_connection(self) -> None:
+        for _ in range(5):
+            status, _ = await self.send()
+            self.assertEqual(status, 200)
+        self.assertEqual(self.morph.requests, 5)
+        self.assertEqual(self.morph.accepted, 1)
+
+    async def test_the_upstream_request_no_longer_asks_for_close(self) -> None:
+        await self.send()
+        self.assertNotIn("connection", self.morph.last_headers)
+
+    async def test_a_server_error_response_is_not_reused(self) -> None:
+        self.morph.modes = ["ok", "500", "ok"]
+        await self.send()
+        await self.send()
+        await self.send()
+        self.assertEqual(self.morph.requests, 3)
+        self.assertEqual(self.morph.accepted, 2)
+
+    async def test_a_stream_that_ends_abnormally_is_not_reused(self) -> None:
+        self.morph.modes = ["truncate", "ok"]
+        with contextlib.suppress(Exception):
+            await self.send(stream=True)
+        status, _ = await self.send()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.morph.accepted, 2)
+
+    async def test_a_connection_the_server_closed_while_idle_is_replaced_without_an_error(self) -> None:
+        self.morph.modes = ["ok-close"]
+        status, _ = await self.send()
+        self.assertEqual(status, 200)
+        await asyncio.sleep(0.05)
+        status, _ = await self.send()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.morph.accepted, 2)
+
+    async def test_a_request_whose_bytes_reached_the_upstream_is_never_sent_again(self) -> None:
+        self.morph.modes = ["ok", "drop"]
+        await self.send()
+        status, _ = await self.send()
+        self.assertEqual(status, 502)
+        self.assertEqual(self.morph.requests, 2)
+
+    async def test_the_maintenance_tick_drops_a_connection_the_server_closed(self) -> None:
+        self.morph.modes = ["ok-close"]
+        await self.send()
+        await asyncio.sleep(0.5)
+        self.assertEqual(len(self.proxy.pool.idle), 0)
+
+    async def test_an_idle_connection_expires_after_the_idle_limit(self) -> None:
+        self.proxy.pool.idle_s = 0.05
+        await self.send()
+        await asyncio.sleep(0.2)
+        await self.send()
+        self.assertEqual(self.morph.accepted, 2)
+
+
+class UpstreamPoolTest(unittest.IsolatedAsyncioTestCase):
+    async def connections(self, count: int):
+        server_side: list[asyncio.StreamWriter] = []
+
+        async def hold(reader, writer):
+            server_side.append(writer)
+            await reader.read()
+            writer.close()
+
+        server = await asyncio.start_server(hold, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        opened = [await asyncio.open_connection("127.0.0.1", port) for _ in range(count)]
+        self.addCleanup(server.close)
+        for _ in range(200):
+            if len(server_side) >= count:
+                break
+            await asyncio.sleep(0.01)
+        self.server_side = server_side
+        return opened
+
+    async def test_prune_closes_a_half_closed_connection_behind_a_fresh_head(self) -> None:
+        pool = UpstreamPool(4, 30.0)
+        conns = await self.connections(2)
+        for reader, writer in conns:
+            pool.give("k", reader, writer)
+        self.server_side[1].close()
+        await asyncio.sleep(0.02)
+        self.assertTrue(conns[1][0].at_eof())
+        pool.prune()
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(pool.idle), 1)
+        self.assertTrue(conns[1][1].is_closing())
+        self.assertFalse(conns[0][1].is_closing())
+
+    async def test_take_returns_only_the_connection_for_the_same_upstream(self) -> None:
+        pool = UpstreamPool(4, 30.0)
+        (reader, writer), = await self.connections(1)
+        pool.give("https://a", reader, writer)
+        self.assertIsNone(pool.take("https://b"))
+        self.assertEqual(pool.take("https://a")[1], writer)
+        self.assertIsNone(pool.take("https://a"))
+
+    async def test_the_oldest_connection_is_closed_when_the_pool_is_full(self) -> None:
+        pool = UpstreamPool(2, 30.0)
+        conns = await self.connections(3)
+        for reader, writer in conns:
+            pool.give("k", reader, writer)
+        self.assertEqual(len(pool.idle), 2)
+        await asyncio.sleep(0.01)
+        self.assertTrue(conns[0][1].is_closing())
+        self.assertFalse(conns[2][1].is_closing())
+
+    async def test_a_zero_sized_pool_keeps_nothing(self) -> None:
+        pool = UpstreamPool(0, 30.0)
+        (reader, writer), = await self.connections(1)
+        pool.give("k", reader, writer)
+        self.assertEqual(len(pool.idle), 0)
+
+    async def test_expired_connections_are_closed_on_the_next_use(self) -> None:
+        now = [0.0]
+        pool = UpstreamPool(4, 30.0, clock=lambda: now[0])
+        (reader, writer), = await self.connections(1)
+        pool.give("k", reader, writer)
+        now[0] = 31.0
+        self.assertIsNone(pool.take("k"))
+        await asyncio.sleep(0.01)
+        self.assertTrue(writer.is_closing())
+
+    async def test_close_all_empties_the_pool(self) -> None:
+        pool = UpstreamPool(4, 30.0)
+        conns = await self.connections(2)
+        for reader, writer in conns:
+            pool.give("k", reader, writer)
+        pool.close_all()
+        self.assertEqual(len(pool.idle), 0)
+        await asyncio.sleep(0.01)
+        self.assertTrue(all(writer.is_closing() for _, writer in conns))
+
+
+class TlsHandshakeLabTest(unittest.IsolatedAsyncioTestCase):
+    """Lab measurement: TLS handshakes to the upstream for 100 sequential requests, with reuse off and on."""
+
+    async def asyncSetUp(self) -> None:
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl not available for a test certificate")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cert, key = Path(tmp.name) / "c.pem", Path(tmp.name) / "k.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+             "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+            check=True, capture_output=True,
+        )
+        server_ctx = ssl.create_server_context(ssl.PROTOCOL_TLS_SERVER) if hasattr(ssl, "create_server_context") else ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(cert, key)
+        self.morph = KeepAliveMorph()
+        self.morph_server = await asyncio.start_server(self.morph.handle, "127.0.0.1", 0, ssl=server_ctx)
+        self.addCleanup(self.morph_server.close)
+        port = self.morph_server.sockets[0].getsockname()[1]
+        self.tmp = Path(tmp.name)
+        home = self.tmp / "agentq"
+        self.gov = Governor(home, config_with(), log=quiet)
+        self.proxy = Proxy(self.gov, f"https://127.0.0.1:{port}/v1", KEY)
+        client_ctx = ssl.create_default_context(cafile=str(cert))
+        self.proxy.ssl_context = client_ctx
+        self.server = await self.proxy.start("127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        self.addCleanup(self.server.close)
+
+    async def asyncTearDown(self) -> None:
+        await self.proxy.close()
+
+    async def run_requests(self, count: int) -> int:
+        before = self.morph.accepted
+        for _ in range(count):
+            status, _ = await asyncio.to_thread(
+                post_json, self.port, {"model": MODEL_OUT, "max_tokens": 8, "messages": [{"role": "user", "content": "lab"}]}, "lab", "Bearer x"
+            )
+            self.assertEqual(status, 200)
+        return self.morph.accepted - before
+
+    async def test_reuse_cuts_tls_handshakes_for_100_requests(self) -> None:
+        self.proxy.pool.max_idle = 0
+        before = await self.run_requests(100)
+        self.proxy.pool.max_idle = 64
+        after = await self.run_requests(100)
+        print(f"\nTLS handshakes per 100 sequential requests: without reuse={before}, with reuse={after}")
+        self.assertGreaterEqual(before, 100)
+        self.assertLessEqual(after, 5)
+
+
+class CloseDrainsSeedsTest(ProxyCase):
+    """Shutdown lets pending seed reads land, so the final flush writes stored plus new counts."""
+
+    def stored(self, minute: str) -> int:
+        counts = read_minute_counts(self.gov.db_path, minute, MODEL_OUT)
+        return counts["req"] if counts else 0
+
+    async def test_close_waits_for_a_pending_row_seed_and_writes_the_sum(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        row = self.gov.row(MODEL_OUT)
+        row["req"] += 2
+        await self.proxy.close()
+        self.assertEqual(self.stored(minute), 7)
+
+    async def test_close_waits_for_a_pending_calibration_seed(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_calib_rows(self.gov.db_path, [(minute, 3, 0, 0, 0, None, 0)])
+        record = self.gov.calib_record(minute)
+        record["overall"]["req"] += 1
+        await self.proxy.close()
+        connection = sqlite3.connect(self.gov.db_path)
+        stored = connection.execute("SELECT req FROM proxy_calib WHERE minute = ?", (minute,)).fetchone()[0]
+        connection.close()
+        self.assertEqual(stored, 4)
+
+    async def test_a_seed_that_never_lands_is_released_and_the_new_counts_still_write(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        release = threading.Event()
+
+        def stuck(path, minute, model):
+            release.wait(5)
+            return None
+
+        with mock.patch("agentq.proxy.read_minute_counts", stuck):
+            row = self.gov.row(MODEL_OUT)
+            row["req"] += 2
+            await self.proxy.close(asyncio.get_running_loop().time() + FINAL_RESERVE_S + 0.5)
+        release.set()
+        self.assertEqual(self.gov.pending_seeds, set())
+        self.assertIn("seed_timeout", self.events())
+        self.assertEqual(self.stored(minute), 2)
+
+
+class EntryPointTest(unittest.TestCase):
+    """Each process launchd or the broker starts must import and print its help, from a clean directory."""
+
+    def run_help(self, args: list[str], cwd: str) -> subprocess.CompletedProcess:
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        return subprocess.run([sys.executable, *args, "--help"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+
+    def test_the_proxy_runs_as_launchd_runs_it_from_a_clean_directory(self) -> None:
+        proxy = str(Path(__file__).resolve().parents[1] / "agentq" / "proxy.py")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = self.run_help(["-u", proxy], cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+    def test_the_proxy_also_runs_in_isolated_mode(self) -> None:
+        proxy = str(Path(__file__).resolve().parents[1] / "agentq" / "proxy.py")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = self.run_help(["-I", proxy], cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_dashboard_runs_as_launchd_runs_it(self) -> None:
+        dash = str(Path(__file__).resolve().parents[1] / "agentq" / "dash.py")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = self.run_help(["-u", dash], cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_broker_runs_as_its_launch_agent_runs_it(self) -> None:
+        package_root = str(Path(__file__).resolve().parents[1])
+        result = self.run_help(["-m", "agentq.cli"], package_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class SharedShutdownDeadlineTest(ProxyCase):
+    """One shutdown budget covers the request drain, the seed drain and the final writes."""
+
+    async def wait_until(self, condition, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail("condition not reached")
+            await asyncio.sleep(0.01)
+
+    async def test_request_and_seed_drains_share_one_deadline(self) -> None:
+        hold = asyncio.Event()
+        self.fake.script = [{"hold": hold}]
+        gate = threading.Event()
+
+        def stuck_seed(path, minute, model):
+            gate.wait(10)
+            return None
+
+        loop = asyncio.get_running_loop()
+        stuck = None
+        try:
+            with mock.patch("agentq.proxy.read_minute_counts", stuck_seed):
+                stuck = asyncio.create_task(self.post(self.chat(MODEL_OUT, stream=False), job="stuck"))
+                await self.wait_until(lambda: len(self.fake.requests) == 1)
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(self.gov.pending_seeds), 1)
+                started = loop.time()
+                await self.proxy.shutdown(6.0)
+                elapsed = loop.time() - started
+        finally:
+            gate.set()
+            hold.set()
+            if stuck is not None:
+                with contextlib.suppress(Exception):
+                    await stuck
+        self.assertLess(elapsed, 6.5)
+        self.assertGreaterEqual(elapsed, 2.5)
+
+    async def test_both_writer_threads_stuck_still_persist_the_in_memory_counts_in_time(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        write_calib_rows(self.gov.db_path, [(minute, 3, 0, 0, 0, None, 0)])
+        gate = threading.Event()
+
+        def stuck_minute(path, minute, model):
+            gate.wait(10)
+            return None
+
+        def stuck_calib(path, minute):
+            gate.wait(10)
+            return None
+
+        loop = asyncio.get_running_loop()
+        with mock.patch("agentq.proxy.read_minute_counts", stuck_minute), mock.patch("agentq.proxy.read_calib_counts", stuck_calib):
+            self.gov.row(MODEL_OUT)["req"] += 2
+            self.gov.calib_record(minute)["overall"]["req"] += 1
+            await asyncio.sleep(0.05)
+            started = loop.time()
+            try:
+                await self.proxy.shutdown(6.0)
+                elapsed = loop.time() - started
+            finally:
+                gate.set()
+        self.assertLess(elapsed, 6.5)
+        minute_counts = read_minute_counts(self.gov.db_path, minute, MODEL_OUT)
+        self.assertEqual(minute_counts["req"], 2)
+        connection = sqlite3.connect(self.gov.db_path)
+        calib = connection.execute("SELECT req FROM proxy_calib WHERE minute = ?", (minute,)).fetchone()[0]
+        connection.close()
+        self.assertEqual(calib, 1)
+        self.assertIn("seed_timeout", self.events())
+
+
+class LaunchAgentTest(unittest.TestCase):
+    def test_exit_timeout_covers_the_default_shutdown_budget_with_margin(self) -> None:
+        with PLIST.open("rb") as handle:
+            plist = plistlib.load(handle)
+        self.assertEqual(plist["ExitTimeOut"], int(DEFAULT_CONFIG["shutdown_s"]) + 15)
