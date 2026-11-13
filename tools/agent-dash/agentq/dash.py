@@ -27,6 +27,8 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import Counter
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
@@ -456,7 +458,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The dotted line is the average of those minutes over the selected range, from the first recorded minute, with idle minutes counted as zero; it is the same figure as the total pool tile. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The step line is the average of each Eastern clock hour over its minutes, with idle minutes counted as zero; the lighter dotted step is the hour in progress, averaged over the minutes so far. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -817,6 +819,33 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       }
     });
   }
+  function hourRowFor(rows, t) {
+    for (var i = 0; i < rows.length; i++) {
+      if (t >= rows[i].t && t < rows[i].t + 3600) return rows[i];
+    }
+    return null;
+  }
+  function withHourly(points, rows, until) {
+    // Each minute point carries its Eastern hour's average. At an hour boundary a point with the old
+    // value is inserted at the boundary time, so the step is vertical rather than a slope across one minute.
+    var out = [];
+    var prev = null;
+    points.forEach(function (p) {
+      var row = hourRowFor(rows, p.t);
+      var cur = Object.assign({}, p, { hourly: null, hourlyPartial: null });
+      if (row && row.avg !== null) {
+        if (row.partial) cur.hourlyPartial = row.avg; else cur.hourly = row.avg;
+      }
+      if (prev && row && prev.row && row !== prev.row) {
+        var step = Object.assign({}, p, { hourly: null, hourlyPartial: null });
+        if (prev.row.partial) step.hourlyPartial = prev.row.avg; else step.hourly = prev.row.avg;
+        out.push(step);
+      }
+      out.push(cur);
+      prev = { row: row };
+    });
+    return out;
+  }
   function endSeries(cfg, points) {
     var out = [];
     cfg.series.forEach(function (s) {
@@ -865,6 +894,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     if (cfg.y.label) svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = cfg.y.label;
 
     var refs = (cfg.refs || []).slice();
+    (cfg.notes || []).forEach(function (note) {
+      svgEl("text", {
+        x: X(note.t) - 6, y: Yc(note.v) - 7, "text-anchor": "end", class: "direct",
+        style: "fill: " + note.color + "; stroke: var(--surface); stroke-width: 3px; paint-order: stroke; font-weight: 600"
+      }, svg).textContent = note.text;
+    });
     refs.forEach(function (r) {
       svgEl("line", {
         x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: r.color || "var(--ink-3)", "stroke-width": r.width || 1,
@@ -1268,22 +1303,25 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     charts.length = 0;
 
     var pctAxis = { min: 0, max: 1.2, clip: 1.2, ticks: [0, 0.2, 0.4, 0.6, 0.8, 1, 1.2], fmt: pctFmt };
+    var hourlyRows = d.hourly_avg_pct_total || [];
+    var lastComplete = null;
+    hourlyRows.forEach(function (row) { if (!row.partial && row.avg !== null) lastComplete = row; });
     registerChart("c-billed", {
       title: "Morph total-token limit used per minute",
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
-      points: minutes,
+      points: withHourly(minutes, hourlyRows, win.end),
       series: [
-        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }
+        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 },
+        { key: "hourly", name: "Hourly average", color: COLORS.s3, width: 2.5 },
+        { key: "hourlyPartial", name: "This hour so far", color: COLORS.s3, width: 2.5, dash: "1 4", opacity: 0.75 }
       ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
-      refs: [{ v: 1, label: "Morph limit (10M/min)" }].concat(
-        d.range_avg_pct_total === null || d.range_avg_pct_total === undefined ? [] : [{
-          v: d.range_avg_pct_total,
-          label: "avg " + RANGE_LABEL[d.hours] + ": " + Math.round(d.range_avg_pct_total * 100) + "%",
-          color: COLORS.s3, dash: "1 4", width: 2, end: true
-        }]
-      ),
+      refs: [{ v: 1, label: "Morph limit (10M/min)" }],
+      notes: lastComplete ? [{
+        t: lastComplete.t + 3600, v: lastComplete.avg,
+        text: lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%", color: COLORS.s3
+      }] : [],
       fmt: pctFmt
     });
     registerChart("c-workers", {
@@ -1318,7 +1356,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
       { name: "Per minute", color: COLORS.s1 },
-      { name: "Average, " + RANGE_LABEL[d.hours], color: COLORS.s3, dotted: true }
+      { name: "Hourly average", color: COLORS.s3 },
+      { name: "This hour so far", color: COLORS.s3, dotted: true }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -2262,6 +2301,41 @@ def apply_admitted_totals(points: list[dict], admitted: dict[int, int]) -> None:
             point["pct_total"] = fraction(admitted[point["t"]], LIMITS["total"])
         else:
             point["total_source"] = "completed"
+
+
+ET = ZoneInfo("America/New_York")
+
+
+def et_hour_label(hour_start: int) -> str:
+    """The Eastern clock hour that starts at ``hour_start`` (epoch seconds), as ``11 ET``."""
+    return datetime.fromtimestamp(hour_start, ET).strftime("%H") + " ET"
+
+
+def hourly_averages(minute_points: list[dict], until: int) -> list[dict]:
+    """Mean ``pct_total`` per Eastern clock hour over the same minute points the chart draws.
+
+    Hours start on the hour in ET. Every whole-hour UTC offset is in ET's history, so an epoch multiple of
+    3600 is also an ET hour start, including across the DST changes; tests check this against zoneinfo.
+    Idle minutes inside an hour count as zero. The first hour counts from the first recorded minute. The
+    hour containing ``until`` is partial and averages the minutes so far.
+    """
+    if not minute_points:
+        return []
+    first = minute_points[0]["t"]
+    by_minute = {point["t"]: point["pct_total"] for point in minute_points}
+    rows = []
+    hour = first - first % 3600
+    while hour < until:
+        lo, hi = max(hour, first), min(hour + 3600, until)
+        stamps = range(lo, hi, 60)
+        count = len(stamps)
+        rows.append({
+            "t": hour, "label": et_hour_label(hour), "minutes": count,
+            "avg": round(sum(by_minute.get(t, 0.0) for t in stamps) / count, 4) if count else None,
+            "partial": hour + 3600 > until,
+        })
+        hour += 3600
+    return rows
 
 
 def range_average_pct(minute_points: list[dict], until: int) -> float | None:
@@ -3424,6 +3498,7 @@ def build_summary(
     minute_points = minute_series(raw, since, until)
     apply_admitted_totals(minute_points, admitted)
     range_avg_total = range_average_pct(minute_points, until)
+    hourly_avg = hourly_averages(minute_points, until)
     limits = {
         name: {
             "label": LIMIT_LABELS[name],
@@ -3481,6 +3556,7 @@ def build_summary(
         "ds_uncached_rejections": budget_rejections(calib_429s, "uncached_ds", since, until),
         "ds_output_5m_per_min": deepseek_output_rate(raw, until),
         "range_avg_pct_total": range_avg_total,
+        "hourly_avg_pct_total": hourly_avg,
         "bucket_s": bucket,
         "minutes": minutes,
         "token_mix": mix,
