@@ -340,6 +340,29 @@ class UnmarkedWorkerTests(GcBase):
         self.assertEqual(verdict["action"], "keep", verdict)
         self.assertIn("no owner marker", verdict["reason"])
 
+    def test_unreadable_owner_marker_keeps_the_folder(self):
+        folder = self.unmarked("hub-exec-foo", age_when=NOW - 6 * 3600)
+        (folder / scratchdir.OWNER_FILE).write_text("{not json", encoding="utf-8")
+        age(folder, NOW - 6 * 3600)
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertEqual(verdict["reason"], "owner marker unreadable")
+        report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+
+class CliFlagTests(GcBase):
+    def test_non_finite_flags_are_rejected(self):
+        for flag in ("--finished-after-hours", "--older-than-days"):
+            for value in ("nan", "inf", "-inf"):
+                with self.subTest(flag=flag, value=value):
+                    err = io.StringIO()
+                    with redirect_stderr(err):
+                        code = scratchgc.cmd_scratch(["gc", flag, value])
+                    self.assertEqual(code, 2)
+                    self.assertIn("finite", err.getvalue())
+
 
 class WorkstreamHelperTests(GcBase):
     def test_workstream_live_refuses_on_a_live_launcher(self):

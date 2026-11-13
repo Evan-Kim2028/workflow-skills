@@ -18,11 +18,12 @@ Two rules relax the age cutoff, and only the age cutoff:
 - a marked folder whose run is finished is reclaimed once its newest file
   is older than ``--finished-after-hours`` (off by default), even when it
   is younger than ``--older-than-days``;
-- a folder with no owner marker is reclaimed once its newest file is older
-  than ``--older-than-days``, but only when its name is a worker run label
-  (``hub``/``ws<n>`` plus ``exec``/``review``/``plan``/``coord``), its path
-  is not a Postgres data directory or a ``.db`` file, and no live launcher
-  names it. Every other unmarked folder is kept.
+- a folder with no owner marker file at all is reclaimed once its newest file
+  is older than ``--older-than-days``, but only when its name is a worker run
+  label (``hub``/``ws<n>`` plus ``exec``/``review``/``plan``/``coord``), its
+  path is not a Postgres data directory or a ``.db`` file, and no live
+  launcher names it. Every other unmarked folder is kept, and so is a folder
+  whose marker file exists but cannot be read.
 
 ``gc`` is a dry run unless ``--apply``. Each candidate is assessed a
 second time just before removal, so a run that started in between is
@@ -33,6 +34,7 @@ symlinks are never followed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -200,6 +202,8 @@ def assess(folder, now: float, older_than_days: float | None, live: set | None,
         return keep("cannot read the folder")
     owner = scratchdir.read_owner(folder)
     if owner is None:
+        if os.path.lexists(folder / scratchdir.OWNER_FILE):
+            return keep("owner marker unreadable")
         if older_than_days is None or not _unmarked_worker(folder):
             return keep("no owner marker: not made by a launcher")
         if live is None:
@@ -453,6 +457,10 @@ def cmd_scratch(argv: list[str]) -> int:
         except ValueError:
             print(f"--older-than-days needs a number, got {flags['--older-than-days']!r}", file=sys.stderr)
             return 2
+        if not math.isfinite(days):
+            print(f"--older-than-days must be a finite number, got {flags.get('--older-than-days', DEFAULT_OLDER_DAYS)!r}",
+                  file=sys.stderr)
+            return 2
         if days < 0:
             print("--older-than-days must be 0 or more", file=sys.stderr)
             return 2
@@ -462,6 +470,10 @@ def cmd_scratch(argv: list[str]) -> int:
                 finished = float(finished)
             except ValueError:
                 print(f"--finished-after-hours needs a number, got {finished!r}", file=sys.stderr)
+                return 2
+            if not math.isfinite(finished):
+                print(f"--finished-after-hours must be a finite number, got {flags['--finished-after-hours']!r}",
+                      file=sys.stderr)
                 return 2
             if finished < 0:
                 print("--finished-after-hours must be 0 or more", file=sys.stderr)
