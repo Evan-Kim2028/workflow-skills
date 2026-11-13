@@ -237,6 +237,23 @@ instead of letting it swing between idle and burst.
   dashboard shows "Filler runs" under Work and "Holding near target: N filler runs
   filling the gap" under Limited by.
 
+## Thinking levels
+
+Each pi run can carry a thinking level (`pi --thinking <level>`: off, minimal, low, medium,
+high, xhigh or max). Unset means pi's own default, which real work keeps unless configured.
+
+- Per tier: `broker.json` `tiers_thinking`, for example `{"pi-deepseek-flash": "high"}`. Levels
+  outside pi's list are dropped. Kimi runs at pi's default unless its tier is named here.
+- Per job: a job's `thinking` field overrides its tier's level when it names a valid level.
+- The broker passes the level to the launcher as `AGENTQ_THINKING` (never inherited from the
+  broker's own environment). `launch_pi.py` adds `--thinking <level>` to the pi command, for a
+  new run and a resumed one, and writes the level to `<run>/pi/thinking-level`.
+- The level a job actually launched with is recorded on the job (`jobs.thinking_used`), so the
+  report can group runs by it. A run from before levels were recorded reads as `default`.
+- `agentq thinking report [--since <iso>]` is read-only. Per level, for DeepSeek jobs: finished
+  jobs, the verdict mix, the PASS rate with a 95% Wilson interval, output tokens per job and per
+  model turn (proxied requests, from `proxy_jobs`), billed tokens per job, and wall time per job.
+
 ## Lanes and ordering
 
 - Lanes: `urgent` > `normal` > `backlog`. FIFO inside each lane.
@@ -353,7 +370,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 |---|---|
 | `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_audits`, `filler_prs`, `filler_targets` (older, read once by the migration), `filler_state`. `proxy_minutes` belongs to the proxy |
 | `backlog/<name>.md` | a backlog template's prompt copy |
-| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings and the `fill` and `pacing` settings (see above) |
+| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings, the per-tier `tiers_thinking` levels and the `fill` and `pacing` settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
 | `jobs/<id>/runs/<n>/` | the run folder of each launch (run_worker's files live here) |
