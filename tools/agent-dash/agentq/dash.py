@@ -44,7 +44,6 @@ LAPTOP_BAR_DEFAULTS = {
     "tests_max_cpu_busy": 0.80, "tests_min_free_pct": 35.0, "light_max_cpu_busy": 0.92,
     "light_min_free_pct": 20.0, "max_swap_frac": 0.90,
 }
-ROOM_CPU_FRAC = 1.2
 MEMORY_CACHE_S = 15.0
 MEMORY_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 BUDGET_FIELDS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
@@ -3035,8 +3034,9 @@ def room(
     """How many more busy DeepSeek workers fit: the smallest of three candidates, each in workers.
 
     Morph total and Morph uncached input (ds_uncached) use ROOM_FRAC of their limit less the 5-minute average
-    per minute, divided by the per-worker rate. The laptop uses ROOM_CPU_FRAC times the CPU count less the
-    1-minute load, divided by the load per worker. A candidate with no per-worker rate is left out.
+    per minute, divided by the per-worker rate. The laptop uses the light-job CPU busy bar: workers fit while
+    CPU busy stays under that bar, each worker adding busy / workers of CPU. A candidate with no per-worker
+    rate, or no CPU reading, is left out.
     """
     workers = active_ds_workers
     total5 = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES
@@ -3047,9 +3047,10 @@ def room(
             candidates["total"] = (ROOM_FRAC * limits["total"] - total5) / (total5 / workers)
         if uncached5 > 0:
             candidates["uncached_ds"] = (ROOM_FRAC * limits["uncached_ds"] - uncached5) / (uncached5 / workers)
-        load1, cpus = laptop.get("load1"), laptop.get("cpus")
-        if load1 is not None and cpus and load1 > 0:
-            candidates["laptop"] = max(0.0, ROOM_CPU_FRAC * cpus - load1) / (load1 / workers)
+        busy = laptop.get("cpu_busy")
+        bar = (laptop.get("bars") or LAPTOP_BAR_DEFAULTS)["light_max_cpu_busy"]
+        if busy is not None and busy > 0:
+            candidates["laptop"] = max(0.0, bar - busy) * workers / busy
     if not candidates:
         return {
             "workers": None, "bound": None, "active_ds_workers": workers,
@@ -3404,7 +3405,10 @@ class SummaryCache:
 
 def laptop_unread() -> dict:
     """The laptop reading served before the first read lands: the CPU count is known, nothing else is."""
-    return {"load1": None, "cpus": os.cpu_count() or 1, "load_per_cpu": None, "memory_free_pct": None}
+    return {
+        "load1": None, "cpus": os.cpu_count() or 1, "load_per_cpu": None, "memory_free_pct": None,
+        "cpu_busy": None, "swap_frac": None, "bars": dict(LAPTOP_BAR_DEFAULTS),
+    }
 
 
 def note_client_gone(server: "DashServer") -> None:

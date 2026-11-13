@@ -1118,7 +1118,7 @@ class EnforcedLimitsChartTest(unittest.TestCase):
 
 LIMITS_NOW = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
 CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.30, "swap_frac": 0.10}
-HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.90, "swap_frac": 0.10}
+HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.95, "swap_frac": 0.10}
 def live_queued(total=0, output=0, uncached=0, uncached_ds=0) -> dict:
     """A proxy status whose budgets hold the given number of waiting requests each, all in the normal lane."""
     waits = {"total": total, "output": output, "uncached": uncached, "uncached_ds": uncached_ds}
@@ -1428,6 +1428,18 @@ class RoomForWorkersTest(unittest.TestCase):
         self.assertEqual(result["bound"], "laptop")
         self.assertEqual(result["workers"], 0)
         self.assertEqual(result["text"], "No room; adding workers will only queue (bounded by laptop CPU).")
+
+    def test_laptop_room_is_the_light_cpu_bar_less_busy_scaled_per_worker(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=100_000)
+        laptop = dict(CALM, cpu_busy=0.50)
+        result = self.room_for(raw, workers=10, laptop=laptop)
+        self.assertEqual(result["candidates"]["laptop"], round((0.92 - 0.50) * 10 / 0.50, 2))
+
+    def test_laptop_room_ignores_load_and_is_absent_without_a_cpu_reading(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=100_000)
+        high_load = dict(CALM, load1=60.0, cpu_busy=0.30)
+        self.assertNotIn("laptop", self.room_for(raw, workers=10, laptop=dict(high_load, cpu_busy=None))["candidates"])
+        self.assertEqual(self.room_for(raw, workers=10, laptop=high_load)["candidates"]["laptop"], round((0.92 - 0.30) * 10 / 0.30, 2))
 
     def test_no_active_workers_means_room_is_unknown(self) -> None:
         result = self.room_for(five_minutes(total=1_000_000), workers=None)
