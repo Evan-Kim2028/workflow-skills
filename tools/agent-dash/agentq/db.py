@@ -24,6 +24,10 @@ LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+#: The longest job label the launcher accepts, and its character set. One source of truth: run_worker.py enforces
+#: LAUNCH_LABEL_RE, dash/labels.py refuses what it would refuse, and the filler checks what it builds against both.
+LAUNCH_LABEL_MAX = 80
+LAUNCH_LABEL_RE = re.compile(rf"^[\w.+-]{{1,{LAUNCH_LABEL_MAX}}}$")
 REVIEW_TIER = "pi-kimi"
 DEFAULT_TIER = "pi-deepseek-flash"
 OPEN_STATES = ("queued", "running")

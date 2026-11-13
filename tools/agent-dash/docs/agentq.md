@@ -208,8 +208,16 @@ instead of letting it swing between idle and burst.
   the targets rotating from the cursor. Every filler job, whatever its kind, counts as
   queued filler (its label, or its record in `filler_jobs`) toward the controller's queue
   and the `max_workers` room, so queued reviews hold the controller until they drain.
-  Labels come from `label make` as `hub-exec-backlog-filler-<kind>-<repo>-<module>`; PR
-  reviews use `hub-exec-backlog-filler-pr-<repo>-<number>`. Report
+  Labels come from `label make` as `hub-exec-backlog-filler-<kind>-<repo-short>-<readable>-<hash>`.
+  The whole label, `hub-exec-` included, is at most 80 characters (the launcher's limit,
+  `agentq.db.LAUNCH_LABEL_MAX`, shared with run_worker and `label check`); the readable part is
+  cut to fit and the 8-character hash keeps modules apart. The generator refuses to submit a
+  label the launcher would reject, logs it once, and submits the rest of the batch. PR reviews
+  use `hub-exec-backlog-filler-pr-<repo-short>-<number>`.
+- Repairing bad-label failures. A filler job that failed at launch with `reason=bad-label` audited
+  nothing, yet its audit or PR row said it had. `agentq filler repair-failed` lists those jobs and
+  the rows they wrote; `--apply` clears those rows so the targets are due again. Nothing else is
+  touched. The default is a dry run. Report
   paths and labels use a readable slug plus an 8-character hash of the full path
   (`pkg-a-<hash>`), so long paths that share a prefix never collide. Reports written
   under the earlier unhashed names stay where they are.

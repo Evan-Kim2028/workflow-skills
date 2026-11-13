@@ -408,6 +408,18 @@ def _set_paused(args, ctx: Context, enabled: bool) -> int:
     return answer(ctx, f"{state} backlog {args.name}", 0)
 
 
+def cmd_filler_repair_failed(args, ctx: Context) -> int:
+    """Make the targets of bad-label filler failures due again. A dry run unless ``--apply``."""
+    conn = db.connect(ctx.home)
+    result = filler_lib.repair_failed(conn, apply=args.apply)
+    if result["failed_jobs"] == 0:
+        return answer(ctx, "no failed filler job has reason=bad-label; nothing to repair", 0)
+    verb = "cleared" if args.apply else "would clear"
+    return answer(ctx, f"{result['failed_jobs']} failed filler job(s) with reason=bad-label: {verb} "
+                       f"{result['audit_rows']} audit row(s) and {result['pr_rows']} PR row(s)"
+                       + ("" if args.apply else "; dry run, add --apply to clear them"), 0)
+
+
 def cmd_thinking_report(args, ctx: Context) -> int:
     """Read-only: DeepSeek jobs per thinking level. The store is opened with mode=ro."""
     try:
@@ -525,6 +537,11 @@ def build_parser() -> argparse.ArgumentParser:
     report = tsub.add_parser("report", help="per thinking level: verdicts, output per job and per turn, billed tokens")
     report.add_argument("--since", metavar="ISO", help="only jobs submitted at or after this UTC time")
     report.set_defaults(func=cmd_thinking_report)
+    filler = sub.add_parser("filler", help="filler work supply: repairs")
+    fsub = filler.add_subparsers(dest="filler_cmd", required=True)
+    repair = fsub.add_parser("repair-failed", help="make targets whose filler job failed with a bad label due again")
+    repair.add_argument("--apply", action="store_true", help="clear the rows (default: dry run, count only)")
+    repair.set_defaults(func=cmd_filler_repair_failed)
     return parser
 
 

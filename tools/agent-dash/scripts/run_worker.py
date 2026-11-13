@@ -91,6 +91,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agentq.db import LAUNCH_LABEL_RE as LABEL_OK  # noqa: E402
 from dash.caps import PgrepFailed, as_int, base_model, cap_block  # noqa: E402
 
 RUN_RULE = (
@@ -98,7 +99,6 @@ RUN_RULE = (
     "then end with the full final report as your last message (it is captured from stdout). "
     "A run that ends without the report is a failed run."
 )
-LABEL_OK = re.compile(r"^[\w.+-]{1,80}$")
 KINDS = ("muse", "cursor", "grok-build", "pi", "codex")
 READ_LIMIT = 262144
 AGENTQ_HOME_DEFAULT = "~/.local/state/agentq"

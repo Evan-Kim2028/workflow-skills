@@ -1074,6 +1074,7 @@ class Broker:
         self._work = filler_lib.WorkCache(self.home, now=self.now, synchronous=work_synchronous, log=self.log)
         self._filler_retry = 0.0
         self._index_retry_at = 0.0
+        self._bad_label_logged: set[str] = set()
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -1407,6 +1408,11 @@ class Broker:
                 self._filler_retry = now + BACKLOG_RETRY_S
                 self.log(f"filler {work.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
                 break
+            if not filler_lib.label_fits(label):
+                if work.key not in self._bad_label_logged:
+                    self._bad_label_logged.add(work.key)
+                    self.log(f"filler {work.key}: label {label!r} would be refused by run_worker; not submitted")
+                continue
             job_id = db.new_job_id()
             prompt = db.job_dir(self.home, job_id) / "prompt.md"
             prompt.parent.mkdir(parents=True, exist_ok=True)

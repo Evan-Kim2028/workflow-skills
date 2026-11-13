@@ -169,9 +169,37 @@ def module_slug(text: str) -> str:
     return f"{base}-{digest}"
 
 
+LABEL_PREFIX = "hub-exec-"
+REPO_SHORT_MAX = 12
+
+
+def _short(text: str, limit: int) -> str:
+    """Lowercase letters, digits and dashes, cut to ``limit`` characters. At least ``x`` so a slug never has an empty part."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:limit].strip("-") or "x"
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:SLUG_HASH_LEN]
+
+
+def label_fits(label: str) -> bool:
+    """True when run_worker will accept the label: its character set and the launch length (prefix included)."""
+    return db.LAUNCH_LABEL_RE.fullmatch(label or "") is not None
+
+
 def label_slug(target: Target, kind: str = "bugs") -> str:
-    """The slug passed to ``label make`` for an audit, so it reads ``hub-exec-backlog-filler-<kind>-<repo>-<module>``."""
-    return f"{LABEL_SLUG}-{kind}-{module_slug(target.repo)}-{module_slug(target.module)}"
+    """The slug passed to ``label make`` for an audit: ``backlog-filler-<kind>-<repo-short>-<readable>-<hash>``.
+
+    The whole label, ``hub-exec-`` included, must fit the launch limit. The repo is cut to REPO_SHORT_MAX characters and
+    the module's readable part takes the rest of the room; the hash of the full path (the same one the report path uses)
+    keeps two modules apart even when their readable parts are cut to the same text.
+    """
+    head = f"{LABEL_SLUG}-{kind}-{_short(target.repo, REPO_SHORT_MAX)}-"
+    digest = _digest(target.module)
+    room = db.LAUNCH_LABEL_MAX - len(LABEL_PREFIX) - len(head) - len(digest) - 1
+    readable = _short(target.module, room) if room > 0 else ""
+    slug = f"{head}{readable}-{digest}" if readable else f"{head}{digest}"
+    return slug
 
 
 def is_filler_label(label: str) -> bool:
@@ -524,7 +552,7 @@ def pr_work(candidate: dict) -> Work:
     return Work(
         kind="pr", repo=repo, workspace=candidate["workspace"], module="", commit=candidate.get("merge_commit", ""),
         report_path=str(Path(candidate["report_dir"]) / "filler" / repo / "pr" / f"{number}.md"),
-        slug=f"{LABEL_SLUG}-pr-{module_slug(repo)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
+        slug=f"{LABEL_SLUG}-pr-{_short(repo, REPO_SHORT_MAX)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
         pr_title=candidate.get("title", ""), pr_url=candidate.get("url", ""), pr_slug=candidate.get("slug", ""),
         report_dir=candidate["report_dir"],
     )
@@ -663,6 +691,36 @@ def top_findings(text: str, count: int = 5) -> list[tuple[str, str, str]]:
     """The ``count`` most severe findings of a report; ties keep the report's order."""
     ordered = sorted(parse_findings(text), key=lambda f: SEVERITY_ORDER[f[0]])
     return ordered[:count]
+
+
+BAD_LABEL_REASON = "reason=bad-label"
+
+
+def repair_failed(conn, apply: bool = False) -> dict:
+    """Make the targets whose filler jobs failed with a bad label due again.
+
+    Such a job failed at launch, before any work, so it audited nothing. Its audit row (filler_audits) and its PR
+    review row (filler_prs) were written at submission, so they now say the target was reviewed. This finds the
+    failed filler jobs whose failure reason is ``bad-label`` and clears only the rows those jobs wrote. Nothing else is
+    touched: other failure reasons, jobs that succeeded, and rows written by later jobs. A dry run (apply false) only counts.
+    """
+    failed = [row[0] for row in conn.execute(
+        """SELECT j.id FROM jobs j JOIN filler_jobs f ON f.job_id = j.id
+           WHERE j.state = 'failed' AND instr(j.detail, ?) > 0""",
+        (BAD_LABEL_REASON,),
+    ).fetchall()]
+    if not failed:
+        return {"failed_jobs": 0, "audit_rows": 0, "pr_rows": 0, "applied": False}
+    marks = ",".join("?" for _ in failed)
+    audits = conn.execute(f"SELECT COUNT(*) FROM filler_audits WHERE last_job IN ({marks})", failed).fetchone()[0]
+    prs = conn.execute(f"SELECT COUNT(*) FROM filler_prs WHERE last_job IN ({marks})", failed).fetchone()[0]
+    result = {"failed_jobs": len(failed), "audit_rows": audits, "pr_rows": prs, "applied": False}
+    if apply:
+        with db.tx(conn):
+            conn.execute(f"DELETE FROM filler_audits WHERE last_job IN ({marks})", failed)
+            conn.execute(f"DELETE FROM filler_prs WHERE last_job IN ({marks})", failed)
+        result["applied"] = True
+    return result
 
 
 def index_path(report_dir: str) -> Path:
