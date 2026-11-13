@@ -13,6 +13,17 @@ check that cannot run keeps the folder, so the safe answer is always "keep":
    ``ws archive`` cleanup skips the age check because archiving is the
    decision).
 
+Two rules relax the age cutoff, and only the age cutoff:
+
+- a marked folder whose run is finished is reclaimed once its newest file
+  is older than ``--finished-after-hours`` (off by default), even when it
+  is younger than ``--older-than-days``;
+- a folder with no owner marker is reclaimed once its newest file is older
+  than ``--older-than-days``, but only when its name is a worker run label
+  (``hub``/``ws<n>`` plus ``exec``/``review``/``plan``/``coord``), its path
+  is not a Postgres data directory or a ``.db`` file, and no live launcher
+  names it. Every other unmarked folder is kept.
+
 ``gc`` is a dry run unless ``--apply``. Each candidate is assessed a
 second time just before removal, so a run that started in between is
 kept. Removal is ``shutil.rmtree`` on one folder under the scratch root;
@@ -23,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -35,6 +47,8 @@ from dash import scratchdir
 DEFAULT_OLDER_DAYS = 7.0
 LSOF_TIMEOUT_S = 60
 LIVE_REASONS = ("live launcher", "run still running", "in use")
+WORKER_LABEL_RE = re.compile(r"^(hub|ws\d+|WS\d+)-(exec|review|plan|coord)-[A-Za-z0-9._-]+$")
+PROTECTED_PATH_RE = re.compile(r"pgdata|postgres|\.db$", re.IGNORECASE)
 
 
 def _walk(path: Path) -> tuple[int, float, bool]:
@@ -153,7 +167,15 @@ def _proc_open_in(folder: str) -> bool | None:
     return None
 
 
-def assess(folder, now: float, older_than_days: float | None, live: set | None) -> dict:
+def _unmarked_worker(folder: Path) -> bool:
+    """True when an unmarked folder looks like a launcher-made worker folder."""
+    if not WORKER_LABEL_RE.fullmatch(folder.name):
+        return False
+    return not PROTECTED_PATH_RE.search(str(folder))
+
+
+def assess(folder, now: float, older_than_days: float | None, live: set | None,
+           finished_after_hours: float | None = None) -> dict:
     """Verdict for one scratch folder: ``action`` is ``reclaim`` or ``keep``."""
     folder = Path(folder)
     row = {
@@ -178,7 +200,22 @@ def assess(folder, now: float, older_than_days: float | None, live: set | None) 
         return keep("cannot read the folder")
     owner = scratchdir.read_owner(folder)
     if owner is None:
-        return keep("no owner marker: not made by a launcher")
+        if older_than_days is None or not _unmarked_worker(folder):
+            return keep("no owner marker: not made by a launcher")
+        if live is None:
+            return keep("live-process check did not run")
+        if folder.name in live:
+            return keep("live launcher")
+        in_use = _proc_open_in(str(folder))
+        if in_use is None:
+            return keep("open-handle check did not run")
+        if in_use:
+            return keep("in use")
+        if newest > now - float(older_than_days) * 86400:
+            return keep(f"newest file is under {older_than_days:g} days old")
+        row["action"] = "reclaim"
+        row["reason"] = "unmarked worker folder, stale"
+        return row
     if str(owner.get("label", "")) != folder.name:
         return keep("owner marker names another run")
     if live is None:
@@ -195,10 +232,12 @@ def assess(folder, now: float, older_than_days: float | None, live: set | None) 
         return keep("open-handle check did not run")
     if in_use:
         return keep("in use")
-    if older_than_days is not None:
-        cutoff = now - float(older_than_days) * 86400
-        if newest > cutoff:
+    if older_than_days is not None and newest > now - float(older_than_days) * 86400:
+        if finished_after_hours is None or newest > now - float(finished_after_hours) * 3600:
             return keep(f"newest file is under {older_than_days:g} days old")
+        row["action"] = "reclaim"
+        row["reason"] = f"finished run, idle over {float(finished_after_hours):g} h"
+        return row
     row["action"] = "reclaim"
     row["reason"] = "finished run"
     return row
@@ -216,11 +255,12 @@ def _folders(root: Path):
             yield folder
 
 
-def scan(root, now: float | None = None, older_than_days: float | None = DEFAULT_OLDER_DAYS) -> list:
+def scan(root, now: float | None = None, older_than_days: float | None = DEFAULT_OLDER_DAYS,
+         finished_after_hours: float | None = None) -> list:
     """Assessed rows for every scratch folder under ``root`` (read-only)."""
     moment = time.time() if now is None else float(now)
     live = live_labels(moment)
-    return [assess(f, moment, older_than_days, live) for f in _folders(Path(root))]
+    return [assess(f, moment, older_than_days, live, finished_after_hours) for f in _folders(Path(root))]
 
 
 def _remove(folder: Path) -> bool:
@@ -235,10 +275,11 @@ def _remove(folder: Path) -> bool:
     return True
 
 
-def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, now: float | None = None) -> dict:
+def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, now: float | None = None,
+       finished_after_hours: float | None = None) -> dict:
     """Dry run by default. With ``apply``, removes each reclaimable folder."""
     moment = time.time() if now is None else float(now)
-    rows = scan(root, moment, older_than_days)
+    rows = scan(root, moment, older_than_days, finished_after_hours)
     reclaim = [r for r in rows if r["action"] == "reclaim"]
     removed = []
     failed = []
@@ -246,7 +287,7 @@ def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, n
         live = live_labels(moment)
         for row in reclaim:
             folder = Path(row["path"])
-            again = assess(folder, moment, older_than_days, live)
+            again = assess(folder, moment, older_than_days, live, finished_after_hours)
             if again["action"] != "reclaim":
                 row["action"] = "keep"
                 row["reason"] = again["reason"]
@@ -257,6 +298,7 @@ def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, n
         "root": str(root),
         "apply": bool(apply),
         "older_than_days": float(older_than_days),
+        "finished_after_hours": None if finished_after_hours is None else float(finished_after_hours),
         "rows": rows,
         "reclaimable": sum(r["bytes"] for r in reclaim),
         "reclaimable_count": len(reclaim),
@@ -369,7 +411,7 @@ def remove_workstream(ws: str, root=None, now: float | None = None) -> dict:
 # --- CLI ------------------------------------------------------------------
 
 SCRATCH_USAGE = """usage:
-  python3 agent_dash.py scratch gc [--older-than-days N] [--apply] [--json]
+  python3 agent_dash.py scratch gc [--older-than-days N] [--finished-after-hours H] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
 """
 
@@ -401,7 +443,8 @@ def cmd_scratch(argv: list[str]) -> int:
     verb, rest = argv[0], argv[1:]
     root = scratchdir.scratch_root()
     if verb == "gc":
-        flags = _parse_flags(rest, {"--apply": True, "--json": True, "--older-than-days": False})
+        flags = _parse_flags(rest, {"--apply": True, "--json": True,
+                                    "--older-than-days": False, "--finished-after-hours": False})
         if flags is None:
             print(SCRATCH_USAGE, end="", file=sys.stderr)
             return 2
@@ -413,7 +456,18 @@ def cmd_scratch(argv: list[str]) -> int:
         if days < 0:
             print("--older-than-days must be 0 or more", file=sys.stderr)
             return 2
-        report = gc(root, older_than_days=days, apply=bool(flags.get("--apply")))
+        finished = flags.get("--finished-after-hours")
+        if finished is not None:
+            try:
+                finished = float(finished)
+            except ValueError:
+                print(f"--finished-after-hours needs a number, got {finished!r}", file=sys.stderr)
+                return 2
+            if finished < 0:
+                print("--finished-after-hours must be 0 or more", file=sys.stderr)
+                return 2
+        report = gc(root, older_than_days=days, apply=bool(flags.get("--apply")),
+                    finished_after_hours=finished)
         if flags.get("--json"):
             print(json.dumps({k: v for k, v in report.items() if k != "rows"}, sort_keys=True))
             return 0
@@ -439,6 +493,8 @@ def cmd_scratch(argv: list[str]) -> int:
 def _print_gc(report: dict) -> None:
     mode = "apply" if report["apply"] else "dry run"
     print(f"scratch gc ({mode}) under {report['root']}, folders finished more than {report['older_than_days']:g} days ago:")
+    if report.get("finished_after_hours") is not None:
+        print(f"  finished runs idle over {report['finished_after_hours']:g} h are reclaimed too")
     for row in report["rows"]:
         if row["action"] == "reclaim":
             print(f"  reclaim  {row['workstream']}/{row['label']}  {human(row['bytes'])}")

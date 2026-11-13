@@ -124,7 +124,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py logs sessions [--apply] [--no-reclaim] [--scheduled] [--tool NAME]... [--limit N] [--max-minutes M] [--url URL] [--dest DIR]
   python3 agent_dash.py logs sessions restore <session-id|unit|archive> [--to DIR]
   python3 agent_dash.py logs sessions status
-  python3 agent_dash.py scratch gc [--older-than-days 7] [--apply] [--json]
+  python3 agent_dash.py scratch gc [--older-than-days 7] [--finished-after-hours H] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
   python3 agent_dash.py janitor postgres [--min-age 1h] [--apply]
   python3 agent_dash.py janitor temp [--min-age 5h] [--apply]
