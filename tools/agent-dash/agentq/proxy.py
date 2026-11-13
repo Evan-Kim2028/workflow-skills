@@ -60,6 +60,8 @@ ARMED = "armed"
 SUSPENDED = "suspended"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 RESERVE_REFILL_S = 30 * 60.0
+RESERVE_TARGET_CEILING = 1.0
+BACKLOG_AGING_S = 120.0
 UNCACHED_RATIO_FLOOR = 0.25
 UNCACHED_RATIO_CEIL = 1.25
 UNCACHED_RATIO_ALPHA = 0.05
@@ -117,6 +119,7 @@ DEFAULT_CONFIG = {
     "log_max_bytes": LOG_MAX_BYTES,
     "log_backups": LOG_BACKUPS,
     "reserve_refill_s": RESERVE_REFILL_S,
+    "backlog_aging_s": BACKLOG_AGING_S,
     "budgets": {
         "total": {"limit_type": "total", "limit": 10_000_000},
         "output": {
@@ -945,7 +948,10 @@ class InflightLimiter:
 
 
 class Reserve:
-    """The burst reserve of one budget: its level, capacity, and the overflow drained this minute."""
+    """The burst reserve of one budget: its level, its capacity, and the overflow drained for each minute
+    that still has charges (``drained``, keyed by minute stamp). A minute's drain follows its own charged
+    total, so a charge that completes or is released a minute after its admission is reconciled against
+    the admission minute, not the current one."""
 
     def __init__(
         self,
@@ -963,8 +969,7 @@ class Reserve:
         self.refill_s = float(refill_s)
         self.level = self.capacity if level is None else min(self.capacity, max(0.0, float(level)))
         self.wall = float(wall)
-        self.minute: str | None = None
-        self.drained = 0.0
+        self.drained: dict[str, float] = {}
 
     @property
     def refill_per_s(self) -> float:
@@ -976,23 +981,30 @@ class Reserve:
             self.level = min(self.capacity, self.level + (wall - self.wall) * self.refill_per_s)
             self.wall = wall
 
-    def sync(self, wall: float, minute: str, used: float, free: float) -> None:
-        """Bring the reserve to this minute's usage: refill to ``wall``, then drain or refund the overflow.
+    def reconcile(self, wall: float, ledger: dict[str, float], free: float) -> None:
+        """Refill to ``wall``, then bring every minute's drain to its charged total.
 
-        ``used`` is the minute's total charged so far (in-flight estimates included) and ``free`` the
-        free allowance. The overflow is ``used - free`` when positive. A new minute starts with nothing drained.
+        ``ledger`` maps each minute that still holds charges to their total; ``free`` is the allowance for one
+        minute. A minute whose total grew drains the difference, and one whose total shrank (a completion
+        below its estimate, or a release) refunds it, up to capacity. A minute that is no longer in the ledger
+        has no charges left, so its drain stands and its record is dropped.
         """
         self.refill(wall)
-        if minute != self.minute:
-            self.minute = minute
-            self.drained = 0.0
-        owed = max(0.0, used - free)
-        self.level = min(self.capacity, max(0.0, self.level - (owed - self.drained)))
-        self.drained = owed
+        for minute in [m for m in self.drained if m not in ledger]:
+            del self.drained[minute]
+        for minute, used in ledger.items():
+            owed = max(0.0, used - free)
+            previous = self.drained.get(minute, 0.0)
+            self.level = min(self.capacity, max(0.0, self.level - (owed - previous)))
+            self.drained[minute] = owed
 
-    def admission_overflow(self, used: float, estimate: float, free: float) -> float:
-        """Reserve tokens one more charge of ``estimate`` would drain now. Call sync() first."""
-        return max(0.0, used + estimate - free) - self.drained
+    def sync(self, wall: float, minute: str, used: float, free: float) -> None:
+        """Reconcile a single minute, the view the replay uses when earlier minutes are settled."""
+        self.reconcile(wall, {minute: used}, free)
+
+    def admission_overflow(self, used: float, estimate: float, free: float, minute: str) -> float:
+        """Reserve tokens one more charge of ``estimate`` would drain in ``minute``, given the minute's usage so far."""
+        return max(0.0, used + estimate - free) - self.drained.get(minute, 0.0)
 
     def covers(self, overflow: float) -> bool:
         """True when the reserve can pay this overflow. An overflow larger than the whole reserve is
@@ -1014,20 +1026,22 @@ class Reserve:
         return {
             "level": round(self.level, 3),
             "wall": round(self.wall, 3),
-            "minute": self.minute,
-            "drained": round(self.drained, 3),
+            "drained": {minute: round(value, 3) for minute, value in self.drained.items()},
         }
 
-    def restore(self, data: dict, now: float, minute: str) -> None:
-        """Load a saved snapshot taken at data["wall"]. The level refills for the time since, and the
-        minute's drain is kept only when the minute is still the same one."""
+    def restore(self, data: dict, now: float) -> None:
+        """Load a saved snapshot. The level refills for the time since it was taken. The per-minute drains
+        are kept, and the next reconcile drops any minute that no longer holds charges."""
         saved_wall = float(data.get("wall", now))
         self.level = min(self.capacity, max(0.0, float(data.get("level", self.capacity))))
         self.wall = min(saved_wall, now)
         self.refill(now)
-        if data.get("minute") == minute:
-            self.minute = minute
-            self.drained = max(0.0, float(data.get("drained", 0.0)))
+        drained = data.get("drained")
+        self.drained = (
+            {str(minute): max(0.0, float(value)) for minute, value in drained.items()}
+            if isinstance(drained, dict)
+            else {}
+        )
 
 
 @dataclass(eq=False)
@@ -1091,9 +1105,22 @@ class Budget:
         every charge in flight. Calendar (wall_start given): charges admitted at or after wall_start."""
         if wall_start is None:
             self.prune(now, window)
-        else:
-            self.entries = [e for e in self.entries if e.wall_at >= wall_start]
-        return sum(e.amount for e in self.entries if lane is None or e.lane == lane)
+            return sum(e.amount for e in self.entries if lane is None or e.lane == lane)
+        return sum(
+            e.amount for e in self.entries if e.wall_at >= wall_start and (lane is None or e.lane == lane)
+        )
+
+    def prune_settled(self, wall: float, minute_start: float) -> None:
+        """Drop past minutes whose charges have all settled, and undone charges older than hold_s.
+
+        A minute is dropped whole, never piecemeal, so a reserve drain is never reconciled against a partial
+        ledger. A minute with a charge still in flight is kept, so that charge can settle into its own minute.
+        """
+        alive = [e for e in self.entries if e.done or wall - e.wall_at < self.hold_s]
+        open_minutes = {minute_stamp(e.wall_at) for e in alive if not e.done}
+        self.entries = [
+            e for e in alive if e.wall_at >= minute_start or minute_stamp(e.wall_at) in open_minutes
+        ]
 
     def seconds_until_free(self, needed: float, now: float, window: float) -> float:
         """Seconds until completed charges older than the window free `needed` tokens."""
@@ -1184,10 +1211,13 @@ class Governor:
                     refill_s=float(config.get("reserve_refill_s", RESERVE_REFILL_S)),
                     wall=self.wall(),
                 )
+            start_target = float(config["start_target"])
+            if reserve is not None:
+                start_target = min(start_target, RESERVE_TARGET_CEILING)
             self.budgets[name] = Budget(
                 name=name,
                 limit=int(spec["limit"]),
-                target=float(config["start_target"]),
+                target=start_target,
                 limit_type=limit_type,
                 model_prefix=spec.get("model_prefix"),
                 model=spec.get("model"),
@@ -1231,6 +1261,8 @@ class Governor:
     def _used(self, budget: Budget, lane: str | None = None) -> int:
         """The budget's usage in its current window, in whichever window mode the budget uses."""
         if budget.window_mode == CALENDAR:
+            if budget.reserve is None:
+                budget.prune_settled(self.wall(), self.minute_start())
             return budget.used(self.clock(), self.window, lane, wall_start=self.minute_start())
         return budget.used(self.clock(), self.window, lane)
 
@@ -1255,7 +1287,10 @@ class Governor:
             budget.limit = int(spec.get("limit", budget.limit))
             floor = float(self.config["target_floor"])
             ceiling = float(self.config.get("target_ceiling", 1.0))
-            budget.target = min(ceiling, max(floor, float(spec.get("target_frac", budget.target))))
+            target = min(ceiling, max(floor, float(spec.get("target_frac", budget.target))))
+            if budget.reserve is not None:
+                target = min(target, RESERVE_TARGET_CEILING)
+            budget.target = target
             if spec.get("fast_limit") is not None:
                 budget.fast_limit = float(spec["fast_limit"])
                 budget.last_429 = self.clock()
@@ -1273,7 +1308,7 @@ class Governor:
             if budget.reserve is not None:
                 saved_reserve = spec.get("reserve")
                 if isinstance(saved_reserve, dict):
-                    budget.reserve.restore(saved_reserve, self.wall(), minute_stamp(self.wall()))
+                    budget.reserve.restore(saved_reserve, self.wall())
                 else:
                     budget.reserve.empty()
         for family, spec in (data.get("uncached_ratio") or {}).items():
@@ -1438,12 +1473,22 @@ class Governor:
         if learned["samples"] % UNCACHED_LOG_EVERY == 0:
             self.log("uncached_estimate", family=family, ratio=round(learned["ratio"], 4), samples=learned["samples"])
 
+    def minute_ledger(self, budget: Budget) -> dict[str, float]:
+        """Each minute that still holds a charge on the budget, with the total charged in it."""
+        ledger: dict[str, float] = {}
+        for entry in budget.entries:
+            key = minute_stamp(entry.wall_at)
+            ledger[key] = ledger.get(key, 0.0) + entry.amount
+        return ledger
+
     def sync_reserve(self, budget: Budget) -> None:
-        """Bring a budget's burst reserve to the current minute's usage. A budget without a reserve is left alone."""
+        """Reconcile a budget's burst reserve with every minute still holding charges, then drop settled
+        minutes. A budget without a reserve is left alone."""
         if budget.reserve is None:
             return
         wall = self.wall()
-        budget.reserve.sync(wall, minute_stamp(wall), self._used(budget), budget.cap())
+        budget.reserve.reconcile(wall, self.minute_ledger(budget), budget.cap())
+        budget.prune_settled(wall, self.minute_start())
 
     def enqueue(self, ticket: Ticket) -> None:
         self.queues[ticket.lane].append(ticket)
@@ -1457,7 +1502,16 @@ class Governor:
             self.queues[ticket.lane].remove(ticket)
 
     def promote_aged(self, now: float) -> None:
-        """Normal tickets queued past aging_s join the urgent lane, kept in arrival order."""
+        """Backlog tickets queued past backlog_aging_s join the normal lane, so a steady stream of other work
+        cannot hold them forever. Normal tickets queued past aging_s join the urgent lane, kept in arrival order."""
+        backlog_aging = float(self.config.get("backlog_aging_s", BACKLOG_AGING_S))
+        stale = [t for t in self.queues["backlog"] if now - t.queued_at > backlog_aging]
+        if stale:
+            for ticket in stale:
+                self.queues["backlog"].remove(ticket)
+                ticket.lane = "normal"
+                self.log("backlog_aged", job=ticket.job, model=ticket.model)
+            self.queues["normal"] = deque(sorted([*self.queues["normal"], *stale], key=lambda t: t.queued_at))
         aging = float(self.config["aging_s"])
         normal = self.queues["normal"]
         aged = [t for t in normal if now - t.queued_at > aging]
@@ -1568,12 +1622,14 @@ class Governor:
 
     def _reserve_refusal(self, budget: Budget, lane: str, estimate: int, used: float) -> str | None:
         """Why a charge on a budget with a burst reserve must wait, or None. The free allowance is the cap;
-        only the overflow past it touches the reserve. Backlog never spends the reserve, so it waits at the
-        cap (RESERVE). Normal and urgent work waits only when the reserve cannot pay the overflow (EMPTY)."""
-        overflow = budget.reserve.admission_overflow(used, estimate, budget.cap())
+        only the overflow past it touches the reserve. Backlog never spends the reserve while its budget
+        already has charges this minute (RESERVE). An idle budget admits one oversized backlog request that
+        spends only its own overflow, so a request larger than the allowance cannot wait forever. Other work
+        waits only when the reserve cannot pay the overflow (EMPTY)."""
+        overflow = budget.reserve.admission_overflow(used, estimate, budget.cap(), minute_stamp(self.wall()))
         if overflow <= 0:
             return None
-        if lane == "backlog":
+        if lane == "backlog" and used > 0:
             return RESERVE
         if not budget.reserve.covers(overflow):
             return EMPTY
@@ -1796,9 +1852,11 @@ class Governor:
             used = self._used(budget)
             if budget.reserve is not None:
                 self.sync_reserve(budget)
-                overflow = budget.reserve.admission_overflow(used, estimate, budget.cap())
+                overflow = budget.reserve.admission_overflow(
+                    used, estimate, budget.cap(), minute_stamp(self.wall())
+                )
                 if overflow > 0:
-                    if ticket.lane == "backlog":
+                    if ticket.lane == "backlog" and used > 0:
                         wait = max(wait, seconds_to_next_minute(self.wall()))
                         jitter = float(self.config["calendar_jitter_s"])
                     else:
@@ -1833,7 +1891,7 @@ class Governor:
         for budget in self.budgets.values():
             demanded = budget.saturated or budget.saturated_since_tick
             budget.saturated_since_tick = False
-            budget_ceiling = min(ceiling, 1.0) if budget.reserve is not None else ceiling
+            budget_ceiling = min(ceiling, RESERVE_TARGET_CEILING) if budget.reserve is not None else ceiling
             if budget.fast_limit is not None and now - budget.last_429 >= FAST_LIMIT_QUIET_S:
                 self.log("fast_limit_cleared", budget=budget.name, fast_limit=round(budget.fast_limit, 4))
                 budget.fast_limit = None
@@ -2163,7 +2221,7 @@ class Governor:
                     "level": round(budget.reserve.level),
                     "capacity": round(budget.reserve.capacity),
                     "refill_per_min": round(budget.reserve.refill_per_s * MINUTE_S),
-                    "drained_60s": round(budget.reserve.drained),
+                    "drained_60s": round(budget.reserve.drained.get(minute_stamp(self.wall()), 0.0)),
                 }
         inflight_queued = sum(
             1

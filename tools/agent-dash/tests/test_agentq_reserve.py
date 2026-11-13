@@ -38,7 +38,7 @@ class ReserveMathTest(unittest.TestCase):
         reserve = Reserve(100, wall=0.0)
         reserve.sync(0.0, "m0", used=50, free=60)
         self.assertEqual(reserve.level, 100)
-        self.assertEqual(reserve.drained, 0)
+        self.assertEqual(reserve.drained.get("m0", 0), 0)
 
     def test_usage_past_the_allowance_drains_the_reserve(self) -> None:
         reserve = Reserve(100, wall=0.0)
@@ -64,14 +64,15 @@ class ReserveMathTest(unittest.TestCase):
         reserve = Reserve(100, refill_s=1800.0, wall=0.0)
         reserve.sync(0.0, "m0", used=80, free=60)
         reserve.sync(60.0, "m1", used=0, free=60)
-        self.assertEqual(reserve.drained, 0)
+        self.assertEqual(reserve.drained, {"m1": 0.0})
         self.assertAlmostEqual(reserve.level, 80 + 60 * 100 / 1800)
 
     def test_admission_overflow_counts_only_what_is_past_the_allowance(self) -> None:
         reserve = Reserve(100, wall=0.0)
         reserve.sync(0.0, "m0", used=50, free=60)
-        self.assertEqual(reserve.admission_overflow(50, 30, 60), 20)
-        self.assertEqual(reserve.admission_overflow(50, 5, 60), 0)
+        self.assertEqual(reserve.admission_overflow(50, 30, 60, "m0"), 20)
+        self.assertEqual(reserve.admission_overflow(50, 5, 60, "m0"), 0)
+        self.assertEqual(reserve.admission_overflow(50, 30, 60, "m1"), 20)
 
     def test_covers_needs_the_overflow_in_the_reserve_and_an_oversized_one_takes_a_full_reserve(self) -> None:
         reserve = Reserve(100, wall=0.0, level=10)
@@ -89,17 +90,30 @@ class ReserveMathTest(unittest.TestCase):
         reserve.empty()
         self.assertEqual(reserve.level, 0)
 
-    def test_restore_decays_by_elapsed_time_and_keeps_the_drain_only_in_the_same_minute(self) -> None:
+    def test_restore_decays_by_elapsed_time_and_keeps_each_minutes_drain(self) -> None:
         reserve = Reserve(1000, refill_s=1800.0, wall=0.0)
         reserve.sync(0.0, "m0", used=800, free=600)
         saved = reserve.snapshot()
         restored = Reserve(1000, refill_s=1800.0, wall=0.0)
-        restored.restore(saved, now=300.0, minute="m0")
+        restored.restore(saved, now=300.0)
         self.assertAlmostEqual(restored.level, 800 + 1000 * 300 / 1800)
-        self.assertEqual(restored.drained, 200)
-        other = Reserve(1000, refill_s=1800.0, wall=0.0)
-        other.restore(saved, now=300.0, minute="m1")
-        self.assertEqual(other.drained, 0)
+        self.assertEqual(restored.drained, {"m0": 200.0})
+
+    def test_reconcile_drains_the_extra_actual_of_an_earlier_minute_and_refunds_a_release(self) -> None:
+        reserve = Reserve(210_000, refill_s=1800.0, wall=0.0)
+        reserve.reconcile(0.0, {"m0": 100_000}, 70_000)
+        self.assertEqual(reserve.level, 180_000)
+        reserve.reconcile(60.0, {"m0": 200_000}, 70_000)
+        self.assertAlmostEqual(reserve.level, 87_000)
+        reserve.reconcile(120.0, {"m0": 0}, 70_000)
+        self.assertAlmostEqual(reserve.level, 210_000)
+
+    def test_a_minute_missing_from_the_ledger_keeps_its_drain_without_refund(self) -> None:
+        reserve = Reserve(210_000, refill_s=1800.0, wall=0.0)
+        reserve.reconcile(0.0, {"m0": 100_000}, 70_000)
+        reserve.reconcile(60.0, {"m1": 0}, 70_000)
+        self.assertEqual(reserve.drained, {"m1": 0.0})
+        self.assertAlmostEqual(reserve.level, 187_000)
 
 
 class GovernorReserveTest(unittest.TestCase):
@@ -254,6 +268,98 @@ class GovernorReserveTest(unittest.TestCase):
         self.gov.pump()
         self.assertFalse(ticket.holds)
         self.assertEqual(ticket.last_refusal, CAPACITY)
+
+    def test_a_completion_a_minute_later_drains_its_admission_minute(self) -> None:
+        ticket = self.ticket(100_000)
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.assertEqual(self.output_level(), 180_000)
+        self.wall[0] += 60.0
+        self.gov.finish_ok(ticket, {"prompt_tokens": 0, "completion_tokens": 200_000})
+        self.assertAlmostEqual(self.output_level(), 87_000, delta=1)
+
+    def test_a_release_a_minute_later_refunds_its_admission_minute(self) -> None:
+        ticket = self.ticket(100_000)
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.wall[0] += 60.0
+        self.gov.release(ticket)
+        self.assertAlmostEqual(self.output_level(), 210_000, delta=1)
+
+    def test_an_open_charge_survives_the_minute_roll_until_it_settles(self) -> None:
+        ticket = self.ticket(100_000)
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.wall[0] += 60.0
+        self.output_level()
+        self.assertEqual(len(self.gov.budgets["output"].entries), 1)
+        self.gov.finish_ok(ticket, {"prompt_tokens": 0, "completion_tokens": 100_000})
+        self.output_level()
+        self.assertEqual(self.gov.budgets["output"].entries, [])
+
+    def test_settled_minutes_are_pruned_on_a_calendar_budget_without_a_reserve(self) -> None:
+        self.gov.budgets["requests"].entries.append(
+            Entry(at=self.gov.clock(), amount=5, lane="normal", done=True, wall_at=self.wall[0])
+        )
+        self.assertEqual(self.gov._used(self.gov.budgets["requests"]), 5)
+        self.wall[0] += 60.0
+        self.gov._used(self.gov.budgets["requests"])
+        self.assertEqual(self.gov.budgets["requests"].entries, [])
+
+    def test_an_idle_budget_admits_one_oversized_backlog_request_at_once(self) -> None:
+        ticket = self.ticket(500_000, lane="backlog", budget="uncached_ds")
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.assertTrue(ticket.holds)
+        self.assertAlmostEqual(self.gov.budgets["uncached_ds"].reserve.level, 1_100_000, delta=1)
+
+    def test_a_busy_budget_still_holds_backlog_at_the_allowance(self) -> None:
+        self.occupy("uncached_ds", 1)
+        ticket = self.ticket(500_000, lane="backlog", budget="uncached_ds")
+        self.gov.enqueue(ticket)
+        self.gov.pump()
+        self.assertFalse(ticket.holds)
+        self.assertEqual(ticket.last_refusal, RESERVE)
+
+    def test_backlog_queued_past_its_aging_limit_is_admitted_as_normal_and_may_spend_the_reserve(self) -> None:
+        backlog = self.ticket(20_000, lane="backlog")
+        self.gov.enqueue(backlog)
+        self.occupy("output", 60_000)
+        self.gov.pump()
+        self.assertFalse(backlog.holds)
+        self.wall[0] += 121.0
+        self.occupy("output", 60_000)
+        self.gov.pump()
+        self.assertEqual(backlog.lane, "normal")
+        self.assertTrue(backlog.holds)
+
+    def test_backlog_inside_its_aging_limit_stays_backlog(self) -> None:
+        backlog = self.ticket(20_000, lane="backlog")
+        self.gov.enqueue(backlog)
+        self.wall[0] += 119.0
+        self.occupy("output", 60_000)
+        self.gov.pump()
+        self.assertEqual(backlog.lane, "backlog")
+        self.assertFalse(backlog.holds)
+
+    def test_a_restored_reserve_target_is_clamped_to_the_morph_limit(self) -> None:
+        (self.home / "proxy_state.json").write_text(json.dumps({
+            "saved_at": self.wall[0],
+            "budgets": {
+                "output": {"limit": 70_000, "target_frac": 1.4, "window_used": 0,
+                           "reserve": {"level": 210_000, "wall": self.wall[0], "drained": {}}},
+                "total": {"limit": 10_000_000, "target_frac": 1.4, "window_used": 0},
+            },
+        }))
+        restored = self.make_governor()
+        self.assertEqual(restored.budgets["output"].target, 1.0)
+        self.assertEqual(restored.budgets["output"].cap(), 70_000)
+        self.assertEqual(restored.budgets["total"].target, 1.4)
+
+    def test_a_reserve_budget_starts_at_no_more_than_the_morph_limit(self) -> None:
+        started = self.make_governor(start_target=1.2)
+        self.assertEqual(started.budgets["output"].target, 1.0)
+        self.assertEqual(started.budgets["total"].target, 1.2)
 
     def test_status_reports_free_allowance_reserve_and_capacity(self) -> None:
         self.occupy("output", 60_000)
