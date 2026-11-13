@@ -126,6 +126,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py logs sessions status
   python3 agent_dash.py scratch gc [--older-than-days 7] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
+  python3 agent_dash.py janitor postgres [--min-age 1h] [--apply]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -468,6 +469,13 @@ def main(argv: list[str] | None = None) -> int:
         from dash.scratchgc import cmd_scratch
 
         return cmd_scratch(args[1:])
+    if cmd == "janitor":
+        if len(args) < 2 or args[1] != "postgres":
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+        from dash.pgjanitor import cmd_postgres
+
+        return cmd_postgres(args[2:])
     print(USAGE, end="", file=sys.stderr)
     return 2
 
