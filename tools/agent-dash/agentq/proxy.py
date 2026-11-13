@@ -34,14 +34,14 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
-
-from agentq import watchdog as watchdog_lib
 
 LANES = ("urgent", "normal", "backlog")
 MORPH_FAMILIES = ("morph-dsv41flash", "morph-kimik31")
@@ -135,6 +135,7 @@ SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
 DB_WORKERS = 2
 LAG_WINDOW_S = 60.0
+SEED_DRAIN_S = 5.0
 LANE_CACHE_MAX = 10_000
 PREFIX_STORE_JOBS = 256
 ANONYMOUS_JOBS = frozenset({"", "none"})
@@ -1983,9 +1984,57 @@ class Client:
     aborted: bool = False
 
 
-class StaleConnection(Exception):
-    """A reused keep-alive connection was closed by the server before it answered. Nothing was received, so
-    the request can be sent again on a new connection."""
+def formatted_stack(frame) -> str:
+    """One line per frame, outermost first, joined with ' | '. Newlines never appear in the result."""
+    if frame is None:
+        return "unavailable"
+    lines = [line.strip() for block in traceback.format_stack(frame) for line in block.splitlines()]
+    return " | ".join(line for line in lines if line)
+
+
+class StallWatchdog(threading.Thread):
+    def __init__(
+        self,
+        *,
+        loop_thread_id: int,
+        dump_s: float,
+        log: Callable[..., None],
+        clock: Callable[[], float],
+        interval_s: float = 0.25,
+    ) -> None:
+        super().__init__(name="agentq-watchdog", daemon=True)
+        self.loop_thread_id = loop_thread_id
+        self.dump_s = dump_s
+        self.log = log
+        self.clock = clock
+        self.interval_s = interval_s
+        self.beat_at = clock()
+        self.episodes = 0
+        self._episode_open = False
+        self._halt = threading.Event()
+
+    def beat(self) -> None:
+        self.beat_at = self.clock()
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def run(self) -> None:
+        while not self._halt.wait(self.interval_s):
+            self.check()
+
+    def check(self) -> None:
+        """One look at the loop. Writes a stall line the first time a stall is seen; no-op otherwise."""
+        lag = self.clock() - self.beat_at
+        if lag <= self.dump_s:
+            self._episode_open = False
+            return
+        if self._episode_open:
+            return
+        self._episode_open = True
+        self.episodes += 1
+        frame = sys._current_frames().get(self.loop_thread_id)
+        self.log("loop_stall", ms=round(lag * 1000), stack=formatted_stack(frame))
 
 
 class UpstreamPool:
@@ -2006,10 +2055,17 @@ class UpstreamPool:
         return not writer.is_closing() and not reader.at_eof()
 
     def prune(self) -> None:
+        """Close and drop every idle connection that expired or is no longer usable, wherever it sits."""
         now = self.clock()
-        while self.idle and (now - self.idle[0][0] > self.idle_s or not self.usable(self.idle[0][2], self.idle[0][3])):
-            _, _, _, writer = self.idle.popleft()
-            writer.close()
+        kept: deque[tuple[float, str, asyncio.StreamReader, asyncio.StreamWriter]] = deque()
+        while self.idle:
+            entry = self.idle.popleft()
+            stamp, _, reader, writer = entry
+            if now - stamp > self.idle_s or not self.usable(reader, writer):
+                writer.close()
+            else:
+                kept.append(entry)
+        self.idle = kept
 
     def take(self, key: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
         """An idle connection to this upstream, most recently used first, or None. Never waits."""
@@ -2355,8 +2411,9 @@ class Proxy:
         self.active: set[asyncio.Task] = set()
         self.flush_task: asyncio.Task | None = None
         self.flush_lock = asyncio.Lock()
-        self.watchdog: watchdog_lib.StallWatchdog | None = None
+        self.watchdog: StallWatchdog | None = None
         self.seed_tasks: set[asyncio.Task] = set()
+        self.closed = False
         self.pool = UpstreamPool(governor.config["upstream_pool_max"], governor.config["upstream_pool_idle_s"])
         governor.seeder = self._start_seed
         self.db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="agentq-db")
@@ -2388,6 +2445,22 @@ class Proxy:
             else:
                 self.gov.apply_calib_seed(key, None)
 
+    async def drain_seeds(self) -> None:
+        """Let pending seed reads land, for at most SEED_DRAIN_S. A seed still pending after that is cancelled and
+        released as empty: the minute keeps its in-memory counts and loses only the stored seed."""
+        if self.seed_tasks:
+            await asyncio.wait(set(self.seed_tasks), timeout=SEED_DRAIN_S)
+        for task in list(self.seed_tasks):
+            task.cancel()
+        abandoned = list(self.gov.pending_seeds)
+        for kind, key in abandoned:
+            if kind == "row":
+                self.gov.apply_row_seed(key, None)
+            else:
+                self.gov.apply_calib_seed(key, None)
+        if abandoned:
+            self.gov.log("seed_timeout", count=len(abandoned))
+
     def schedule_flush(self) -> None:
         """Start a flush in the background unless one is already running, so no write can hold up admission."""
         if self.flush_task is None or self.flush_task.done():
@@ -2403,7 +2476,7 @@ class Proxy:
         await self.flush_state()
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> asyncio.Server:
-        self.watchdog = watchdog_lib.StallWatchdog(
+        self.watchdog = StallWatchdog(
             loop_thread_id=threading.get_ident(),
             dump_s=float(self.gov.config["stall_dump_s"]),
             log=self.gov.log,
@@ -2425,10 +2498,12 @@ class Proxy:
             await asyncio.gather(*remaining, return_exceptions=True)
 
     async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         if self.watchdog is not None:
             self.watchdog.stop()
-        for task in list(self.seed_tasks):
-            task.cancel()
+        await self.drain_seeds()
         self.pool.close_all()
         if self.maintenance is not None:
             self.maintenance.cancel()
@@ -2456,6 +2531,7 @@ class Proxy:
                 self.gov.pump()
                 self.gov.tick()
                 self.gov.adjust_inflight()
+                self.pool.prune()
                 due = self.gov.clock() - last_flush >= FLUSH_S
                 if due:
                     last_flush = self.gov.clock()
@@ -2554,10 +2630,7 @@ class Proxy:
         key = self.upstream_url
         pooled = self.pool.take(key)
         if pooled is not None:
-            try:
-                return await self._send(pooled[0], pooled[1], key, method, path, headers, body, url, idle_s, True)
-            except StaleConnection:
-                pass
+            return await self._send(pooled[0], pooled[1], key, method, path, headers, body, url, idle_s)
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
                 url.hostname,
@@ -2567,7 +2640,7 @@ class Proxy:
             ),
             connect_s,
         )
-        return await self._send(reader, writer, key, method, path, headers, body, url, idle_s, False)
+        return await self._send(reader, writer, key, method, path, headers, body, url, idle_s)
 
     async def _send(
         self,
@@ -2580,7 +2653,6 @@ class Proxy:
         body: bytes,
         url,
         idle_s: float,
-        reused: bool,
     ) -> Upstream:
         try:
             target = url.path.rstrip("/") + path[len(UPSTREAM_PREFIX) :]
@@ -2597,17 +2669,9 @@ class Proxy:
             writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
             await bounded(writer.drain(), idle_s)
             status_line = await bounded(reader.readline(), idle_s)
-        except (ConnectionError, EOFError) as exc:
-            writer.close()
-            if reused:
-                raise StaleConnection() from exc
-            raise
         except BaseException:
             writer.close()
             raise
-        if reused and not status_line:
-            writer.close()
-            raise StaleConnection()
         try:
             status = parse_status_line(status_line)
             response_headers = await read_headers(reader, idle_s)

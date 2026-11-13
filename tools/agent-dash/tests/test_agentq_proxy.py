@@ -2768,6 +2768,8 @@ class KeepAliveMorph:
                 self.requests += 1
                 self.last_headers = request[2]
                 mode = self.modes.pop(0) if self.modes else "ok"
+                if mode == "drop":
+                    break
                 if mode == "truncate":
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
                     await writer.drain()
@@ -2836,6 +2838,19 @@ class UpstreamKeepAliveTest(KeepAliveCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.morph.accepted, 2)
 
+    async def test_a_request_whose_bytes_reached_the_upstream_is_never_sent_again(self) -> None:
+        self.morph.modes = ["ok", "drop"]
+        await self.send()
+        status, _ = await self.send()
+        self.assertEqual(status, 502)
+        self.assertEqual(self.morph.requests, 2)
+
+    async def test_the_maintenance_tick_drops_a_connection_the_server_closed(self) -> None:
+        self.morph.modes = ["ok-close"]
+        await self.send()
+        await asyncio.sleep(0.5)
+        self.assertEqual(len(self.proxy.pool.idle), 0)
+
     async def test_an_idle_connection_expires_after_the_idle_limit(self) -> None:
         self.proxy.pool.idle_s = 0.05
         await self.send()
@@ -2846,7 +2861,10 @@ class UpstreamKeepAliveTest(KeepAliveCase):
 
 class UpstreamPoolTest(unittest.IsolatedAsyncioTestCase):
     async def connections(self, count: int):
+        server_side: list[asyncio.StreamWriter] = []
+
         async def hold(reader, writer):
+            server_side.append(writer)
             await reader.read()
             writer.close()
 
@@ -2854,7 +2872,22 @@ class UpstreamPoolTest(unittest.IsolatedAsyncioTestCase):
         port = server.sockets[0].getsockname()[1]
         opened = [await asyncio.open_connection("127.0.0.1", port) for _ in range(count)]
         self.addCleanup(server.close)
+        self.server_side = server_side
         return opened
+
+    async def test_prune_closes_a_half_closed_connection_behind_a_fresh_head(self) -> None:
+        pool = UpstreamPool(4, 30.0)
+        conns = await self.connections(2)
+        for reader, writer in conns:
+            pool.give("k", reader, writer)
+        self.server_side[1].close()
+        await asyncio.sleep(0.02)
+        self.assertTrue(conns[1][0].at_eof())
+        pool.prune()
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(pool.idle), 1)
+        self.assertTrue(conns[1][1].is_closing())
+        self.assertFalse(conns[0][1].is_closing())
 
     async def test_take_returns_only_the_connection_for_the_same_upstream(self) -> None:
         pool = UpstreamPool(4, 30.0)
@@ -2951,3 +2984,79 @@ class TlsHandshakeLabTest(unittest.IsolatedAsyncioTestCase):
         print(f"\nTLS handshakes per 100 sequential requests: without reuse={before}, with reuse={after}")
         self.assertGreaterEqual(before, 100)
         self.assertLessEqual(after, 5)
+
+
+class CloseDrainsSeedsTest(ProxyCase):
+    """Shutdown lets pending seed reads land, so the final flush writes stored plus new counts."""
+
+    def stored(self, minute: str) -> int:
+        counts = read_minute_counts(self.gov.db_path, minute, MODEL_OUT)
+        return counts["req"] if counts else 0
+
+    async def test_close_waits_for_a_pending_row_seed_and_writes_the_sum(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        row = self.gov.row(MODEL_OUT)
+        row["req"] += 2
+        await self.proxy.close()
+        self.assertEqual(self.stored(minute), 7)
+
+    async def test_close_waits_for_a_pending_calibration_seed(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_calib_rows(self.gov.db_path, [(minute, 3, 0, 0, 0, None, 0)])
+        record = self.gov.calib_record(minute)
+        record["overall"]["req"] += 1
+        await self.proxy.close()
+        connection = sqlite3.connect(self.gov.db_path)
+        stored = connection.execute("SELECT req FROM proxy_calib WHERE minute = ?", (minute,)).fetchone()[0]
+        connection.close()
+        self.assertEqual(stored, 4)
+
+    async def test_a_seed_that_never_lands_is_released_and_the_new_counts_still_write(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        release = threading.Event()
+
+        def stuck(path, minute, model):
+            release.wait(5)
+            return None
+
+        with mock.patch("agentq.proxy.SEED_DRAIN_S", 0.1), mock.patch("agentq.proxy.read_minute_counts", stuck):
+            row = self.gov.row(MODEL_OUT)
+            row["req"] += 2
+            await self.proxy.close()
+        release.set()
+        self.assertEqual(self.gov.pending_seeds, set())
+        self.assertIn("seed_timeout", self.events())
+        self.assertEqual(self.stored(minute), 2)
+
+
+class EntryPointTest(unittest.TestCase):
+    """Each process launchd or the broker starts must import and print its help, from a clean directory."""
+
+    def run_help(self, args: list[str], cwd: str) -> subprocess.CompletedProcess:
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        return subprocess.run([sys.executable, *args, "--help"], cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+
+    def test_the_proxy_runs_as_launchd_runs_it_from_a_clean_directory(self) -> None:
+        proxy = str(Path(__file__).resolve().parents[1] / "agentq" / "proxy.py")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = self.run_help(["-u", proxy], cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+    def test_the_proxy_also_runs_in_isolated_mode(self) -> None:
+        proxy = str(Path(__file__).resolve().parents[1] / "agentq" / "proxy.py")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = self.run_help(["-I", proxy], cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_dashboard_runs_as_launchd_runs_it(self) -> None:
+        dash = str(Path(__file__).resolve().parents[1] / "agentq" / "dash.py")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = self.run_help(["-u", dash], cwd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_broker_runs_as_its_launch_agent_runs_it(self) -> None:
+        package_root = str(Path(__file__).resolve().parents[1])
+        result = self.run_help(["-m", "agentq.cli"], package_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
