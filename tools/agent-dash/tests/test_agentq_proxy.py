@@ -1939,3 +1939,46 @@ class ProxyLatencyTest(ProxyCase):
         row = self.gov.row(MODEL_OUT)
         self.assertEqual(row["upstream_n"], 1)
         self.assertGreaterEqual(row["in_flight_max"], 1)
+
+
+class BacklogReserveTest(unittest.TestCase):
+    """A backlog ticket waits once its budget passes backlog_max_frac of the target; normal work keeps the rest."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.gov = Governor(Path(tmp.name), config_with(), log=quiet)
+
+    def occupy(self, amount: int) -> None:
+        self.gov.budgets["total"].entries.append(Entry(at=self.gov.clock(), amount=amount, lane="normal"))
+
+    def test_backlog_waits_past_the_reserve_while_normal_work_still_fits(self) -> None:
+        self.occupy(8_900_000)
+        backlog = make_ticket(self.gov, job="bl", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog")
+        normal = make_ticket(self.gov, job="nm", model=MODEL_OUT, text="x", max_tokens=8, lane="normal")
+        self.gov.enqueue(backlog)
+        self.gov.enqueue(normal)
+        self.gov.pump()
+        self.assertIn(backlog, self.gov.queues["backlog"])
+        self.assertNotIn(normal, self.gov.queues["normal"])
+        self.assertEqual(backlog.blocked_by, "total")
+
+    def test_the_reserve_does_not_mark_the_budget_saturated(self) -> None:
+        self.occupy(8_900_000)
+        self.gov.enqueue(make_ticket(self.gov, job="bl", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog"))
+        self.gov.pump()
+        self.assertFalse(self.gov.budgets["total"].saturated)
+        self.assertFalse(self.gov.budgets["total"].saturated_since_tick)
+
+    def test_backlog_below_the_reserve_is_admitted(self) -> None:
+        self.occupy(8_000_000)
+        backlog = make_ticket(self.gov, job="bl", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog")
+        self.gov.enqueue(backlog)
+        self.gov.pump()
+        self.assertNotIn(backlog, self.gov.queues["backlog"])
+
+    def test_an_empty_budget_always_admits_one_backlog_request(self) -> None:
+        backlog = make_ticket(self.gov, job="bl", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog")
+        self.gov.enqueue(backlog)
+        self.gov.pump()
+        self.assertNotIn(backlog, self.gov.queues["backlog"])

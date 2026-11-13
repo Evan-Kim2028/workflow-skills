@@ -39,6 +39,9 @@ MORPH_FAMILIES = ("morph-dsv41flash", "morph-kimik31")
 OTHER_FAMILY = "other"
 FAMILY_KEYS = (*MORPH_FAMILIES, OTHER_FAMILY)
 RESTORED_LANE = "restored"
+CAPACITY = "capacity"
+RESERVE = "reserve"
+GUARD = "guard"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
@@ -79,6 +82,7 @@ DEFAULT_CONFIG = {
     "window_mode": "rolling",
     "charge_basis": "billed",
     "calendar_jitter_s": 1.5,
+    "backlog_max_frac": 0.9,
     "budgets": {
         "total": {"limit_type": "total", "limit": 10_000_000},
         "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
@@ -671,6 +675,7 @@ class Governor:
         self.wall = wall
         self.log = log
         self.window = float(config["window_s"])
+        self.backlog_max_frac = float(config.get("backlog_max_frac", DEFAULT_CONFIG["backlog_max_frac"]))
         start = clock()
         hold_s = float(config["give_up_s"]) + float(config["upstream_idle_s"])
         self.budgets: dict[str, Budget] = {}
@@ -910,6 +915,8 @@ class Governor:
         holds on each budget without stalling tickets that use other budgets. A ticket backing off
         after a 429 blocks nothing, and while it waits its budgets stay closed to backlog.
         Backlog runs only on budgets that no waiting urgent or normal ticket is blocked on.
+        A backlog ticket also waits once its budget is past backlog_max_frac of its target, so
+        normal and urgent work keep the rest of the budget. That hold does not raise the target.
 
         A block caused only by the urgent share guard closes its budget for the rest of the urgent
         lane. Normal and backlog tickets still use that budget, which is what the guard intends.
@@ -944,18 +951,20 @@ class Governor:
                     del queue[index]
                     self._admit(head, now)
                     continue
-                blocker, guard_only = found
+                blocker, refusal = found
                 head.blocked_by = blocker.name
-                if not guard_only:
+                if refusal == CAPACITY:
                     blocker.saturated = True
                     blocker.saturated_since_tick = True
-                (urgent_guarded if guard_only else blocked).add(blocker.name)
+                (urgent_guarded if refusal == GUARD else blocked).add(blocker.name)
                 index += 1
 
-    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> tuple[Budget, bool] | None:
-        """Return (budget, guard_only) for the first budget that refuses this ticket now, or None.
+    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> tuple[Budget, str] | None:
+        """Return (budget, refusal) for the first budget that refuses this ticket now, or None.
 
-        guard_only is True when the budget has room and only the urgent share guard refuses: urgent
+        refusal is CAPACITY when the budget is full to its target, RESERVE when a backlog ticket would
+        take the budget past ``backlog_max_frac`` of its target (the rest is kept for normal and urgent
+        work), and GUARD when the budget has room and only the urgent share guard refuses: urgent
         tickets may hold at most half of a budget while lower lanes wait. A budget with no charges
         in the window always admits one request, even an oversized one, so a large request cannot
         wait forever.
@@ -965,11 +974,13 @@ class Governor:
             cap = budget.cap()
             used = self._used(budget)
             if used > 0 and used + estimate > cap:
-                return budget, False
+                return budget, CAPACITY
+            if ticket.lane == "backlog" and used > 0 and used + estimate > self.backlog_max_frac * cap:
+                return budget, RESERVE
             if ticket.lane == "urgent" and lower_waiting:
                 urgent_used = self._used(budget, lane="urgent")
                 if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
-                    return budget, True
+                    return budget, GUARD
         return None
 
     def _admit(self, ticket: Ticket, now: float) -> None:

@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
@@ -46,6 +46,18 @@ BACKLOG_TABLE = """CREATE TABLE backlog_templates (
     enabled INTEGER NOT NULL DEFAULT 1,
     last_submitted REAL,
     created_at REAL NOT NULL
+)"""
+
+FILLER_TARGETS_TABLE = """CREATE TABLE IF NOT EXISTS filler_targets (
+    target TEXT PRIMARY KEY,
+    last_commit TEXT,
+    last_submitted REAL,
+    last_job TEXT
+)"""
+
+FILLER_STATE_TABLE = """CREATE TABLE IF NOT EXISTS filler_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
 )"""
 
 _STATEMENTS = (
@@ -93,6 +105,8 @@ _STATEMENTS = (
         detail TEXT
     )""",
     BACKLOG_TABLE,
+    FILLER_TARGETS_TABLE,
+    FILLER_STATE_TABLE,
 )
 
 # Each step upgrades a store from the version it names to the next one.
@@ -102,6 +116,7 @@ _UPGRADES = {
         "ALTER TABLE jobs ADD COLUMN in_place INTEGER NOT NULL DEFAULT 0",
     ),
     2: (BACKLOG_TABLE.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),),
+    3: (FILLER_TARGETS_TABLE, FILLER_STATE_TABLE),
 }
 
 JOB_COLUMNS = frozenset(

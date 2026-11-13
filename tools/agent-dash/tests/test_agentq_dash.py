@@ -1555,3 +1555,41 @@ class RejectionAndPerMinuteValuesTest(unittest.TestCase):
         self.assertEqual(per_minute["last_full_minute_frac"], 0.4)
         self.assertEqual(per_minute["avg_5m"], 1_600_000)
         self.assertEqual(per_minute["avg_15m"], round((4_000_000 + 4 * 1_000_000) / 15))
+
+
+class FillerHeadlineTest(unittest.TestCase):
+    FILL = {"enabled": True, "target_billed_per_min": 8_000_000, "low_frac": 0.9}
+
+    def headline(self, total, filler_running, fill=FILL, ds_jobs_ready=0, ds_waiting=None):
+        live = IDLE_LIVE if ds_waiting is None else live_queued(ds_waiting)
+        return dash.verdict(
+            five_minutes(total=total), UNTIL, LIMITS_NOW, live, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=ds_jobs_ready, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            filler_running=filler_running, fill=fill,
+        )
+
+    def test_near_target_with_filler_running_says_holding_near_target(self) -> None:
+        result = self.headline(7_800_000, 6)
+        self.assertEqual(result["key"], "filling")
+        self.assertEqual(result["chip"], "Near target")
+        self.assertEqual(result["text"], "Holding near target: 6 filler runs filling the gap.")
+
+    def test_without_filler_running_the_headline_is_unchanged(self) -> None:
+        self.assertEqual(self.headline(7_800_000, 0)["key"], "headroom")
+
+    def test_below_the_low_mark_is_not_held_by_fill(self) -> None:
+        self.assertEqual(self.headline(5_000_000, 3)["key"], "headroom")
+
+    def test_fill_disabled_never_claims_the_headline(self) -> None:
+        self.assertEqual(self.headline(7_800_000, 3, fill=dict(self.FILL, enabled=False))["key"], "headroom")
+
+    def test_real_deepseek_work_waiting_keeps_its_own_headline(self) -> None:
+        self.assertEqual(self.headline(7_800_000, 3, ds_jobs_ready=2)["key"], "launching")
+
+    def test_proxy_waits_keep_the_proxy_pacing_headline(self) -> None:
+        self.assertEqual(self.headline(7_800_000, 3, ds_waiting=4)["key"], "proxy_pacing")
+
+    def test_read_fill_defaults_when_broker_json_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fill = dash.read_fill(Path(tmp))
+        self.assertEqual(fill, {"enabled": False, "target_billed_per_min": 8_000_000.0, "low_frac": 0.9})

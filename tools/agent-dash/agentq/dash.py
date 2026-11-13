@@ -62,6 +62,7 @@ VERDICT_CHIPS = {
     "laptop": "Laptop",
     "near_capacity": "Near capacity",
     "proxy_pacing": "Proxy pacing",
+    "filling": "Near target",
     "launching": "Launching",
     "headroom": "Headroom",
     "held_laptop": "Laptop",
@@ -156,6 +157,7 @@ SELECT detail FROM jobs
 WHERE state = 'queued' AND tier = 'pi-deepseek-flash' AND detail IS NOT NULL AND detail != ''
 """
 RUNNING_BY_RES_SQL = "SELECT res, COUNT(*) AS n FROM jobs WHERE state = 'running' GROUP BY res"
+FILLER_RUNNING_SQL = "SELECT COUNT(*) AS n FROM jobs WHERE state = 'running' AND label LIKE '%-backlog-filler-%'"
 JOBS_RECENT_SQL = """
 SELECT id, state, lane, tier, kind, verdict, label, submitted_at, started_at, finished_at
 FROM jobs ORDER BY submitted_at DESC LIMIT ?
@@ -392,6 +394,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <h3 class="group" id="g-runs">Work</h3>
       <div class="kpis">
         <div class="kpi"><div class="label">DeepSeek runs active</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
+        <div class="kpi"><div class="label">Filler runs</div><div class="value" id="r-filler">—</div><div class="note">backlog audits running now</div></div>
         <div class="kpi"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note">waiting for a worker</div></div>
         <div class="kpi"><div class="label">Finished today</div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL</div></div>
         <div class="kpi"><div class="label">Tokens today</div><div class="value" id="r-tokens">—</div><div class="note">all runs, local day</div></div>
@@ -1149,6 +1152,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("r-ds-note", "of cap " + count(rk.cap_deepseek));
     var queued = ((d.jobs || {}).by_state || {}).queued;
     setTile("r-queued", queued === undefined ? null : queued);
+    setTile("r-filler", (d.jobs || {}).filler_running);
     var fin = rk.finished_today || {};
     setTileList("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
     setTile("r-tokens", rk.tokens_today);
@@ -1924,6 +1928,7 @@ def read_jobs(agentq_db: Path) -> dict:
         recent = connection.execute(JOBS_RECENT_SQL, (RECENT_JOBS,)).fetchall()
         ds_holds = [row["detail"] for row in connection.execute(QUEUED_DS_DETAIL_SQL).fetchall()]
         running = {row["res"]: row["n"] for row in connection.execute(RUNNING_BY_RES_SQL).fetchall()}
+        filler_running = int(connection.execute(FILLER_RUNNING_SQL).fetchone()["n"])
     finally:
         connection.close()
     by_state: dict[str, int] = {}
@@ -1933,7 +1938,7 @@ def read_jobs(agentq_db: Path) -> dict:
         by_tier.setdefault(row["tier"], {})[row["state"]] = row["n"]
     return {
         "by_state": by_state, "by_tier": by_tier, "recent": [dict(row) for row in recent],
-        "ds_holds": ds_holds, "running_by_res": running,
+        "ds_holds": ds_holds, "running_by_res": running, "filler_running": filler_running,
     }
 
 
@@ -2769,6 +2774,38 @@ def held_verdict(details: list[str], ssh_in_use: int | None) -> tuple[str, str] 
     return HOLD_GROUP_KEYS[primary], f"{'; '.join(phrases)}."
 
 
+def fill_near_target(raw: dict[int, dict], until: int, fill: dict | None) -> bool:
+    """True when the fill controller is on and the 5-minute billed average is at or above its low mark."""
+    if not fill or not fill.get("enabled"):
+        return False
+    average = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES
+    return average >= fill["low_frac"] * fill["target_billed_per_min"]
+
+
+FILL_DEFAULTS = {"enabled": False, "target_billed_per_min": 8_000_000, "low_frac": 0.9}
+
+
+def read_fill(home: Path) -> dict:
+    """The fill controller's headline settings from broker.json's "fill" section (defaults mirror agentq/fill.py).
+
+    The dashboard runs as a script, so it reads these three keys itself rather than importing agentq.fill.
+    """
+    try:
+        data = json.loads((home / "broker.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    section = data.get("fill") if isinstance(data, dict) else None
+    section = section if isinstance(section, dict) else {}
+    enabled = section.get("enabled", FILL_DEFAULTS["enabled"])
+    numbers = {}
+    for name in ("target_billed_per_min", "low_frac"):
+        try:
+            numbers[name] = float(section[name])
+        except (KeyError, TypeError, ValueError):
+            numbers[name] = float(FILL_DEFAULTS[name])
+    return {"enabled": bool(enabled), **numbers}
+
+
 def verdict(
     raw: dict[int, dict],
     until: int,
@@ -2783,6 +2820,8 @@ def verdict(
     ds_p50_base_ms: int | None,
     ds_holds: list[str] | None = None,
     ssh_in_use: int | None = None,
+    filler_running: int = 0,
+    fill: dict | None = None,
 ) -> dict:
     """What limits the DeepSeek pool, from the last 5 complete minutes. The first matching rule wins:
     Morph limit, Morph slow, Laptop, Near capacity, Proxy pacing, Launching, Headroom.
@@ -2848,6 +2887,9 @@ def verdict(
     elif pool >= POOL_NEAR_CAPACITY_FRAC:
         key = "near_capacity"
         text = f"Near capacity: pool at {pool * 100:.0f}% of Morph's {limits['total'] // 1_000_000}M/min limit."
+    elif filler_running and fill_near_target(raw, until, fill) and not ds_waiting and not ds_jobs_ready:
+        key = "filling"
+        text = f"Holding near target: {filler_running} filler runs filling the gap."
     elif ds_waiting:
         key = "proxy_pacing"
         budget = max((name for name in waiting if waiting[name] > 0), key=lambda name: waiting[name])
@@ -2974,6 +3016,8 @@ def build_summary(
         ds_p50_base_ms=median_or_none(base_p50s),
         ds_holds=(jobs or {}).get("ds_holds"),
         ssh_in_use=int((jobs or {}).get("running_by_res", {}).get("ssh", 0)) if jobs else None,
+        filler_running=int((jobs or {}).get("filler_running") or 0),
+        fill=read_fill(home),
     )
     room_now = room(
         raw, until, resolved,

@@ -367,7 +367,7 @@ class SchemaUpgradeTests(BacklogTestCase):
         self.addCleanup(conn.close)
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertIn("backlog_templates", tables)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
 
     def test_a_fresh_store_has_the_template_table_and_no_template(self):
         conn = db.connect(self.home)

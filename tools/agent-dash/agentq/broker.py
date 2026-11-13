@@ -47,16 +47,20 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
 from agentq import backlog as backlog_lib
 from agentq import db
+from agentq import fill as fill_lib
+from agentq import filler as filler_lib
 
 TICK_S = 2.0
 BACKLOG_RETRY_S = 300.0
@@ -94,6 +98,9 @@ VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGN
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
+PACING_WINDOW_S = 60.0
+MEASURE_REFRESH_S = 600.0
+PROCESS_REFRESH_S = 30.0
 OPEN = db.OPEN_STATES
 ALL_STATES = db.OPEN_STATES + db.TERMINAL_STATES
 
@@ -135,6 +142,8 @@ def load_config(home) -> dict:
         "tiers": _caps(DEFAULT_TIERS, data.get("tiers")),
         "adaptive": _adaptive(data.get("adaptive")),
         "auto_worktree": _auto_worktree(data.get("auto_worktree")),
+        "fill": fill_lib.section(data.get("fill"), fill_lib.DEFAULT_FILL),
+        "pacing": fill_lib.section(data.get("pacing"), fill_lib.DEFAULT_PACING),
     }
 
 
@@ -613,6 +622,11 @@ def label_for(kind: str, slug: str) -> str | None:
     return lines[-1] if proc.returncode == 0 and lines else None
 
 
+def is_filler(job: dict) -> bool:
+    """True for a filler audit job (a backlog-session job whose label carries the filler marker)."""
+    return job["session"] == backlog_lib.SESSION and filler_lib.is_filler_label(job["label"])
+
+
 def branch_for(job_id: str) -> str:
     """The branch a job's auto worktree is created on."""
     return f"agentq/{job_id}"
@@ -749,6 +763,14 @@ class Broker:
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
         self._plans: dict[str, tuple[Path, Path] | None] = {}
         self._backlog_retry: dict[str, float] = {}
+        self._filling = False
+        self._fill_key: str | None = None
+        self._active_samples: deque = deque()
+        self._ds_launch_times: deque = deque()
+        self._ps: tuple[float, str | None] | None = None
+        self._measured: tuple[float, int | None] | None = None
+        self._filler_cache: tuple[float, tuple] | None = None
+        self._filler_retry = 0.0
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -763,6 +785,7 @@ class Broker:
             status = self._proxy_status()
             launched = self.launch_ready(conn, now, status=status)
             self.submit_backlog(conn, now, status)
+            self.submit_filler(conn, now, status)
         finally:
             conn.close()
         write_heartbeat(self.home)
@@ -797,6 +820,8 @@ class Broker:
         cfg = load_config(self.home)
         adaptive = cfg["adaptive"]
         on = adaptive["enabled"]
+        pace = self._pacing_gate(conn, now, cfg["pacing"])
+        filler_paused = filler_lib.paused(conn)
         running = db.select_jobs(conn, "state = 'running'")
         ready = [
             job for job in db.select_jobs(conn, "state = 'queued'") if job["not_before"] <= now
@@ -854,6 +879,11 @@ class Broker:
                 name, reason = job["tier"], plain_hold("tier cap full")
             if reason is None and on and job["res"] in LAPTOP_GATED:
                 reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), adaptive)
+            if reason is None and filler_paused and is_filler(job):
+                name, reason = "filler", plain_hold("filler paused")
+            paced = reason is None and pace is not None and job["tier"] == fill_lib.DS_TIER
+            if paced and pace["left"] <= 0 and not (job["lane"] == "urgent" and pace["urgent_free"]):
+                name, reason = "proxy", pace["hold"]
             if reason:
                 holds[job["id"]] = (name, reason)
                 continue
@@ -870,6 +900,10 @@ class Broker:
                 urgent_running += 1
             if self._launch(conn, job, now):
                 launched.append(job["id"])
+                if job["tier"] == fill_lib.DS_TIER:
+                    self._ds_launch_times.append(now)
+                if paced:
+                    self._spend_pacing(pace)
             self._holds.pop(job["id"], None)
         self._collect_launches(conn, now)
         self._record_holds(conn, now, ready, holds)
@@ -958,6 +992,142 @@ class Broker:
             db.insert_job(conn, job, now)
             backlog_lib.mark_submitted(conn, name, now)
         self.log(f"backlog {name} submitted {job_id} ({label})")
+        return job_id
+
+    def _pacing_gate(self, conn, now: float, pacing: dict) -> dict | None:
+        """This tick's DeepSeek launch allowance, or None when pacing is off or the store has no proxy data.
+
+        ``left`` counts launches allowed now; ``urgent_free`` lets one urgent DeepSeek job launch per tick
+        even with nothing left; ``hold`` is the (key, text) a paced job waits under.
+        """
+        if not pacing["enabled"]:
+            return None
+        try:
+            last_input = fill_lib.last_minute_input(conn, now)
+        except sqlite3.OperationalError:
+            return None
+        recent = self._recent_ds_launches(now)
+        left, cost = fill_lib.pacing_allowance(last_input, recent, pacing, self._measured_cost(conn, now, pacing))
+        cap = pacing["uncached_frac"] * pacing["uncached_limit"]
+        text = (f"proxy uncached pacing: last minute {last_input:,} uncached, {recent} recent launch(es) "
+                f"at {cost:,} each, cap {cap:,.0f}")
+        return {"left": left, "cost": cost, "urgent_free": True, "hold": ("proxy uncached pacing", text)}
+
+    def _spend_pacing(self, pace: dict) -> None:
+        """Charge one launch to the tick's allowance. A launch past an empty allowance was the urgent bypass."""
+        if pace["left"] > 0:
+            pace["left"] -= 1
+        else:
+            pace["urgent_free"] = False
+
+    def _recent_ds_launches(self, now: float) -> int:
+        while self._ds_launch_times and self._ds_launch_times[0] < now - PACING_WINDOW_S:
+            self._ds_launch_times.popleft()
+        return len(self._ds_launch_times)
+
+    def _measured_cost(self, conn, now: float, pacing: dict) -> int | None:
+        """The measured first-request cost, refreshed every MEASURE_REFRESH_S. None when off or unmeasured."""
+        if not pacing["measure_first_request"]:
+            return None
+        if self._measured is not None and now - self._measured[0] < MEASURE_REFRESH_S:
+            return self._measured[1]
+        try:
+            value = fill_lib.measured_first_request(conn, now, pacing)
+        except sqlite3.OperationalError:
+            value = None
+        self._measured = (now, value)
+        return value
+
+    def _process_table(self, now: float) -> str | None:
+        """The ``ps -E`` table, refreshed every PROCESS_REFRESH_S. None when ps failed on the last read."""
+        if self._ps is None or now - self._ps[0] >= PROCESS_REFRESH_S:
+            self._ps = (now, fill_lib.process_table())
+        return self._ps[1]
+
+    def _filler_targets(self) -> tuple[list, float]:
+        """Filler targets and max runtime from backlog-seed.json, re-read when the file changes.
+        A malformed section logs once and yields no targets."""
+        path = self.home / filler_lib.CONFIG_NAME
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._filler_cache is not None and self._filler_cache[0] == mtime:
+            return self._filler_cache[1]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if mtime is not None else {}
+            targets, max_runtime = filler_lib.load_targets(data)
+            result = (targets, max_runtime)
+        except (OSError, ValueError) as exc:
+            self.log(f"filler config refused: {exc}")
+            result = ([], filler_lib.DEFAULT_MAX_RUNTIME_S)
+        self._filler_cache = (mtime, result)
+        return result
+
+    def _log_fill(self, plan: fill_lib.FillPlan) -> None:
+        """Log the controller's reason once per change of reason, not once per tick."""
+        if plan.key != self._fill_key:
+            self._fill_key = plan.key
+            self.log(f"fill: {plan.reason}")
+
+    def submit_filler(self, conn, now: float, status: dict | None) -> list[str]:
+        """Submit the filler jobs the fill controller asks for this tick. Returns the new job ids.
+
+        Filler is submitted only while the controller is filling and the gates hold (see
+        ``fill.plan_fill``). Nothing is read from git or the process table while fill is disabled.
+        """
+        cfg = load_config(self.home)
+        fill_cfg, pacing = cfg["fill"], cfg["pacing"]
+        if not fill_cfg["enabled"]:
+            self._filling = False
+            self._log_fill(fill_lib.FillPlan(False, 0, "fill disabled", "disabled"))
+            return []
+        decision = fill_lib.decide(
+            conn, now, fill=fill_cfg, pacing=pacing, status=status,
+            ps_text=self._process_table(now), laptop=self.gauges.read(cfg["adaptive"]["gauge_ttl_s"]),
+            was_filling=self._filling, samples=self._active_samples,
+            recent_launches=self._recent_ds_launches(now),
+            measured=self._measured_cost(conn, now, pacing),
+            paused=filler_lib.paused(conn),
+        )
+        self._filling = decision.plan.filling
+        self._log_fill(decision.plan)
+        if decision.plan.submit <= 0 or now < self._filler_retry:
+            return []
+        targets, max_runtime = self._filler_targets()
+        submitted = []
+        for _ in range(decision.plan.submit):
+            job_id = self._filler_job(conn, now, targets, max_runtime)
+            if job_id is None:
+                break
+            submitted.append(job_id)
+        return submitted
+
+    def _filler_job(self, conn, now: float, targets: list, max_runtime: float) -> str | None:
+        """Queue one audit for the next due target. Returns the job id, or None when nothing is due or the label is refused."""
+        found = filler_lib.next_target(conn, targets, head_of=filler_lib.module_head)
+        if found is None:
+            return None
+        target, commit = found
+        label = self.labeler("read", filler_lib.label_slug(target))
+        if label is None:
+            self._filler_retry = now + BACKLOG_RETRY_S
+            self.log(f"filler {target.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
+            return None
+        job_id = db.new_job_id()
+        prompt = db.job_dir(self.home, job_id) / "prompt.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_body(target, commit)), encoding="utf-8")
+        job = {
+            "id": job_id, "lane": "backlog", "kind": "read", "res": "light",
+            "tier": db.default_tier("read"), "label": label, "workspace": target.workspace,
+            "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
+            "max_runtime_s": max_runtime,
+        }  # fmt: skip
+        with db.tx(conn):
+            db.insert_job(conn, job, now)
+            filler_lib.record_submission(conn, target, commit, job_id, now)
+        self.log(f"filler {target.key} submitted {job_id} ({label}) at {commit[:12]}")
         return job_id
 
     def _proxy_status(self) -> dict | None:

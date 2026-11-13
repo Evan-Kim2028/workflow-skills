@@ -75,8 +75,10 @@ the same units.
 - `agentq backlog ls` shows each template's interval, state, last submission, next
   due time and last job with its verdict. `agentq status` counts the enabled
   templates and the open template jobs.
-- `pause` stops new submissions; a running job finishes. `rm` deletes the template
-  and its prompt copy; its past jobs stay in the history.
+- `pause NAME` stops new submissions for one template; a running job finishes.
+  `pause` with no name pauses every template and the filler (below); `resume` with no
+  name resumes them all. `rm` deletes the template and its prompt copy; its past jobs
+  stay in the history.
 - The standing templates are `merged-review-lor` and `merged-review-ws` (every 6h,
   read-only reviews of the commits merged to origin/main in the last six hours).
   `python3 -m agentq.backlog_seed` creates them once; a second run changes nothing.
@@ -84,6 +86,48 @@ the same units.
   `$AGENTQ_HOME/backlog-seed.json` (or `--config PATH`), a JSON object keyed by
   template name with `workspace` and `report_dir` for each. The prompts in
   `agentq/backlog_prompts/` take those two values as `{workspace}` and `{report_dir}`.
+
+## DeepSeek fill and launch pacing
+
+Two controls in the broker keep the DeepSeek pool near Morph's total-token limit
+instead of letting it swing between idle and burst.
+
+- Fill (`broker.json` `fill`, off by default; `"enabled": true` turns it on). The
+  controller reads the last five complete minutes of DeepSeek billed tokens
+  (`input + cache_read + output` in `proxy_minutes`) and the number of busy
+  DeepSeek workers. Per-worker rate is the billed average over the active average,
+  clamped to `rate_min`..`rate_max` (100k to 250k), and `default_rate` (175k)
+  applies with no history. Desired workers are `ceil(target / rate)`, capped at
+  `max_workers` (64). Below `low_frac` (0.9) of `target_billed_per_min` (8M) the
+  controller submits filler jobs, at most `max_launch_per_tick` (4) per tick, to close
+  the gap; it stops above `high_frac` (0.97). Hysteresis keeps its state between.
+  Filler waits while real DeepSeek work is ready, while the proxy holds a DeepSeek
+  request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and while the
+  laptop is short of memory (`laptop_min_free_pct`, 20) or load (`laptop_max_load_per_cpu`, 1.0).
+- Filler jobs are read-only audits (kind `read`, resource `light`, lane `backlog`).
+  The targets come from the `"filler"` key of `$AGENTQ_HOME/backlog-seed.json`:
+  `report_dir`, an optional `max_runtime` (default `15m`), and `repos`, each with a
+  `workspace` and either `modules` (paths) or `roots` (the folders directly under each
+  root). Each audit writes `<report_dir>/filler/<repo>/<module-slug>.md`. A cursor
+  rotates the targets, and a module unchanged since its last audit is skipped; the
+  audited commit is recorded when the job is submitted, so a failed audit is not
+  retried until the module changes. Labels come from `label make` as
+  `hub-exec-backlog-filler-<repo>-<module>`.
+- Pacing (`broker.json` `pacing`, on by default). A DeepSeek job launches only while
+  the last minute's uncached input (`proxy_minutes.input`), plus each launch of the
+  last minute at the first-request cost, stays under `uncached_frac` (0.8) of
+  `uncached_limit` (400k). The first-request cost is the `measure_percentile` (75th)
+  of single-request DeepSeek jobs in `proxy_jobs`, once `min_measured_jobs` (20) are
+  seen; otherwise `first_request_uncached` (40k). One urgent DeepSeek job per tick
+  launches even when the allowance is spent.
+- Proxy reserve (`proxy.json` `backlog_max_frac`, 0.9): a backlog request waits once
+  its budget passes that fraction of the target, so normal and urgent work keep the
+  rest. The reserve does not raise the 429 controller's target.
+- Commands: `python3 -m agentq.fill --home <dir>` prints one reading (what fill and
+  pacing would do now, and why) and never writes; run it on a copy of the store.
+  `agentq status` shows `filler: on|off|paused` and the filler jobs running. The
+  dashboard shows "Filler runs" under Work and "Holding near target: N filler runs
+  filling the gap" under Limited by.
 
 ## Lanes and ordering
 
@@ -186,7 +230,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 
 | Path | What it is |
 |---|---|
-| `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`. `proxy_minutes` belongs to the proxy |
+| `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_targets`, `filler_state`. `proxy_minutes` belongs to the proxy |
 | `backlog/<name>.md` | a backlog template's prompt copy |
 | `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings and the `auto_worktree` settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
