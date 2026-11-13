@@ -2680,6 +2680,8 @@ def read_calib_429s(home: Path) -> dict | None:
         return None
     events: list[tuple[str, int]] = []
     for line in data.decode("utf-8", "replace").splitlines():
+        if " calib " not in line:
+            continue
         entry = parse_log_line(line)
         if entry is None or entry["event"] != "calib":
             continue
