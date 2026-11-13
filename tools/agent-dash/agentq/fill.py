@@ -186,43 +186,82 @@ class FillPlan:
     key: str
 
 
+GATE_DECAY_S = 600.0
+
+
 class FillController:
     """Gate-driven filler controller: fill while the DeepSeek billed average is below the low mark.
 
-    While the average is below ``low_frac`` of the target, the controller adds up to ``step_workers`` filler
-    workers every ``step_interval_s``, but only when every gate is open (``gate`` is None), no real DeepSeek
-    job is ready, and no earlier step is still waiting to launch. It stops adding once the average reaches
-    ``high_frac`` of the target (hysteresis between the marks), and never takes busy DeepSeek workers above
-    ``max_workers``. Nothing is judged and nothing is killed: the gates are what keep the pool safe.
+    The controller tracks ``level``, the filler population it has reached. While filling and every gate is
+    open, filler that finished is replaced up to ``level`` at once (only pacing applies). Growth above
+    ``level`` is limited to ``step_workers`` per ``step_interval_s``, and a growth step must launch before the
+    next one. Above the high mark ``level`` is set to the current filler population, so nothing grows. While a
+    gate is closed nothing is submitted; after ``GATE_DECAY_S`` closed, ``level`` decays to the current
+    population. Nothing is judged and nothing is killed. ``state()`` and ``from_state()`` persist ``level``,
+    ``last_step_at`` and the gate-closure start, so a restart keeps the step interval.
     """
 
     def __init__(self):
         self.filling = False
+        self.level: int | None = None
         self.last_step_at: float | None = None
+        self.gate_since: float | None = None
 
-    def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int,
+    def state(self) -> dict:
+        return {"level": self.level, "last_step_at": self.last_step_at, "gate_since": self.gate_since}
+
+    @classmethod
+    def from_state(cls, data) -> "FillController":
+        controller = cls()
+        if not isinstance(data, dict):
+            return controller
+        level, last, since = data.get("level"), data.get("last_step_at"), data.get("gate_since")
+        controller.level = int(level) if isinstance(level, int) and not isinstance(level, bool) else None
+        controller.last_step_at = float(last) if isinstance(last, (int, float)) else None
+        controller.gate_since = float(since) if isinstance(since, (int, float)) else None
+        return controller
+
+    def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int, filler_busy: int,
              ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
-        """One decision. ``active`` counts busy DeepSeek workers, filler included."""
+        """One decision. ``active`` counts busy DeepSeek workers (real and filler); ``filler_busy`` and
+        ``queued_filler`` count the filler population."""
         if not fill["enabled"]:
             self.filling = False
             return FillPlan(False, 0, "fill disabled", "disabled")
         if paused:
             self.filling = False
             return FillPlan(False, 0, "filler paused", "paused")
+        max_workers = int(fill["max_workers"])
+        population = filler_busy + queued_filler
         target = float(fill["target_billed_per_min"])
         low, high = fill["low_frac"] * target, fill["high_frac"] * target
         self.filling = filling_state(self.filling, billed_avg, target, fill["low_frac"], fill["high_frac"])
+        if self.level is None:
+            self.level = population
+        self.level = min(self.level, max_workers)
         average = f"5-min average {billed_avg / 1e6:.2f}M/min"
         if not self.filling:
-            return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; no filler", "high-mark")
+            self.level = min(population, max_workers)
+            self.gate_since = None
+            return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; level held at "
+                            f"{self.level} filler", "high-mark")
         if ready_real > 0:
             return FillPlan(True, 0, f"{ready_real} real DeepSeek jobs ready; they launch before filler", "real-ready")
         if gate is not None:
-            return FillPlan(True, 0, gate, "gate")
-        room = int(fill["max_workers"]) - active - queued_filler
+            if self.gate_since is None:
+                self.gate_since = now
+            if now - self.gate_since >= GATE_DECAY_S:
+                self.level = min(population, max_workers)
+            return FillPlan(True, 0, f"{gate}; level {self.level} held", "gate")
+        self.gate_since = None
+        room = max_workers - active - queued_filler
         if room <= 0:
-            return FillPlan(True, 0, f"{average}; {active} busy DeepSeek workers at max_workers "
-                            f"{fill['max_workers']}", "at-max")
+            return FillPlan(True, 0, f"{average}; {active} busy DeepSeek workers at max_workers {max_workers}",
+                            "at-max")
+        if population < self.level:
+            to_add = min(self.level - population, room)
+            return FillPlan(True, to_add, f"{average}; replacing {to_add} finished filler toward level "
+                            f"{self.level}", "refill")
         if queued_filler > 0:
             return FillPlan(True, 0, f"{average}; {queued_filler} filler job(s) from the last step still waiting "
                             "to launch", "step-wait")
@@ -232,8 +271,9 @@ class FillController:
                             "step-wait")
         to_add = min(int(fill["step_workers"]), room)
         self.last_step_at = now
+        self.level = min(max_workers, population + to_add)
         return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; adding {to_add} filler "
-                        f"workers to {active + to_add} busy", "stepping")
+                        f"workers to level {self.level}", "stepping")
 
 
 def pacing_allowance(current: int, pending: int, pacing: dict, measured: int | None) -> tuple[int, int]:
@@ -285,7 +325,8 @@ def decide(
         gate = "worker count unknown (ps failed); filler waits"
     plan = controller.tick(
         now, fill=fill, paused=paused, billed_avg=billed_avg, active=active,
-        ready_real=counts["ready_real"], queued_filler=counts["queued_filler"], gate=gate,
+        filler_busy=counts["running_filler"], ready_real=counts["ready_real"], queued_filler=counts["queued_filler"],
+        gate=gate,
     )
     current, source, pending = pacing_inputs(conn, now, status, pacing)
     left, cost = pacing_allowance(current, pending, pacing, measured)
