@@ -288,7 +288,8 @@ def _proc_scan() -> tuple[list[int], bool]:
     """Bounded pid list plus a partial flag. Never raises.
 
     ``partial`` is True when the list hit :data:`MAX_PIDS`, so processes
-    beyond the cap were never examined. A truncated list must never read
+    beyond the cap were never examined, and when no pid could be listed at
+    all (``ps`` failed, timed out, or returned nothing). A truncated list must never read
     as a complete scan: callers keep every candidate in that case.
     """
     try:
@@ -307,9 +308,9 @@ def _proc_scan() -> tuple[list[int], bool]:
             timeout=PS_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return [], False
+        return [], True
     if proc.returncode != 0:
-        return [], False
+        return [], True
     out: list[int] = []
     partial = False
     for token in (proc.stdout or "").split():
@@ -320,7 +321,7 @@ def _proc_scan() -> tuple[list[int], bool]:
         if len(out) >= MAX_PIDS:
             partial = True
             break
-    return out, partial
+    return out, partial or not out
 
 
 def _proc_pids() -> list[int]:
@@ -415,7 +416,7 @@ def busy_map(paths: list[str]) -> dict[str, str]:
     if partial:
         # The pid list was truncated, so a busy process may sit past the
         # cap. Keep every candidate rather than delete on a partial scan.
-        return {path: "process scan hit its pid cap" for path in paths}
+        return {path: "process scan incomplete (pid cap or ps failure)" for path in paths}
     pids = [pid for pid in pids if pid != mine]
     try:
         cwds = _cwd_table(pids)

@@ -316,7 +316,25 @@ class ProcScanCapTest(unittest.TestCase):
             self.assertTrue(partial)
             busy = worktrees.busy_map([path])
         self.assertEqual(set(busy), {path})
-        self.assertIn("pid cap", busy[path])
+        self.assertIn("incomplete", busy[path])
+
+    def test_failed_pid_listing_keeps_every_candidate(self):
+        """A ps failure or timeout with no /proc is an unknown scan, never an empty one."""
+        path = "/tmp/agent-dash-unscanned-worktree"
+        failures = [OSError("ps missing"), subprocess.TimeoutExpired("ps", 1)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(worktrees.os, "listdir", side_effect=OSError("no /proc")), \
+                    mock.patch.object(worktrees.subprocess, "run", side_effect=failure):
+                pids, partial = worktrees._proc_scan()
+                self.assertEqual(pids, [])
+                self.assertTrue(partial)
+                busy = worktrees.busy_map([path])
+            self.assertEqual(set(busy), {path})
+        nonzero = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(worktrees.os, "listdir", side_effect=OSError("no /proc")), \
+                mock.patch.object(worktrees.subprocess, "run", return_value=nonzero):
+            self.assertEqual(worktrees._proc_scan(), ([], True))
 
     def test_uncapped_scan_is_not_partial(self):
         """A normal scan reports itself complete."""
