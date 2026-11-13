@@ -83,7 +83,7 @@ class WorkerWatchTests(unittest.TestCase):
     def test_busy_child_process_keeps_the_watch_going(self):
         # The run is a shell whose child burns CPU for longer than STALL_S.
         # The watcher must keep watching, not report STALLED.
-        script = "python3 -c 'while True: pass' & wait"
+        script = "python3 -c 'import time\nend = time.time() + 15\nwhile time.time() < end: pass' & wait"
         proc = self.start_run(script)
         time.sleep(0.5)
 
