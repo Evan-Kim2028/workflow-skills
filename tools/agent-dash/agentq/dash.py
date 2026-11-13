@@ -421,10 +421,11 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   <section class="card" aria-labelledby="h-tokens">
     <div class="card-head">
-      <h2 id="h-tokens">Tokens per 5 minutes, millions</h2>
+      <h2 id="h-tokens">Tokens billed per 5 min</h2>
       <div class="legend" id="lg-tokens"></div>
     </div>
     <div class="chart" id="c-tokens"></div>
+    <div class="note-line" id="tok-mix">Mix: —</div>
   </section>
 
   <section class="grid3">
@@ -572,7 +573,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   var SLOW_POLL_MS = 120000;
   var RANGE_NAME = { 1: "1h", 6: "6h", 24: "24h", 168: "7d" };
   var NAME_RANGE = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
-  var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)" };
+  var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)", muted: "var(--ink-3)" };
   var state = { hours: 6, data: null, seq: 0, lastFetch: 0, lastGood: null, stale: null, timer: null };
   var log = { source: "proxy", page: 1, q: "", seq: 0, data: null, qTimer: null };
   var charts = [];
@@ -731,13 +732,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     return function place(x, top) {
       cross.setAttribute("x1", x); cross.setAttribute("x2", x);
       cross.setAttribute("visibility", "visible");
-      tip.style.display = "block";
-      var tipW = tip.offsetWidth || 160;
-      var tipX = x + 12;
-      if (tipX + tipW > W) tipX = x - tipW - 12;
-      tip.style.left = Math.max(0, tipX) + "px";
-      tip.style.top = (top || 8) + "px";
+      placeTip(tip, W, x, top);
     };
+  }
+  function placeTip(tip, W, x, top) {
+    tip.style.display = "block";
+    var tipW = tip.offsetWidth || 160;
+    var tipX = x + 12;
+    if (tipX + tipW > W) tipX = x - tipW - 12;
+    tip.style.left = Math.max(0, tipX) + "px";
+    tip.style.top = (top || 8) + "px";
   }
   function fillTip(tip, head, rows) {
     tip.innerHTML = "";
@@ -750,7 +754,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       row.className = "row";
       var dot = document.createElement("span");
       dot.className = "dot";
-      dot.style.background = r.color;
+      if (r.color) dot.style.background = r.color;
+      else dot.style.visibility = "hidden";
       row.appendChild(dot);
       var txt = document.createElement("span");
       txt.textContent = r.text;
@@ -955,6 +960,30 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     return best;
   }
 
+  function fmtTokens(n) {
+    if (n === null || n === undefined) return "\u2014";
+    var a = Math.abs(n), sign = n < 0 ? "-" : "";
+    var units = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+    for (var i = 0; i < units.length; i++) {
+      if (a >= units[i][0]) {
+        var v = a / units[i][0];
+        return sign + String(v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + units[i][1];
+      }
+    }
+    return sign + String(Math.round(a));
+  }
+  function shareText(part, total) {
+    if (!total) return "\u2014";
+    var v = (part / total) * 100;
+    return String(v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + "%";
+  }
+  function mixCaption(totals) {
+    if (!totals || !totals.total) return "Mix: no tokens billed in this range";
+    var s = totals.shares;
+    return "Mix: cache read " + shareText(s.cache_read, 1) + " \u00b7 uncached input " + shareText(s.uncached, 1) +
+      " \u00b7 output " + shareText(s.output, 1);
+  }
+
   function drawTokenCombo(host, cfg) {
     host.innerHTML = "";
     var points = cfg.points || [];
@@ -962,102 +991,92 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var W = Math.max(260, Math.floor(host.clientWidth || 600));
     var H = cfg.height || 280;
     var svg = svgEl("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": cfg.title }, host);
-    var fmtM = function (v) { return (v >= 10 ? v.toFixed(0) : v.toFixed(1)) + "M"; };
-    var fmtCompact = function (v) {
-      if (v >= 1000) { var b = v / 1000; return (b >= 10 ? b.toFixed(0) : b.toFixed(1)).replace(/\.0$/, "") + "B"; }
-      if (v >= 1) return (v >= 10 ? v.toFixed(0) : v.toFixed(1)).replace(/\.0$/, "") + "M";
-      if (v > 0) return Math.round(v * 1000) + "K";
-      return "0";
-    };
-    var stackMax = points.reduce(function (a, p) { return Math.max(a, p.cache + p.uncached + p.output); }, 0);
-    var cumMax = points.reduce(function (a, p) { return Math.max(a, p.cumulative); }, 0);
-    var left = niceTicks(Math.max(stackMax, 0.1), 4);
-    var right = niceTicks(Math.max(cumMax, 0.1), 4);
-    var leftW = 0, rightW = 0;
-    left.ticks.forEach(function (v) { leftW = Math.max(leftW, measure(svg, fmtM(v), "tick")); });
-    right.ticks.forEach(function (v) { rightW = Math.max(rightW, measure(svg, fmtM(v), "tick")); });
-    var m = { l: Math.max(44, Math.ceil(leftW) + 12), r: Math.max(44, Math.ceil(rightW) + 14), t: 26, b: 24 };
+    var left = cfg.axes.left, right = cfg.axes.right;
+    var m = { l: 64, r: 48, t: 26, b: 24 };
     var iw = W - m.l - m.r;
     var ih = H - m.t - m.b;
     var plotBottom = m.t + ih;
     var x0 = cfg.x0, x1 = cfg.x1;
+    var slot = (cfg.bucket_s / Math.max(1, x1 - x0)) * iw;
+    var barW = Math.min(24, Math.max(1, slot - 2));
     function X(t) { return m.l + ((t - x0) / Math.max(1, x1 - x0)) * iw; }
+    function center(p) { return X(p.t) + slot / 2; }
     function YL(v) { return plotBottom - (v / (left.max || 1)) * ih; }
     function YR(v) { return plotBottom - (v / (right.max || 1)) * ih; }
 
     left.ticks.forEach(function (v) {
       svgEl("line", { x1: m.l, x2: W - m.r, y1: YL(v), y2: YL(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }, svg);
-      svgEl("text", { x: m.l - 8, y: YL(v) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = fmtM(v);
+      svgEl("text", { x: m.l - 8, y: YL(v) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = fmtTokens(v);
     });
     right.ticks.forEach(function (v) {
-      svgEl("text", { x: W - m.r + 8, y: YR(v) + 4, "text-anchor": "start", class: "tick" }, svg).textContent = fmtCompact(v);
+      svgEl("text", { x: W - m.r + 8, y: YR(v) + 4, "text-anchor": "start", class: "tick" }, svg).textContent = fmtTokens(v);
     });
-    svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = "tokens per " + cfg.unit + " (M)";
-    svgEl("text", { x: W - m.r, y: 12, "text-anchor": "end", class: "tick" }, svg).textContent = "cumulative tokens";
+    svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = cfg.yLabel;
+    svgEl("text", { x: W - 2, y: 12, "text-anchor": "end", class: "tick" }, svg).textContent = cfg.rightLabel;
     xTicks(svg, cfg, iw, H, m, X, cfg.tickFmt || hm);
 
-    var band = iw / Math.max(1, points.length);
-    var bw = Math.min(24, Math.max(2, band * 0.6));
-    var stacks = [
-      { key: "cache", color: COLORS.s3 },
-      { key: "uncached", color: COLORS.s1 },
-      { key: "output", color: COLORS.s2 }
-    ];
+    var limitY = YL(cfg.limit.value);
+    svgEl("line", { x1: m.l, x2: W - m.r, y1: limitY, y2: limitY, stroke: "var(--ink-3)", "stroke-width": 1, "stroke-dasharray": "5 4" }, svg);
+    svgEl("text", {
+      x: m.l + 6, y: limitY - 6, class: "direct",
+      style: "fill: var(--ink-3); stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
+    }, svg).textContent = cfg.limit.label;
+
+    var band = svgEl("rect", { x: m.l, y: m.t, width: slot, height: ih, fill: "var(--ink-3)", "fill-opacity": 0.14, visibility: "hidden" }, svg);
     points.forEach(function (p) {
-      var base = 0;
-      var top = 0;
-      var topIdx = -1;
-      stacks.forEach(function (s, idx) { if ((p[s.key] || 0) > 0) topIdx = idx; });
-      stacks.forEach(function (s, idx) {
-        var v = p[s.key] || 0;
-        if (v <= 0) return;
-        base = top;
-        top = top + v;
-        var yTop = YL(top), yBase = YL(base);
-        var h = Math.max(0, yBase - yTop);
-        var cx = X(p.t);
-        var l = cx - bw / 2, r = cx + bw / 2;
-        var rad = Math.min(4, bw / 2, h);
-        var d;
-        if (idx === topIdx && rad > 0) {
-          d = "M" + l + "," + yBase + " L" + l + "," + (yTop + rad) + " Q" + l + "," + yTop + " " + (l + rad) + "," + yTop +
-            " L" + (r - rad) + "," + yTop + " Q" + r + "," + yTop + " " + r + "," + (yTop + rad) + " L" + r + "," + yBase + " Z";
-        } else {
-          d = "M" + l + "," + yBase + " L" + l + "," + yTop + " L" + r + "," + yTop + " L" + r + "," + yBase + " Z";
-        }
-        svgEl("path", { d: d, fill: s.color, stroke: "var(--surface)", "stroke-width": 2 }, svg);
-      });
+      if (!p.total) return;
+      var cx = center(p);
+      var top = YL(p.total), base = plotBottom;
+      var r = Math.min(4, barW / 2, base - top);
+      var l = cx - barW / 2, rt = cx + barW / 2;
+      var d = "M" + l + "," + base + " L" + l + "," + (top + r) + " Q" + l + "," + top + " " + (l + r) + "," + top +
+        " L" + (rt - r) + "," + top + " Q" + rt + "," + top + " " + rt + "," + (top + r) + " L" + rt + "," + base + " Z";
+      svgEl("path", { d: d, fill: cfg.series[0].color }, svg);
     });
 
-    var line = "";
-    points.forEach(function (p, idx) {
-      line += (idx ? " L" : "M") + X(p.t).toFixed(1) + "," + YR(p.cumulative).toFixed(1);
-    });
-    if (line) {
-      svgEl("path", { d: line, fill: "none", stroke: "var(--surface)", "stroke-width": 6, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
-      svgEl("path", { d: line, fill: "none", stroke: COLORS.ink, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
-    }
+    var line = points.map(function (p, idx) {
+      return (idx ? " L" : "M") + center(p).toFixed(1) + "," + YR(p.cumulative).toFixed(1);
+    }).join("");
+    svgEl("path", { d: line, fill: "none", stroke: "var(--surface)", "stroke-width": 4.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    svgEl("path", { d: line, fill: "none", stroke: COLORS.muted, "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
     var lastP = points[points.length - 1];
-    svgEl("circle", { cx: X(lastP.t), cy: YR(lastP.cumulative), r: 4, fill: COLORS.ink, stroke: "var(--surface)", "stroke-width": 2 }, svg);
+    svgEl("circle", { cx: center(lastP), cy: YR(lastP.cumulative), r: 4, fill: COLORS.muted, stroke: "var(--surface)", "stroke-width": 2 }, svg);
 
-    var cross = svgEl("line", { x1: 0, x2: 0, y1: m.t, y2: plotBottom, stroke: "var(--ink-3)", "stroke-width": 1, visibility: "hidden" }, svg);
-    var hit = svgEl("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent" }, svg);
     var tip = document.createElement("div");
     tip.className = "tip";
     host.appendChild(tip);
-    var place = tooltipFor(host, svg, W, X, hit, cross, tip, function (px) {
-      var sec = x0 + ((px - m.l) / Math.max(1, iw)) * (x1 - x0);
+    var hit = svgEl("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent" }, svg);
+    function showAt(sec) {
       var p = nearest(points, sec);
       if (!p) return;
-      var span = cfg.bucket_s && cfg.bucket_s > 60 ? " – " + hm(p.t + cfg.bucket_s) : "";
-      fillTip(tip, (cfg.tickFmt || hm)(p.t) + span, [
-        { color: COLORS.s3, text: "Cache read: " + fmtM(p.cache) },
-        { color: COLORS.s1, text: "Uncached input: " + fmtM(p.uncached) },
-        { color: COLORS.s2, text: "Output: " + fmtM(p.output) },
-        { color: COLORS.ink, text: "Cumulative (right axis): " + fmtCompact(p.cumulative) }
+      band.setAttribute("x", X(p.t));
+      band.setAttribute("visibility", "visible");
+      var head = (cfg.tickFmt || hm)(p.t) + " \u2013 " + hm(p.t + cfg.bucket_s);
+      fillTip(tip, head, [
+        { color: cfg.series[0].color, text: "Total: " + fmtTokens(p.total) },
+        { color: null, text: "Cache read: " + fmtTokens(p.cache_read) + " (" + shareText(p.cache_read, p.total) + ")" },
+        { color: null, text: "Uncached input: " + fmtTokens(p.uncached) + " (" + shareText(p.uncached, p.total) + ")" },
+        { color: null, text: "Output: " + fmtTokens(p.output) + " (" + shareText(p.output, p.total) + ")" },
+        { color: COLORS.muted, text: "Cumulative (right axis): " + fmtTokens(p.cumulative) }
       ]);
-      place(X(p.t), 8);
+      placeTip(tip, W, center(p), 8);
+    }
+    function hide() {
+      band.setAttribute("visibility", "hidden");
+      tip.style.display = "none";
+    }
+    hit.addEventListener("mousemove", function (ev) {
+      var box = svg.getBoundingClientRect();
+      var sec = x0 + ((ev.clientX - box.left - m.l) / Math.max(1, iw)) * (x1 - x0);
+      showAt(sec);
+      peersOf(host).forEach(function (peer) { peer.showAt(sec); });
     });
+    hit.addEventListener("mouseleave", function () {
+      hide();
+      peersOf(host).forEach(function (peer) { peer.hide(); });
+    });
+    host._hover = { showAt: showAt, hide: hide };
+    if (cfg.group) host.setAttribute("data-hover-group", cfg.group);
     return svg;
   }
 
@@ -1185,18 +1204,20 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       offScale: axis.caps.filter(function (c) { return !c.on_scale; }).map(function (c) { return c.label + " \u2191 (off scale)"; }),
       fmt: intFmt
     });
-    var mix = (d.token_mix || []).map(function (p) {
-      return {
-        t: p.t, cache: p.cache_read / 1e6, uncached: p.uncached / 1e6, output: p.output / 1e6,
-        cumulative: p.cumulative / 1e6
-      };
-    });
+    var mix = d.token_mix || [];
+    var tokenLimit = d.token_limit || { value: 0 };
     registerChart("c-tokens", {
-      title: "Tokens per interval, millions, with cumulative total",
-      unit: tunit, bucket_s: tb, tickFmt: fmtX, x0: win.start, x1: win.end, height: 280,
-      points: mix
+      title: "Tokens billed per " + tunit + ", with cumulative total on the right axis",
+      tickFmt: fmtX, group: "capacity", bucket_s: tb, x0: win.start, x1: win.end, height: 280,
+      points: mix,
+      series: [{ key: "total", name: "Tokens billed", color: COLORS.s1 }],
+      axes: d.token_axes || { left: { max: 1, ticks: [0, 1] }, right: { max: 1, ticks: [0, 1] } },
+      limit: { value: tokenLimit.value, label: "Morph limit " + fmtTokens(tokenLimit.value) + " / " + tunit },
+      yLabel: "tokens per " + tunit,
+      rightLabel: "cumulative"
     }, drawTokenCombo);
-    setText("h-tokens", "Tokens per " + tunit + ", millions");
+    setText("h-tokens", "Tokens billed per " + tunit);
+    setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
       { name: "Total pool, % of 10M/min", color: COLORS.s1 }
     ]);
@@ -1206,10 +1227,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       { name: "Queued jobs", color: COLORS.s3 }
     ]);
     legendFor($("lg-tokens"), [
-      { name: "Cache read", color: COLORS.s3, block: true },
-      { name: "Uncached input", color: COLORS.s1, block: true },
-      { name: "Output", color: COLORS.s2, block: true },
-      { name: "Cumulative (right axis)", color: COLORS.ink }
+      { name: "Tokens billed", color: COLORS.s1, block: true },
+      { name: "Cumulative (right axis)", color: COLORS.muted }
     ]);
     var recent = d.recent || { window: { start: 0, end: 0 }, minutes: [] };
     var recentMinutes = recent.minutes || [];
@@ -2380,23 +2399,61 @@ def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float, li
     }
 
 
+TOKEN_KINDS = ("cache_read", "uncached", "output")
+TOKEN_AXIS_MULTIPLES = (1, 2, 2.5, 5)
+
+
 def token_mix(minutes: list[dict]) -> list[dict]:
-    """Tokens per interval split into cache read, uncached input and output, plus the running total from the range start."""
+    """Billed tokens per interval (cache read, uncached input and output) plus the running total from the range start."""
     running = 0
     mix = []
     for point in minutes:
-        running += point["cache_read"] + point["input"] + point["output"]
-        mix.append(
-            {
-                "t": point["t"],
-                "minute": point["minute"],
-                "cache_read": point["cache_read"],
-                "uncached": point["input"],
-                "output": point["output"],
-                "cumulative": running,
-            }
-        )
+        parts = {"cache_read": point["cache_read"], "uncached": point["input"], "output": point["output"]}
+        total = sum(parts.values())
+        running += total
+        mix.append({"t": point["t"], "minute": point["minute"], "total": total, **parts, "cumulative": running})
     return mix
+
+
+def token_totals(mix: list[dict]) -> dict:
+    """Range totals by kind and each kind's share of the billed total (shares are None when nothing was billed)."""
+    sums = {kind: sum(row[kind] for row in mix) for kind in TOKEN_KINDS}
+    total = sum(sums.values())
+    shares = {kind: (sums[kind] / total if total else None) for kind in TOKEN_KINDS}
+    return {"total": total, **sums, "shares": shares}
+
+
+def token_limit(per_minute: int, bucket_s: int) -> dict:
+    """Morph's total-token limit for one chart bucket: the per-minute limit times the bucket's minutes."""
+    minutes = bucket_s // 60
+    return {"per_minute": per_minute, "bucket_minutes": minutes, "value": per_minute * minutes}
+
+
+def nice_axis(peak: float) -> dict:
+    """Zero-based axis whose top is the smallest 1, 2, 2.5 or 5 step (times a power of ten) covering ``peak`` in 3 to 5 steps."""
+    peak = max(float(peak), 1.0)
+    magnitude = 10 ** math.floor(math.log10(peak))
+    best = None
+    for scale in (magnitude / 10, magnitude, magnitude * 10):
+        for multiple in TOKEN_AXIS_MULTIPLES:
+            unit = multiple * scale
+            steps = math.ceil(peak / unit)
+            if unit >= 1 and 3 <= steps <= 5 and (best is None or steps * unit < best[0]):
+                best = (steps * unit, unit, steps)
+    if best is None:
+        return {"max": peak, "ticks": [0, peak]}
+    top, unit, steps = best
+    return {"max": top, "ticks": [unit * i for i in range(steps + 1)]}
+
+
+def token_axes(mix: list[dict], limit: dict) -> dict:
+    """Left axis for billed tokens per bucket (at least 1.1 x the largest bucket and 1.05 x the limit) and the right cumulative axis."""
+    peak_bucket = max((row["total"] for row in mix), default=0)
+    cumulative_peak = mix[-1]["cumulative"] if mix else 0
+    return {
+        "left": nice_axis(max(1.1 * peak_bucket, 1.05 * limit["value"])),
+        "right": nice_axis(cumulative_peak),
+    }
 
 
 def top_consumers(runs: list[dict], day: float, tokens_today: int) -> list[dict]:
@@ -2866,6 +2923,8 @@ def build_summary(
     minutes = bucket_minutes(minute_points, bucket)
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
+    mix = token_mix(token_minutes)
+    limit = token_limit(resolved["total"], token_bucket)
     range_verdicts = _guard("range_verdicts", errors, read_verdicts, {}, agentq_db, float(since), float(until))
     workers_bucketed = bucket_workers(samples, bucket)
     kpis = run_kpis(runs, day, caps, verdicts)
@@ -2919,8 +2978,11 @@ def build_summary(
         "ds_output_5m_per_min": deepseek_output_rate(raw, until),
         "bucket_s": bucket,
         "minutes": minutes,
-        "token_mix": token_mix(token_minutes),
+        "token_mix": mix,
+        "token_totals": token_totals(mix),
         "token_bucket_s": token_bucket,
+        "token_limit": limit,
+        "token_axes": token_axes(mix, limit),
         "range_totals": range_totals(raw, since, until, runs, range_verdicts),
         "jobs": jobs,
         "workers": workers_bucketed,
