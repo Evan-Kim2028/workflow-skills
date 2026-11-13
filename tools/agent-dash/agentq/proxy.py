@@ -61,7 +61,6 @@ SUSPENDED = "suspended"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 RESERVE_REFILL_S = 30 * 60.0
 RESERVE_TARGET_CEILING = 1.0
-BACKLOG_AGING_S = 120.0
 UNCACHED_RATIO_FLOOR = 0.25
 UNCACHED_RATIO_CEIL = 1.25
 UNCACHED_RATIO_ALPHA = 0.05
@@ -119,7 +118,6 @@ DEFAULT_CONFIG = {
     "log_max_bytes": LOG_MAX_BYTES,
     "log_backups": LOG_BACKUPS,
     "reserve_refill_s": RESERVE_REFILL_S,
-    "backlog_aging_s": BACKLOG_AGING_S,
     "budgets": {
         "total": {"limit_type": "total", "limit": 10_000_000},
         "output": {
@@ -1502,16 +1500,8 @@ class Governor:
             self.queues[ticket.lane].remove(ticket)
 
     def promote_aged(self, now: float) -> None:
-        """Backlog tickets queued past backlog_aging_s join the normal lane, so a steady stream of other work
-        cannot hold them forever. Normal tickets queued past aging_s join the urgent lane, kept in arrival order."""
-        backlog_aging = float(self.config.get("backlog_aging_s", BACKLOG_AGING_S))
-        stale = [t for t in self.queues["backlog"] if now - t.queued_at > backlog_aging]
-        if stale:
-            for ticket in stale:
-                self.queues["backlog"].remove(ticket)
-                ticket.lane = "normal"
-                self.log("backlog_aged", job=ticket.job, model=ticket.model)
-            self.queues["normal"] = deque(sorted([*self.queues["normal"], *stale], key=lambda t: t.queued_at))
+        """Normal tickets queued past aging_s join the urgent lane, kept in arrival order. Backlog never moves
+        lanes: it keeps its arrival order, so the oldest backlog is offered the free allowance first."""
         aging = float(self.config["aging_s"])
         normal = self.queues["normal"]
         aged = [t for t in normal if now - t.queued_at > aging]

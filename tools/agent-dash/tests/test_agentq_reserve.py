@@ -321,26 +321,30 @@ class GovernorReserveTest(unittest.TestCase):
         self.assertFalse(ticket.holds)
         self.assertEqual(ticket.last_refusal, RESERVE)
 
-    def test_backlog_queued_past_its_aging_limit_is_admitted_as_normal_and_may_spend_the_reserve(self) -> None:
+    def test_aged_backlog_never_drains_the_reserve_under_sustained_normal_traffic(self) -> None:
         backlog = self.ticket(20_000, lane="backlog")
         self.gov.enqueue(backlog)
-        self.occupy("output", 60_000)
-        self.gov.pump()
-        self.assertFalse(backlog.holds)
-        self.wall[0] += 121.0
-        self.occupy("output", 60_000)
-        self.gov.pump()
-        self.assertEqual(backlog.lane, "normal")
-        self.assertTrue(backlog.holds)
+        self.wall[0] += 200.0
+        for _ in range(10):
+            self.occupy("output", 70_000)
+            self.gov.pump()
+            self.assertFalse(backlog.holds)
+            self.assertEqual(backlog.lane, "backlog")
+            self.assertEqual(self.output_level(), 210_000)
+            self.wall[0] += 60.0
 
-    def test_backlog_inside_its_aging_limit_stays_backlog(self) -> None:
-        backlog = self.ticket(20_000, lane="backlog")
-        self.gov.enqueue(backlog)
-        self.wall[0] += 119.0
-        self.occupy("output", 60_000)
+    def test_on_a_minute_with_allowance_left_the_oldest_backlog_is_admitted_first(self) -> None:
+        oldest = self.ticket(20_000, lane="backlog")
+        self.gov.enqueue(oldest)
+        self.wall[0] += 130.0
+        newer = self.ticket(20_000, lane="backlog")
+        self.gov.enqueue(newer)
+        self.occupy("output", 40_000)
         self.gov.pump()
-        self.assertEqual(backlog.lane, "backlog")
-        self.assertFalse(backlog.holds)
+        self.assertTrue(oldest.holds)
+        self.assertFalse(newer.holds)
+        self.assertEqual(newer.last_refusal, RESERVE)
+        self.assertEqual(self.output_level(), 210_000)
 
     def test_a_restored_reserve_target_is_clamped_to_the_morph_limit(self) -> None:
         (self.home / "proxy_state.json").write_text(json.dumps({
