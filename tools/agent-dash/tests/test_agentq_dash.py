@@ -1221,22 +1221,20 @@ class HourlyStepPageTest(unittest.TestCase):
         if shutil.which("node") is None:
             self.skipTest("node is not installed")
         html = dash.PAGE_HTML
-        snippet = html[html.index("  function hourRowFor("):html.index("  function endSeries(")]
+        snippet = html[html.index("  function completeHourFor("):html.index("  function endSeries(")]
         script = snippet + """
 var rows = [
   {t: 0, label: "00 ET", avg: 0.2, minutes: 60, partial: false},
   {t: 3600, label: "01 ET", avg: 0.6, minutes: 10, partial: true}
 ];
 var points = [{t: 3540, pct_total: 0.1}, {t: 3600, pct_total: 0.7}, {t: 3660, pct_total: 0.7}];
-console.log(JSON.stringify(withHourly(points, rows, 3720)));
+console.log(JSON.stringify(withHourly(points, rows)));
 """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30, check=True)
         out = json.loads(result.stdout)
         self.assertEqual([p["t"] for p in out], [3540, 3600, 3600, 3660])
-        self.assertEqual((out[0]["hourly"], out[0]["hourlyPartial"]), (0.2, None))
-        self.assertEqual((out[1]["hourly"], out[1]["hourlyPartial"]), (0.2, None), "the boundary point holds the old hour")
-        self.assertEqual((out[2]["hourly"], out[2]["hourlyPartial"]), (None, 0.6), "the new hour starts at the boundary")
-        self.assertEqual(out[3]["hourlyPartial"], 0.6)
+        self.assertEqual([p["hourly"] for p in out], [0.2, 0.2, None, None])
+        self.assertNotIn("hourlyPartial", out[0])
         self.assertEqual([p["pct_total"] for p in out], [0.1, 0.7, 0.7, 0.7])
 
 
@@ -1250,7 +1248,8 @@ class EnforcedLimitsChartTest(unittest.TestCase):
         self.assertNotIn("5-min average", html)
         self.assertIn('{ key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }', block)
         self.assertIn('{ key: "hourly", name: "Hourly average", color: COLORS.s3, width: 2.5 }', block)
-        self.assertIn('{ key: "hourlyPartial", name: "This hour so far", color: COLORS.s3, width: 2.5, dash: "1 4", opacity: 0.75 }', block)
+        self.assertNotIn("hourlyPartial", html)
+        self.assertNotIn("This hour so far", html)
         self.assertIn('"Hourly average"', html)
         self.assertIn('text: lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%"', block)
         self.assertNotIn("range_avg_pct_total", block)
@@ -1960,11 +1959,14 @@ class QueuedSplitChartTest(unittest.TestCase):
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-workers"')
         block = html[start:html.index("var mix = d.token_mix", start)]
-        self.assertIn('{ key: "dsq", name: "DeepSeek queued", color: COLORS.s3, area: true, fillOpacity: 0.32 }', block)
-        self.assertIn('{ key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 }', block)
+        self.assertIn('{ key: "dsq", name: "DeepSeek queued", color: COLORS.s3, stacked: true, fillOpacity: 0.32 }', block)
+        self.assertIn('{ key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, stacked: true, fillOpacity: 0.3 }', block)
+        self.assertIn('stack: ["dsq", "kimiq"]', block)
+        self.assertIn('{ key: "queuedTotal", name: "Queued, total", color: COLORS.muted, tooltipOnly: true }', block)
         self.assertIn('kimiQueue: "#8a6cc0"', html)
-        self.assertIn('cfg.series.filter(function (s) { return s.area; })', html)
-        self.assertIn('cfg.series.filter(function (s) { return !s.area; })', html)
+        self.assertIn("queuedTotal: split ? w.ds_queued + w.kimi_queued : null", html)
+        self.assertIn("cfg.series.filter(function (s) { return !s.stacked && !s.tooltipOnly; })", html)
+        self.assertIn("var stackKeys = cfg.stack || [];", html)
         self.assertIn('{ key: "ds", name: "DeepSeek runs", color: COLORS.s1 }', block)
         self.assertIn('{ key: "kimi", name: "Kimi runs", color: COLORS.s2 }', block)
         self.assertNotIn('dash: "4 3"', block)
