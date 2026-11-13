@@ -65,21 +65,29 @@ VERDICT_CHIPS = {
     "morph_slow": "Morph slow",
     "laptop": "Laptop",
     "near_capacity": "Near capacity",
-    "proxy_pacing": "Proxy pacing",
+    "proxy_pacing": "Proxy waiting",
     "filling": "Near target",
     "launching": "Launching",
     "headroom": "Headroom",
+    "held_pacing": "Launch pacing",
+    "held_proxy": "Proxy waiting",
     "held_laptop": "Laptop",
     "held_ssh": "SSH slots",
-    "held_proxy": "Proxy pacing",
+    "held_slots": "Worker slots",
     "held_workspace": "Workspace",
+    "held_tier": "Worker pool",
     "held_other": "Held",
 }
 HOLD_DETAIL = re.compile(r"^hold ([^:]+): (.*)$", re.DOTALL)
 CPU_HOLD = re.compile(r"cpu (\d+)% busy >= (\d+)%")
 MEMORY_HOLD = re.compile(r"memory free (\d+)% < (\d+)%")
 SWAP_HOLD = re.compile(r"swap (\d+)% used >= (\d+)%")
-HOLD_GROUP_ORDER = ("laptop", "ssh", "proxy", "workspace", "other")
+PACING_HOLD = re.compile(
+    r"proxy uncached pacing: ([\d,]+) uncached this minute \(([^)]*)\), (\d+) pending launch\(es\) at ([\d,]+) each, cap ([\d,]+)"
+)
+PROXY_WAIT_HOLD = re.compile(r"^proxy (\w+) waiting (\d+)")
+PROXY_BUDGET_LABELS = {"total": "the Morph total pool", "output": "DeepSeek's output budget", "uncached_ds": "DeepSeek's uncached-input budget"}
+HOLD_GROUP_ORDER = ("pacing", "proxy", "laptop", "ssh", "slots", "workspace", "tier", "other")
 HOLD_GROUP_KEYS = {group: f"held_{group}" for group in HOLD_GROUP_ORDER}
 RATE_WINDOW_MINUTES = 60
 SAMPLE_INTERVAL_S = 60.0
@@ -2803,17 +2811,6 @@ def laptop_bars(home: Path) -> dict:
     return bars
 
 
-def laptop_holds(details: list[str]) -> list[tuple[str, str]]:
-    """The (gate, reason) pairs of queued DeepSeek jobs the broker holds on laptop headroom."""
-    held = []
-    for detail in details:
-        if detail:
-            gate, reason = split_hold(detail)
-            if hold_group(gate, reason) == "laptop":
-                held.append((gate, reason))
-    return held
-
-
 def laptop_pressure(laptop: dict, bars: dict) -> str | None:
     """The first light-job bar the laptop is past now (CPU busy, memory free, swap used), as text, or None.
 
@@ -2913,91 +2910,138 @@ def split_hold(detail: str) -> tuple[str, str]:
     return (match.group(1), match.group(2)) if match else ("", detail)
 
 
-def hold_group(gate: str, reason: str) -> str:
-    """The limit a held DeepSeek job waits on: a proxy budget, a workspace, an ssh slot, laptop load or memory, or other."""
-    if reason.startswith("proxy "):
-        return "proxy"
-    if reason == "workspace busy":
-        return "workspace"
-    if gate == "ssh":
-        return "ssh"
-    if gate in ("tests", "light") and any(rx.search(reason) for rx in (CPU_HOLD, MEMORY_HOLD, SWAP_HOLD)):
-        return "laptop"
-    return "other"
+def hold_kind(gate: str, reason: str) -> tuple[str, str]:
+    """(group, key) for one hold: the kind of wait, with its live numbers left out.
 
-
-def laptop_phrases(rows: list[tuple[str, str]]) -> list[str]:
-    """One phrase per gate and limit kind, quoting the worst reading: the highest CPU busy or swap used,
-    or the lowest free memory.
-
-    The broker refreshes each held job's reason on its own tick, so the numbers differ a little across jobs.
+    Launch pacing is the broker holding a job back under Morph's uncached-input limit; a proxy wait is the
+    proxy itself holding requests for a budget. The two are different groups and never share a key.
     """
-    buckets: dict[tuple[str, str], list] = {}
-    for gate, reason in rows:
+    if PACING_HOLD.search(reason):
+        return "pacing", "uncached pacing"
+    waiting = PROXY_WAIT_HOLD.match(reason)
+    if waiting:
+        return "proxy", f"proxy waiting {waiting.group(1)}"
+    if reason == "proxy saturated":
+        return "proxy", "proxy saturated"
+    if reason == "workspace busy":
+        return "workspace", "workspace busy"
+    if gate == "ssh":
+        return "ssh", "ssh slots"
+    if gate in ("tests", "light"):
+        for kind, rx in (("cpu", CPU_HOLD), ("memory", MEMORY_HOLD), ("swap", SWAP_HOLD)):
+            if rx.search(reason):
+                return "laptop", f"{gate} {kind}"
+    if reason == "slots full":
+        return "slots", f"{gate} slots"
+    if reason == "tier cap full":
+        return "tier", f"{gate} tier cap"
+    return "other", re.sub(r"[\d,.]+", "N", f"{gate}: {reason}" if gate else reason)
+
+
+def short_count(value: float) -> str:
+    """A count in the page's compact form: 243k, 1.2M."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{round(value / 1_000)}k"
+    return str(round(value))
+
+
+def hold_figures(group: str, key: str, reason: str, figures: dict) -> None:
+    """Fold one hold's live numbers into its key's figures: the largest current value, or the worst reading."""
+    if group == "pacing":
+        match = PACING_HOLD.search(reason)
+        current, pending, cap = (int(match.group(1).replace(",", "")), int(match.group(3)), int(match.group(5).replace(",", "")))
+        figures["current"] = max(figures.get("current", 0), current)
+        figures["cap"] = max(figures.get("cap", 0), cap)
+        figures["pending"] = max(figures.get("pending", 0), pending)
+    elif group == "proxy":
+        waiting = PROXY_WAIT_HOLD.match(reason)
+        if waiting:
+            figures["waiting"] = max(figures.get("waiting", 0), int(waiting.group(2)))
+            figures["budget"] = waiting.group(1)
+    elif group == "laptop":
         cpu, memory, swap = CPU_HOLD.search(reason), MEMORY_HOLD.search(reason), SWAP_HOLD.search(reason)
         if cpu:
-            kind, rank = "cpu", float(cpu.group(1))
-            text = f"CPU {rank:.0f}% busy, limit {float(cpu.group(2)):.0f}%"
+            reading = (float(cpu.group(1)), f"CPU {float(cpu.group(1)):.0f}% busy, limit {float(cpu.group(2)):.0f}%")
         elif swap:
-            kind, rank = "swap", float(swap.group(1))
-            text = f"swap {rank:.0f}% used, limit {float(swap.group(2)):.0f}%"
+            reading = (float(swap.group(1)), f"swap {float(swap.group(1)):.0f}% used, limit {float(swap.group(2)):.0f}%")
+        elif memory:
+            reading = (-float(memory.group(1)), f"memory {float(memory.group(1)):.0f}% free, floor {memory.group(2)}%")
         else:
-            kind, rank = "memory", -float(memory.group(1))
-            text = f"memory {-rank:.0f}% free, floor {memory.group(2)}%"
-        bucket = buckets.setdefault((gate, kind), [0, rank, text])
-        bucket[0] += 1
-        if rank > bucket[1]:
-            bucket[1], bucket[2] = rank, text
-    return [
-        f"{count} {'test job' if gate == 'tests' else 'light job'}{'' if count == 1 else 's'} ({text})"
-        for (gate, _), (count, _, text) in buckets.items()
-    ]
+            return
+        figures["worst"] = max(figures.get("worst", reading), reading, key=lambda item: item[0])
 
 
-def hold_body(group: str, gate: str, reason: str, ssh_in_use: int | None) -> tuple[str, str]:
-    """(singular, plural) noun phrase for one held reason of a non-laptop group, without its count."""
+def hold_clause(group: str, key: str, count: int, figures: dict, ssh_in_use: int | None) -> str:
+    """One sentence for one kind of hold, with its count and its single current figure."""
+    jobs = "job" if count == 1 else "jobs"
+    if group == "pacing":
+        return (
+            f"Launch pacing: {count} DeepSeek {jobs} waiting to launch under Morph's uncached-input limit "
+            f"({short_count(figures['current'])} of {short_count(figures['cap'])} this minute)"
+        )
+    if group == "proxy":
+        if key == "proxy saturated":
+            return f"{count} {jobs} waiting to launch while the Morph proxy is saturated"
+        budget = PROXY_BUDGET_LABELS.get(figures.get("budget", ""), "a Morph budget")
+        return (
+            f"{count} DeepSeek {jobs} waiting to launch behind {figures.get('waiting', 0)} requests "
+            f"waiting at the proxy on {budget}"
+        )
+    if group == "laptop":
+        gate = key.split()[0]
+        return f"{count} {'test' if gate == 'tests' else 'light'} {jobs} waiting for laptop headroom ({figures['worst'][1]})"
     if group == "ssh":
         in_use = f" ({ssh_in_use} in use)" if ssh_in_use is not None else ""
-        return f"job waiting for a production ssh slot{in_use}", f"jobs waiting for a production ssh slot{in_use}"
-    if group == "proxy":
-        return (
-            f"DeepSeek job waiting at the Morph proxy ({reason})",
-            f"DeepSeek jobs waiting at the Morph proxy ({reason})",
-        )
+        return f"{count} {jobs} waiting for a production ssh slot{in_use}"
+    if group == "slots":
+        gate = key.split()[0]
+        return f"{count} {gate} {jobs} waiting for a free {gate} slot"
     if group == "workspace":
-        return "write job waiting for its workspace", "write jobs waiting for their workspace"
-    detail = f"{gate}: {reason}" if gate else reason
-    return f"job held ({detail})", f"jobs held ({detail})"
+        return f"{count} write {jobs} waiting for {'its' if count == 1 else 'their'} workspace"
+    if group == "tier":
+        gate = key.split()[0]
+        pool = "Kimi" if gate == KIMI_TIER else "DeepSeek"
+        return f"{count} {pool} {jobs} waiting for a free worker in the pool (cap reached)"
+    return f"{count} {jobs} held ({key.split(': ', 1)[-1]})"
 
 
-def held_verdict(details: list[str], ssh_in_use: int | None) -> tuple[str, str] | None:
-    """(key, text) when ready DeepSeek jobs carry a broker hold, else None.
+def hold_summary(details: list[str], ssh_in_use: int | None) -> list[tuple[str, str, int, str]]:
+    """Every kind of hold among the queued DeepSeek jobs: (group, key, count, clause), biggest first.
 
-    The chip follows the largest group of held jobs (ties keep HOLD_GROUP_ORDER). Each group names its
-    reasons with counts; the other groups follow after a semicolon.
+    Jobs are counted per kind (group and key), so the same hold reported with different live numbers is one
+    clause. Ties keep HOLD_GROUP_ORDER.
     """
-    groups: dict[str, list[tuple[str, str]]] = {}
+    kinds: dict[tuple[str, str], list] = {}
     for detail in details:
-        if detail:
-            gate, reason = split_hold(detail)
-            groups.setdefault(hold_group(gate, reason), []).append((gate, reason))
-    if not groups:
-        return None
-    primary = max(HOLD_GROUP_ORDER, key=lambda group: len(groups.get(group, ())))
-    phrases = []
-    for group in (primary, *(g for g in HOLD_GROUP_ORDER if g in groups and g != primary)):
-        if group == "laptop":
-            phrases.append("; ".join(laptop_phrases(groups[group])))
+        if not detail:
             continue
-        counts: dict[tuple[str, str], int] = {}
-        for gate, reason in groups[group]:
-            body = hold_body(group, gate, reason, ssh_in_use)
-            counts[body] = counts.get(body, 0) + 1
-        phrases.append("; ".join(f"{n} {singular if n == 1 else plural}" for (singular, plural), n in counts.items()))
-    if primary == "laptop":
-        total = sum(len(rows) for rows in groups.values())
-        return HOLD_GROUP_KEYS[primary], f"{total} DeepSeek jobs held for laptop headroom: {'; '.join(phrases)}."
-    return HOLD_GROUP_KEYS[primary], f"{'; '.join(phrases)}."
+        gate, reason = split_hold(detail)
+        group, key = hold_kind(gate, reason)
+        entry = kinds.setdefault((group, key), [0, {}])
+        entry[0] += 1
+        hold_figures(group, key, reason, entry[1])
+    rows = [
+        (group, key, count, hold_clause(group, key, count, figures, ssh_in_use))
+        for (group, key), (count, figures) in kinds.items()
+    ]
+    return sorted(rows, key=lambda row: (-row[2], HOLD_GROUP_ORDER.index(row[0])))
+
+
+def held_verdict(details: list[str], ssh_in_use: int | None) -> tuple[str, str, str | None] | None:
+    """(key, headline, secondary) when ready DeepSeek jobs carry a broker hold, else None.
+
+    The headline is the biggest kind of hold and sets the chip. The next two kinds go in the secondary line,
+    so the verdict never has more than three clauses.
+    """
+    rows = hold_summary(details, ssh_in_use)
+    if not rows:
+        return None
+    group, _key, _count, headline = rows[0]
+    others = [row[3] for row in rows[1:3]]
+    secondary = f"Also: {'; '.join(others)}." if others else None
+    return HOLD_GROUP_KEYS[group], f"{headline}.", secondary
 
 
 def fill_near_target(raw: dict[int, dict], until: int, fill: dict | None) -> bool:
@@ -3164,14 +3208,17 @@ def verdict(
         key = "proxy_pacing"
         budget = max((name for name in waiting if waiting[name] > 0), key=lambda name: waiting[name])
         text = (
-            f"Proxy pacing: DeepSeek requests are waiting on {LIMIT_LABELS[budget]} "
+            f"DeepSeek requests are waiting at the proxy on {LIMIT_LABELS[budget]} "
             f"while the pool is at {pool * 100:.0f}%."
         )
     elif ds_jobs_ready:
         held = held_verdict(ds_holds or [], ssh_in_use)
-        key, text = held or (
-            "launching", f"Launching: {ds_jobs_ready} DeepSeek jobs are ready; the broker is starting them.",
-        )
+        if held is not None:
+            key, text, hold_secondary = held
+            if hold_secondary:
+                secondary_parts.append(hold_secondary)
+        else:
+            key, text = "launching", f"Launching: {ds_jobs_ready} DeepSeek jobs are ready; the broker is starting them."
     else:
         key = "headroom"
         text = f"Headroom: pool at {pool * 100:.0f}% of Morph's limit; room for more work."

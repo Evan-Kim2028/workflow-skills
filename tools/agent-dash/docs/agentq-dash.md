@@ -86,3 +86,20 @@ A source that fails shows as null or empty in the JSON and is named under
 - The token chart stacks cache read, uncached input and output per interval, with the running total as a line on the right axis.
 - The total pool % uses tokens admitted in each UTC minute (`proxy_calib.billed`) where that row exists, and falls back to completion-minute totals from `proxy_minutes` otherwise.
 - DeepSeek output is a plain count per minute (activity row). Its stated 70k per minute is not enforced by Morph, so it is not charted as a % of limit. Kimi uncached is an estimate computed by the proxy, not Morph's own tally.
+
+## Limited-by headline
+
+When ready DeepSeek jobs carry a broker hold, the headline groups the holds by
+kind, not by exact text. Each jobs.detail string is normalised to a kind (launch
+pacing under Morph's uncached-input limit, a proxy wait, laptop CPU, memory or
+swap, a production ssh slot, a free worker slot, a workspace, the pool cap, or
+other). Numbers are left out of the kind, so the same hold with different live
+numbers is one clause with a count.
+
+- The headline is the biggest kind; its chip names the kind. The next two kinds
+  follow on the secondary line as "Also: ...". No verdict has more than three clauses.
+- Launch pacing means the broker is holding jobs back before launch ("waiting to
+  launch"). The clause quotes the largest current uncached-input figure in the group.
+- "Waiting at the proxy" is used only for requests the proxy itself holds, with
+  the queued count from the proxy's status.
+
