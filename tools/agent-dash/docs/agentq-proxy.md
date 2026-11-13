@@ -175,7 +175,7 @@ A request that is already streaming upstream is not cancelled.
 `upstream`, `window_s`, `start_target`, `target_floor`, `target_cut`,
 `target_step_up`, `target_ceiling`, `fast_until`, `fast_step_up`, `fast_interval_s`, `default_output_tokens`, `give_up_s`, `retry_floor_s`,
 `retry_jitter_s`, `aging_s`, `connect_timeout_s` (10), `upstream_idle_s` (120),
-`drain_s` (20), `budgets`, `max_tokens_cap`, `window_mode` (`rolling`),
+`shutdown_s` (25), `budgets`, `max_tokens_cap`, `window_mode` (`rolling`),
 `charge_basis` (`billed`), `calendar_jitter_s` (1.5) and the log file settings
 `log_path` (`logs/proxy.err.log`, relative to `$AGENTQ_HOME`; empty means
 stderr), `log_max_bytes` (10 MB) and `log_backups` (3). Environment variables:
@@ -224,7 +224,7 @@ The proxy uses only the standard library (asyncio streams and ssl), so the
 launchd agent runs the system `python3` with no virtualenv. `httpx` is not used.
 The template `agentq/launchd/com.agentq.proxy.plist` has `__PYTHON__` and
 `__HOME__` placeholders. Install it by substituting them and copying it to
-`~/Library/LaunchAgents/`. Nothing is installed by this change.
+`~/Library/LaunchAgents/`, then reload the agent (see the commands in the PR). Nothing is installed by this change.
 
 ## Failure handling
 
@@ -250,8 +250,12 @@ error, a client that left, a timeout, a truncated stream).
 
 ## Shutdown and state
 
-- On SIGTERM or SIGINT the proxy stops accepting connections, lets in-flight
-  requests finish for up to `drain_s` (20 s), cancels what remains, and exits.
+- On SIGTERM or SIGINT the proxy stops accepting connections and runs one shutdown
+  budget of `shutdown_s` (25 s). In-flight requests get `shutdown_s - 5` s and are then
+  cancelled. Pending seed reads get what is left minus 3 s. The final writes always get
+  at least 3 s: they run on their own thread with a 1 s busy timeout, so they never queue
+  behind a seed read still running. launchd's `ExitTimeOut` is 40 s, which covers the
+  whole budget with margin.
 - The learned state is written by the maintenance loop (about every 0.2 s when
   it changed, and at least every 5 s), off the request path, not on every 429.
   Shutdown always writes it once more, after in-flight requests settle.

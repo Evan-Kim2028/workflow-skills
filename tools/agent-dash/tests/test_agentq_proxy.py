@@ -59,6 +59,7 @@ from agentq.proxy import (
     seconds_to_next_minute,
     tokens_for_chars,
     write_calib_rows,
+    FINAL_RESERVE_S,
     UpstreamPool,
     read_minute_counts,
     read_only_uri,
@@ -3020,10 +3021,10 @@ class CloseDrainsSeedsTest(ProxyCase):
             release.wait(5)
             return None
 
-        with mock.patch("agentq.proxy.SEED_DRAIN_S", 0.1), mock.patch("agentq.proxy.read_minute_counts", stuck):
+        with mock.patch("agentq.proxy.read_minute_counts", stuck):
             row = self.gov.row(MODEL_OUT)
             row["req"] += 2
-            await self.proxy.close()
+            await self.proxy.close(asyncio.get_running_loop().time() + FINAL_RESERVE_S + 0.5)
         release.set()
         self.assertEqual(self.gov.pending_seeds, set())
         self.assertIn("seed_timeout", self.events())
@@ -3060,3 +3061,84 @@ class EntryPointTest(unittest.TestCase):
         package_root = str(Path(__file__).resolve().parents[1])
         result = self.run_help(["-m", "agentq.cli"], package_root)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class SharedShutdownDeadlineTest(ProxyCase):
+    """One shutdown budget covers the request drain, the seed drain and the final writes."""
+
+    async def wait_until(self, condition, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail("condition not reached")
+            await asyncio.sleep(0.01)
+
+    async def test_request_and_seed_drains_share_one_deadline(self) -> None:
+        hold = asyncio.Event()
+        self.fake.script = [{"hold": hold}]
+        gate = threading.Event()
+
+        def stuck_seed(path, minute, model):
+            gate.wait(10)
+            return None
+
+        loop = asyncio.get_running_loop()
+        stuck = None
+        try:
+            with mock.patch("agentq.proxy.read_minute_counts", stuck_seed):
+                stuck = asyncio.create_task(self.post(self.chat(MODEL_OUT, stream=False), job="stuck"))
+                await self.wait_until(lambda: len(self.fake.requests) == 1)
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(self.gov.pending_seeds), 1)
+                started = loop.time()
+                await self.proxy.shutdown(6.0)
+                elapsed = loop.time() - started
+        finally:
+            gate.set()
+            hold.set()
+            if stuck is not None:
+                with contextlib.suppress(Exception):
+                    await stuck
+        self.assertLess(elapsed, 6.5)
+        self.assertGreaterEqual(elapsed, 2.5)
+
+    async def test_both_writer_threads_stuck_still_persist_the_in_memory_counts_in_time(self) -> None:
+        minute = minute_stamp(self.gov.wall())
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        write_calib_rows(self.gov.db_path, [(minute, 3, 0, 0, 0, None, 0)])
+        gate = threading.Event()
+
+        def stuck_minute(path, minute, model):
+            gate.wait(10)
+            return None
+
+        def stuck_calib(path, minute):
+            gate.wait(10)
+            return None
+
+        loop = asyncio.get_running_loop()
+        with mock.patch("agentq.proxy.read_minute_counts", stuck_minute), mock.patch("agentq.proxy.read_calib_counts", stuck_calib):
+            self.gov.row(MODEL_OUT)["req"] += 2
+            self.gov.calib_record(minute)["overall"]["req"] += 1
+            await asyncio.sleep(0.05)
+            started = loop.time()
+            try:
+                await self.proxy.shutdown(6.0)
+                elapsed = loop.time() - started
+            finally:
+                gate.set()
+        self.assertLess(elapsed, 6.5)
+        minute_counts = read_minute_counts(self.gov.db_path, minute, MODEL_OUT)
+        self.assertEqual(minute_counts["req"], 2)
+        connection = sqlite3.connect(self.gov.db_path)
+        calib = connection.execute("SELECT req FROM proxy_calib WHERE minute = ?", (minute,)).fetchone()[0]
+        connection.close()
+        self.assertEqual(calib, 1)
+        self.assertIn("seed_timeout", self.events())
+
+
+class LaunchAgentTest(unittest.TestCase):
+    def test_exit_timeout_covers_the_default_shutdown_budget_with_margin(self) -> None:
+        with PLIST.open("rb") as handle:
+            plist = plistlib.load(handle)
+        self.assertEqual(plist["ExitTimeOut"], int(DEFAULT_CONFIG["shutdown_s"]) + 15)

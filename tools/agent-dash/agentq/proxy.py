@@ -98,7 +98,7 @@ DEFAULT_CONFIG = {
     "aging_s": 900.0,
     "connect_timeout_s": 10.0,
     "upstream_idle_s": 120.0,
-    "drain_s": 20.0,
+    "shutdown_s": 25.0,
     "max_tokens_cap": {},
     "window_mode": "rolling",
     "charge_basis": "billed",
@@ -135,7 +135,9 @@ SATURATION_WAIT_S = 2.0
 LANE_CACHE_S = 2.0
 DB_WORKERS = 2
 LAG_WINDOW_S = 60.0
-SEED_DRAIN_S = 5.0
+REQUEST_RESERVE_S = 5.0
+FINAL_RESERVE_S = 3.0
+FINAL_BUSY_S = 1.0
 LANE_CACHE_MAX = 10_000
 PREFIX_STORE_JOBS = 256
 ANONYMOUS_JOBS = frozenset({"", "none"})
@@ -623,13 +625,13 @@ def read_calib_counts(db_path: Path, minute: str) -> dict | None:
     return {"overall": overall, "families": {}, "first_429_s": first_429_s, "r429": int(r429 or 0)}
 
 
-def write_calib_rows(db_path: Path, rows: list[tuple]) -> None:
+def write_calib_rows(db_path: Path, rows: list[tuple], busy_s: float = 5.0) -> None:
     """Upsert one proxy_calib row per UTC minute. The minute is owned by this process, so each write
     carries the whole minute. Runs in a worker thread."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=5.0)
+    connection = sqlite3.connect(db_path, timeout=busy_s)
     try:
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_s * 1000)}")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(PROXY_CALIB_DDL)
         connection.executemany("INSERT OR REPLACE INTO proxy_calib VALUES (?,?,?,?,?,?,?)", rows)
@@ -736,12 +738,12 @@ MINUTE_ROW_COLUMNS = (
 )
 
 
-def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
+def write_minute_rows(db_path: Path, rows: list[tuple], busy_s: float = 5.0) -> None:
     """Upsert one proxy_minutes row per model per minute. Runs in a worker thread."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=5.0)
+    connection = sqlite3.connect(db_path, timeout=busy_s)
     try:
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_s * 1000)}")
         connection.execute("PRAGMA journal_mode = WAL")
         ensure_minutes_schema(connection)
         marks = ",".join("?" * len(MINUTE_ROW_COLUMNS))
@@ -752,14 +754,14 @@ def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
         connection.close()
 
 
-def write_inflight_minute_rows(db_path: Path, rows: list[tuple]) -> None:
+def write_inflight_minute_rows(db_path: Path, rows: list[tuple], busy_s: float = 5.0) -> None:
     """Upsert the limiter's record for each calendar minute the proxy was running: (minute, mode, arm, limit,
     enforcing). Written on every flush, so a minute keeps its last state. A minute with no row was not recorded
     (the proxy was down or not yet instrumented), and the report leaves it out. Runs in a worker thread."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=5.0)
+    connection = sqlite3.connect(db_path, timeout=busy_s)
     try:
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_s * 1000)}")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(INFLIGHT_MINUTES_DDL)
         connection.executemany(
@@ -771,13 +773,13 @@ def write_inflight_minute_rows(db_path: Path, rows: list[tuple]) -> None:
         connection.close()
 
 
-def write_job_rows(db_path: Path, rows: list[tuple]) -> None:
+def write_job_rows(db_path: Path, rows: list[tuple], busy_s: float = 5.0) -> None:
     """Add per-run deltas to proxy_jobs. Additive upserts, so two processes or restarts never overwrite.
     Runs in a worker thread."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=5.0)
+    connection = sqlite3.connect(db_path, timeout=busy_s)
     try:
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_s * 1000)}")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(PROXY_JOBS_DDL)
         connection.executemany(JOB_UPSERT_SQL, rows)
@@ -2418,10 +2420,11 @@ class Proxy:
         governor.seeder = self._start_seed
         self.db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="agentq-db")
 
-    async def run_db(self, fn, *args):
+    async def run_db(self, fn, *args, executor: ThreadPoolExecutor | None = None, **kwargs):
         """Run one store or state write on the dedicated writer threads, never on the default executor the
-        request path uses for lane lookups and body parsing."""
-        return await asyncio.get_running_loop().run_in_executor(self.db_executor, fn, *args)
+        request path uses for lane lookups and body parsing. Shutdown passes its own executor."""
+        call = functools.partial(fn, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(executor or self.db_executor, call)
 
     def _start_seed(self, kind: str, key: object) -> None:
         """Governor hook: read a stored minute off the loop, on the writer threads."""
@@ -2445,11 +2448,13 @@ class Proxy:
             else:
                 self.gov.apply_calib_seed(key, None)
 
-    async def drain_seeds(self) -> None:
-        """Let pending seed reads land, for at most SEED_DRAIN_S. A seed still pending after that is cancelled and
-        released as empty: the minute keeps its in-memory counts and loses only the stored seed."""
+    async def drain_seeds(self, until: float) -> None:
+        """Let pending seed reads land until the loop clock reaches ``until``. A seed still pending then is cancelled
+        and released as empty: the minute keeps its in-memory counts and loses only the stored seed. A cancelled
+        wrapper does not stop a read already running on a writer thread, which is why final writes use their own."""
+        timeout = max(0.0, until - asyncio.get_running_loop().time())
         if self.seed_tasks:
-            await asyncio.wait(set(self.seed_tasks), timeout=SEED_DRAIN_S)
+            await asyncio.wait(set(self.seed_tasks), timeout=timeout)
         for task in list(self.seed_tasks):
             task.cancel()
         abandoned = list(self.gov.pending_seeds)
@@ -2497,24 +2502,54 @@ class Proxy:
         if remaining:
             await asyncio.gather(*remaining, return_exceptions=True)
 
-    async def close(self) -> None:
+    async def shutdown(self, shutdown_s: float) -> None:
+        """Stop serving and persist, all inside one budget of shutdown_s seconds. In-flight requests get the budget
+        minus REQUEST_RESERVE_S; seed reads and then the final writes get what is left, with the final writes
+        always keeping FINAL_RESERVE_S."""
+        deadline = asyncio.get_running_loop().time() + shutdown_s
+        await self.drain(max(0.0, shutdown_s - REQUEST_RESERVE_S))
+        await self.close(deadline)
+
+    async def close(self, deadline: float | None = None) -> None:
+        """Persist everything and release the threads. ``deadline`` is a loop-clock time; the default is shutdown_s
+        from now. Seed reads are drained only up to deadline minus FINAL_RESERVE_S. The final writes run on a
+        fresh thread with a short busy timeout, so they never queue behind a seed read that is still running."""
         if self.closed:
             return
         self.closed = True
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + float(self.gov.config["shutdown_s"])
         if self.watchdog is not None:
             self.watchdog.stop()
-        await self.drain_seeds()
+        await self.drain_seeds(deadline - FINAL_RESERVE_S)
         self.pool.close_all()
         if self.maintenance is not None:
             self.maintenance.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.maintenance
         if self.flush_task is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.flush_task
-        await self.flush()
-        await self.flush_state(force=True)
-        self.db_executor.shutdown(wait=False)
+            await asyncio.wait({self.flush_task}, timeout=max(0.0, deadline - FINAL_RESERVE_S - loop.time()))
+        await self.persist_final(deadline)
+        self.db_executor.shutdown(wait=False, cancel_futures=True)
+
+    async def persist_final(self, deadline: float) -> None:
+        """Write the pending counters and the learned state on a new thread, with a short busy timeout, and give up
+        at the deadline. A write that is still running then is left to finish on its own thread."""
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentq-final")
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(self._final_writes(executor), timeout=max(0.0, deadline - loop.time()))
+        except asyncio.TimeoutError:
+            self.gov.log("final_timeout")
+        except Exception as exc:
+            self.gov.log("final_error", kind=type(exc).__name__)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _final_writes(self, executor: ThreadPoolExecutor) -> None:
+        await self._write_pending(executor=executor, busy_s=FINAL_BUSY_S)
+        await self.flush_state(force=True, executor=executor)
 
     async def maintain(self) -> None:
         loop = asyncio.get_running_loop()
@@ -2546,41 +2581,42 @@ class Proxy:
         async with self.flush_lock:
             await self._write_pending()
 
-    async def _write_pending(self) -> None:
+    async def _write_pending(self, executor: ThreadPoolExecutor | None = None, busy_s: float | None = None) -> None:
+        options = {} if busy_s is None else {"busy_s": busy_s}
         rows = self.gov.take_minute_rows()
         if rows:
             try:
-                await self.run_db(write_minute_rows, self.gov.db_path, rows)
+                await self.run_db(write_minute_rows, self.gov.db_path, rows, executor=executor, **options)
             except sqlite3.Error as exc:
                 self.gov.log("flush_error", kind=type(exc).__name__)
         record = [self.gov.inflight_minute_row()]
         try:
-            await self.run_db(write_inflight_minute_rows, self.gov.db_path, record)
+            await self.run_db(write_inflight_minute_rows, self.gov.db_path, record, executor=executor, **options)
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
         calib_rows = self.gov.take_calib_rows()
         if calib_rows:
             try:
-                await self.run_db(write_calib_rows, self.gov.db_path, calib_rows)
+                await self.run_db(write_calib_rows, self.gov.db_path, calib_rows, executor=executor, **options)
             except sqlite3.Error as exc:
                 self.gov.log("flush_error", kind=type(exc).__name__)
         job_rows, snapshot = self.gov.take_job_rows()
         if not job_rows:
             return
         try:
-            await self.run_db(write_job_rows, self.gov.db_path, job_rows)
+            await self.run_db(write_job_rows, self.gov.db_path, job_rows, executor=executor, **options)
         except sqlite3.Error as exc:
             self.gov.log("flush_error", kind=type(exc).__name__)
             return
         self.gov.settle_job_rows(snapshot)
 
-    async def flush_state(self, force: bool = False) -> None:
+    async def flush_state(self, force: bool = False, executor: ThreadPoolExecutor | None = None) -> None:
         if not (self.gov.state_dirty or force):
             return
         snapshot = self.gov.snapshot_state()
         self.gov.state_dirty = False
         try:
-            await self.run_db(write_state_file, self.gov.state_path, snapshot)
+            await self.run_db(write_state_file, self.gov.state_path, snapshot, executor=executor)
         except OSError as exc:
             self.gov.state_dirty = True
             self.gov.log("state_error", kind=type(exc).__name__)
@@ -2876,8 +2912,7 @@ async def run(governor: Governor, upstream_url: str, key: str, port: int) -> Non
     await stop.wait()
     server.close()
     governor.log("draining", in_flight=len(proxy.active))
-    await proxy.drain(float(governor.config["drain_s"]))
-    await proxy.close()
+    await proxy.shutdown(float(governor.config["shutdown_s"]))
     governor.log("stopped")
 
 
