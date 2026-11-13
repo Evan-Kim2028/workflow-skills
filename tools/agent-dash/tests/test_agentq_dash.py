@@ -1,6 +1,8 @@
 import calendar
 import re
 import hashlib
+import shutil
+import subprocess
 import http.client
 import json
 import sqlite3
@@ -282,7 +284,7 @@ class ServerTest(unittest.TestCase):
         for title in (
             "Morph total-token limit used per minute",
             "Active runs over time, with caps",
-            "Tokens per 5 minutes, millions",
+            "Tokens billed per 5 min",
             "Runs",
             "Top consumers today",
             "Morph 429s",
@@ -785,6 +787,94 @@ class LogTest(unittest.TestCase):
         self.assertEqual(full.count(b"\n"), 60)
 
 
+class TokenChartTest(unittest.TestCase):
+    """The tokens-billed chart: one bar series, a Morph limit line per bucket, a secondary cumulative axis, and the mix caption."""
+
+    @staticmethod
+    def chart_block(html: str, chart_id: str) -> str:
+        start = html.index(f'registerChart("{chart_id}"')
+        return html[start:html.index("registerChart(", start + 1)]
+
+    def summary(self, hours: int) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            return dash.build_summary(home, hours, now=NOW, fetch_live=proxy_status, laptop=CALM)
+
+    def test_tokens_chart_is_one_total_bar_series_and_the_cumulative_line(self) -> None:
+        html = dash.PAGE_HTML
+        block = html[html.index('registerChart("c-tokens"'):html.index("}, drawTokenCombo);")]
+        self.assertIn('series: [{ key: "total", name: "Tokens billed", color: COLORS.s1 }]', block)
+        self.assertEqual(block.count('key: "'), 1)
+        self.assertNotIn("cache_read", block)
+        self.assertNotIn("COLORS.s3", block)
+        self.assertIn('{ name: "Cumulative (right axis)", color: COLORS.muted }', dash.PAGE_HTML)
+
+    def test_limit_line_is_ten_million_per_minute_times_the_bucket_minutes(self) -> None:
+        six = self.summary(6)
+        self.assertEqual(six["token_limit"], {"per_minute": 10_000_000, "bucket_minutes": 5, "value": 50_000_000})
+        week = self.summary(168)
+        self.assertEqual(week["token_bucket_s"], 1800)
+        self.assertEqual(week["token_limit"]["value"], 10_000_000 * 30)
+
+    def test_left_axis_covers_the_limit_and_1_1_times_the_largest_bucket(self) -> None:
+        for hours in (6, 168):
+            summary = self.summary(hours)
+            with self.subTest(hours=hours):
+                axis = summary["token_axes"]["left"]
+                peak = max(row["total"] for row in summary["token_mix"])
+                self.assertGreaterEqual(axis["max"], summary["token_limit"]["value"] * 1.05)
+                self.assertGreaterEqual(axis["max"], peak * 1.1)
+                self.assertEqual(axis["ticks"][0], 0)
+                self.assertEqual(axis["ticks"][-1], axis["max"])
+                self.assertIn(len(axis["ticks"]), (4, 5, 6))
+
+    def test_nice_axis_steps_are_round_and_cover_the_peak(self) -> None:
+        self.assertEqual(dash.nice_axis(52_500_000), {"max": 60_000_000, "ticks": [0, 20_000_000, 40_000_000, 60_000_000]})
+        self.assertEqual(dash.nice_axis(315_000_000)["ticks"], [0, 100_000_000, 200_000_000, 300_000_000, 400_000_000])
+        cumulative = dash.nice_axis(1_300_000_000)
+        self.assertEqual(cumulative["ticks"], [0, 500_000_000, 1_000_000_000, 1_500_000_000])
+        self.assertEqual(dash.nice_axis(0)["max"], 1)
+
+    def test_mix_shares_sum_to_one_and_match_the_range_totals(self) -> None:
+        for hours in (6, 168):
+            summary = self.summary(hours)
+            totals = summary["token_totals"]
+            with self.subTest(hours=hours):
+                self.assertEqual(totals["total"], sum(row["total"] for row in summary["token_mix"]))
+                self.assertAlmostEqual(sum(totals["shares"].values()), 1.0, places=9)
+                self.assertEqual(totals["shares"]["output"], totals["output"] / totals["total"])
+
+    def test_mix_shares_are_none_when_nothing_was_billed(self) -> None:
+        totals = dash.token_totals([])
+        self.assertEqual(totals["total"], 0)
+        self.assertEqual(totals["shares"], {"cache_read": None, "uncached": None, "output": None})
+
+    def test_tick_labels_have_no_trailing_point_zero(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        match = re.search(r"\n  function fmtTokens\(n\) \{.*?\n  \}\n", dash.PAGE_HTML, re.S)
+        self.assertIsNotNone(match)
+        values = [0, 500_000, 2_000_000, 2_500_000, 20_000_000, 60_000_000, 500_000_000, 1_000_000_000, 1_500_000_000, 300_000_000]
+        script = match.group(0) + "\nconsole.log(JSON.stringify(%s.map(fmtTokens)));" % json.dumps(values)
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = Path(tmp) / "fmt.js"
+            script_path.write_text(script, encoding="utf-8")
+            out = subprocess.run([node, str(script_path)], capture_output=True, text=True, timeout=30, check=True)
+        labels = json.loads(out.stdout)
+        self.assertEqual(labels, ["0", "500K", "2M", "2.5M", "20M", "60M", "500M", "1B", "1.5B", "300M"])
+        self.assertFalse([label for label in labels if ".0" in label])
+
+    def test_page_titles_the_chart_by_bucket_and_states_the_mix_caption_slot(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('"Tokens billed per " + tunit', html)
+        self.assertIn('setText("tok-mix", mixCaption(d.token_totals));', html)
+        self.assertIn('id="tok-mix"', html)
+        self.assertIn('rightLabel: "cumulative"', html)
+        self.assertIn('"stroke-width": 1.5', html)
+        self.assertIn('group: "capacity", bucket_s: tb', html)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -940,8 +1030,9 @@ class YAxisLabelTest(unittest.TestCase):
     def test_the_label_is_drawn_above_the_plot_in_the_muted_tick_class(self) -> None:
         html = dash.PAGE_HTML
         self.assertIn('if (cfg.y.label) svgEl("text", { x: m.l, y: 12, class: "tick" }', html)
-        self.assertIn('"tokens per " + cfg.unit + " (M)"', html)
-        self.assertIn('"cumulative tokens"', html)
+        self.assertIn('svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = cfg.yLabel;', html)
+        self.assertIn('svgEl("text", { x: W - 2, y: 12, "text-anchor": "end", class: "tick" }, svg).textContent = cfg.rightLabel;', html)
+        self.assertIn('yLabel: "tokens per " + tunit,', html)
 
     def test_pair_layout_is_shared_by_both_capacity_charts_and_reserves_the_label_row(self) -> None:
         html = dash.PAGE_HTML
