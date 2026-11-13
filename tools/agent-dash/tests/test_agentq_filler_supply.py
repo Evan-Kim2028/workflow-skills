@@ -548,6 +548,38 @@ class ConfigBoundsTests(unittest.TestCase):
                          (500, 2 * 2**20, 1.5))
 
 
+class PromptSizeTests(unittest.TestCase):
+    """Every filler brief asks for the terse report, and stays short enough that its output stays lean."""
+
+    RULES = ("at most 10 findings", "under 60 lines", "5 lines", "why:")
+
+    def rendered(self, kind):
+        target = F.Target(repo="r", module="pkg/a.py", workspace="/ws", report_dir="/rep")
+        if kind == "pr":
+            work = F.pr_work({"number": 7, "title": "t", "url": "u", "repo": "r", "slug": "o/r", "workspace": "/ws",
+                              "report_dir": "/rep", "merge_commit": "c"})
+        else:
+            work = F.audit_work(target, kind, "c0ffee")
+        return F.prompt_for(work)
+
+    def test_every_kind_carries_the_terse_rules(self):
+        for kind in ("bugs", "tests", "docs", "risk", "pr"):
+            text = self.rendered(kind)
+            for rule in self.RULES:
+                self.assertIn(rule, text, f"{kind} brief is missing {rule!r}")
+
+    def test_every_brief_is_short_enough(self):
+        for kind in ("bugs", "tests", "docs", "risk", "pr"):
+            text = self.rendered(kind)
+            self.assertLessEqual(len(text), 2200, f"{kind} brief is {len(text)} characters")
+            self.assertLessEqual(len(text.splitlines()), 30, f"{kind} brief has too many lines")
+
+    def test_a_terse_finding_still_parses_into_the_index_with_its_why(self):
+        line = "- **high** `pkg/a.py:12` — unchecked error — why: the write is never checked"
+        self.assertEqual(F.parse_findings(line), [("high", "pkg/a.py:12",
+                                                   "unchecked error — why: the write is never checked")])
+
+
 class PrSourceUnitTests(unittest.TestCase):
     def test_merged_epoch_reads_gh_timestamps_and_tolerates_bad_rows(self):
         self.assertEqual(P.merged_epoch({"mergedAt": "1970-01-01T00:01:00Z"}), 60.0)

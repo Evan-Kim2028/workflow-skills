@@ -67,6 +67,43 @@ def tick(ctl, now, billed, active, *, fill=FILL, filler=None, ready_real=0, queu
                     queued_filler=queued_filler, gate=gate)
 
 
+class OutputGateTests(unittest.TestCase):
+    """Filler waits while the DeepSeek output budget's current-minute use is near its target."""
+
+    def status(self, used, limit=70_000, frac=0.98):
+        return {"budgets": {
+            "total": {"queued": {}, "blocked_by_family": {}},
+            "output": {"used_60s": used, "limit": limit, "target_frac": frac, "window_mode": "calendar"},
+        }}
+
+    def test_the_output_budget_at_the_hold_fraction_holds_filler_and_names_it(self):
+        reason = F.output_gate(self.status(used=58_310), FILL)
+        self.assertIsNotNone(reason)
+        self.assertIn("output budget", reason)
+        self.assertIn("85% of its 68,600 target", reason)
+
+    def test_just_below_the_hold_fraction_does_not_hold(self):
+        self.assertIsNone(F.output_gate(self.status(used=58_309), FILL))
+
+    def test_the_hold_fraction_is_configurable(self):
+        self.assertIsNotNone(F.output_gate(self.status(used=50_000), dict(FILL, output_hold_frac=0.5)))
+        self.assertEqual(F.DEFAULT_FILL["output_hold_frac"], 0.85)
+
+    def test_an_absent_or_unreadable_output_budget_does_not_hold(self):
+        self.assertIsNone(F.output_gate({"budgets": {"total": {}}}, FILL))
+        self.assertIsNone(F.output_gate(self.status(used=None), FILL))
+        self.assertIsNone(F.output_gate(None, FILL))
+
+    def test_the_gate_reaches_the_controller_through_gate_reason(self):
+        reason = F.gate_reason(self.status(used=65_000), 0, None, LAPTOP, FILL)
+        self.assertIn("output budget", reason)
+        plan = tick(F.FillController(), NOW, 1e6, 10, gate=reason)
+        self.assertEqual((plan.submit, plan.key), (0, "gate"))
+
+    def test_a_deepseek_429_still_holds_when_the_output_budget_is_clear(self):
+        self.assertIn("429", F.gate_reason(self.status(used=1_000), 1, None, LAPTOP, FILL))
+
+
 class LaptopGateTests(unittest.TestCase):
     def test_laptop_cpu_memory_and_swap_hold_at_the_filler_bars(self):
         self.assertIn("memory free 10% < 20%", F.gate_reason(status_doc(), 0, reading(free=10.0), LAPTOP, FILL))
