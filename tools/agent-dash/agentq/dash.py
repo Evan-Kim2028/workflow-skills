@@ -110,7 +110,11 @@ VERDICTS = ("PASS", "PARTIAL", "FAIL")
 FAR_FUTURE = 4102444800.0
 BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ds_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
 PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached", "pct_ds_uncached")
-WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs")
+WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued", "queued_unsplit")
+DS_TIER = "pi-deepseek-flash"
+KIMI_TIER = "pi-kimi"
+SAMPLE_COLUMNS = ("ts", "ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued")
+SPLIT_COLUMNS = ("ds_queued", "kimi_queued")
 LOG_SOURCES = {"proxy": "proxy.err.log", "broker": "broker.log"}
 LOG_PAGE = 100
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -129,7 +133,9 @@ CREATE TABLE IF NOT EXISTS samples (
     kimi_workers INT,
     queue_workers INT,
     direct_workers INT,
-    queued_jobs INT
+    queued_jobs INT,
+    ds_queued INT,
+    kimi_queued INT
 )
 """
 MINUTES_SQL = """
@@ -170,11 +176,9 @@ JOBS_RECENT_SQL = """
 SELECT id, state, lane, tier, kind, verdict, label, submitted_at, started_at, finished_at
 FROM jobs ORDER BY submitted_at DESC LIMIT ?
 """
-SAMPLES_SQL = """
-SELECT ts, ds_workers, kimi_workers, queue_workers, direct_workers, queued_jobs
-FROM samples WHERE ts >= ? ORDER BY ts
-"""
-SAMPLE_INSERT_SQL = "INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?, ?, ?)"
+SAMPLE_INSERT_SQL = (
+    f"INSERT OR REPLACE INTO samples ({', '.join(SAMPLE_COLUMNS)}) VALUES ({', '.join('?' * len(SAMPLE_COLUMNS))})"
+)
 RUNS_SQL = """
 SELECT p.job AS job,
        MIN(p.first_ts) AS first_ts,
@@ -707,6 +711,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       sw.className = s.block ? "block" : "swatch";
       if (s.block) sw.style.background = s.color;
       else sw.style.borderColor = s.color;
+      if (s.dashed) sw.style.borderStyle = "dashed";
       key.appendChild(sw);
       key.appendChild(document.createTextNode(s.name));
       el.appendChild(key);
@@ -891,10 +896,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
           d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + Yc(v).toFixed(1);
           lastPoint = p;
         });
-        if (d) svgEl("path", {
+        var attrs = {
           d: d.trim(), fill: "none", stroke: s.color, "stroke-width": s.width || 2,
           "stroke-opacity": s.opacity === undefined ? 1 : s.opacity, "stroke-linejoin": "round", "stroke-linecap": "round"
-        }, svg);
+        };
+        if (s.dash) attrs["stroke-dasharray"] = s.dash;
+        if (d) svgEl("path", attrs, svg);
         if (cfg.y.clip !== undefined) {
           points.forEach(function (p) {
             if (p[s.key] > cfg.y.clip) {
@@ -1189,8 +1196,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var tb = d.token_bucket_s || bucket;
     var tunit = unitLabel(tb);
     var workers = (d.workers || []).map(function (w) {
-      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, queued: w.queued_jobs };
+      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued, unsplit: w.queued_unsplit };
     });
+    var firstSplit = workers.find(function (w) { return w.dsq !== null && w.dsq !== undefined; });
+    var unsplitName = firstSplit ? "Queued, unsplit (before " + hm(firstSplit.t) + ")" : "Queued, unsplit";
     var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
@@ -1218,7 +1227,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       series: [
         { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
-        { key: "queued", name: "Queued jobs", color: COLORS.s3 }
+        { key: "dsq", name: "DeepSeek queued", color: COLORS.s1, dash: "4 3" },
+        { key: "kimiq", name: "Kimi queued", color: COLORS.s2, dash: "4 3" },
+        { key: "unsplit", name: unsplitName, color: COLORS.muted, dash: "2 3", width: 1.25, opacity: 0.6 }
       ],
       y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
@@ -1246,7 +1257,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
       { name: "Kimi runs", color: COLORS.s2 },
-      { name: "Queued jobs", color: COLORS.s3 }
+      { name: "DeepSeek queued", color: COLORS.s1, dashed: true },
+      { name: "Kimi queued", color: COLORS.s2, dashed: true },
+      { name: unsplitName, color: COLORS.muted, dashed: true }
     ]);
     legendFor($("lg-tokens"), [
       { name: "Tokens billed", color: COLORS.s1, block: true },
@@ -1968,13 +1981,14 @@ def read_jobs(agentq_db: Path) -> dict:
     }
 
 
-def read_queued(agentq_db: Path) -> int:
-    """How many jobs are queued right now."""
+def read_queued_by_tier(agentq_db: Path) -> dict[str, int]:
+    """Jobs queued right now, counted per tier. Read-only."""
     connection = readonly_connection(agentq_db)
     try:
-        return int(connection.execute("SELECT COUNT(*) FROM jobs WHERE state = 'queued'").fetchone()[0])
+        rows = connection.execute("SELECT tier, COUNT(*) AS n FROM jobs WHERE state = 'queued' GROUP BY tier").fetchall()
     finally:
         connection.close()
+    return {row["tier"]: int(row["n"]) for row in rows}
 
 
 def read_caps(home: Path) -> dict[str, int]:
@@ -1992,14 +2006,24 @@ def read_caps(home: Path) -> dict[str, int]:
 
 
 def read_samples(dash_db: Path, since: float) -> list[dict]:
-    """Worker samples recorded at or after ``since``. Empty before the first sample exists."""
+    """Worker samples recorded at or after ``since``. Empty before the first sample exists.
+
+    A database written before the per-tier queue split has no split columns: those read as None. A sample with
+    a total but no split is reported as ``queued_unsplit``, so the chart never invents a per-tier figure.
+    """
     if not dash_db.exists():
         return []
     connection = readonly_connection(dash_db)
     try:
-        return [dict(row) for row in connection.execute(SAMPLES_SQL, (since,)).fetchall()]
+        present = {row[1] for row in connection.execute("PRAGMA table_info(samples)").fetchall()}
+        columns = ", ".join(c if c in present else f"NULL AS {c}" for c in SAMPLE_COLUMNS)
+        rows = [dict(row) for row in connection.execute(f"SELECT {columns} FROM samples WHERE ts >= ? ORDER BY ts", (since,))]
     finally:
         connection.close()
+    for row in rows:
+        split = row["ds_queued"] is not None
+        row["queued_unsplit"] = None if split or row["queued_jobs"] is None else row["queued_jobs"]
+    return rows
 
 
 def last_complete_minute(raw: dict[int, dict], until: int) -> int | None:
@@ -2142,7 +2166,7 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
     return buckets
 
 
-RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "queued_jobs")
+RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "ds_queued", "kimi_queued", "queued_unsplit")
 RUNS_AXIS_HEADROOM = 1.15
 RUNS_AXIS_MIN = 10
 RUNS_AXIS_STEPS = tuple(sorted({m * 10**k for k in range(7) for m in (1, 2, 5, 10, 20, 25, 50)}))
@@ -2179,7 +2203,9 @@ def bucket_workers(samples: list[dict], size: int) -> list[dict]:
     for start in sorted(groups):
         row: dict = {"ts": float(start)}
         for key in WORKER_KEYS:
-            values = [sample[key] for sample in groups[start] if sample[key] is not None]
+            if not any(key in sample for sample in groups[start]):
+                continue
+            values = [sample.get(key) for sample in groups[start] if sample.get(key) is not None]
             row[key] = round(sum(values) / len(values), 2) if values else None
         rows.append(row)
     return rows
@@ -3157,23 +3183,22 @@ def table_runs(runs: list[dict]) -> list[dict]:
     return tagged[:RUN_ROWS] + [run for run in runs if run["untagged"]]
 
 
+def ensure_split_columns(connection: sqlite3.Connection) -> None:
+    """Add the per-tier queue columns to a samples table written before they existed."""
+    present = {row[1] for row in connection.execute("PRAGMA table_info(samples)").fetchall()}
+    for column in SPLIT_COLUMNS:
+        if column not in present:
+            connection.execute(f"ALTER TABLE samples ADD COLUMN {column} INT")
+
+
 def write_sample(dash_db: Path, row: dict) -> None:
     """Store one worker sample and prune samples older than SAMPLE_KEEP_S. Never touches agentq.db."""
     dash_db.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(dash_db, timeout=DB_TIMEOUT_S)
     try:
         connection.execute(SAMPLES_DDL)
-        connection.execute(
-            SAMPLE_INSERT_SQL,
-            (
-                row["ts"],
-                row["ds_workers"],
-                row["kimi_workers"],
-                row["queue_workers"],
-                row["direct_workers"],
-                row["queued_jobs"],
-            ),
-        )
+        ensure_split_columns(connection)
+        connection.execute(SAMPLE_INSERT_SQL, tuple(row[column] for column in SAMPLE_COLUMNS))
         connection.execute("DELETE FROM samples WHERE ts < ?", (row["ts"] - SAMPLE_KEEP_S,))
         connection.commit()
     finally:
@@ -3184,11 +3209,15 @@ def sample_once(home: Path, ps_runner=run_ps, now: float | None = None) -> dict:
     """Take one worker sample. Raises when ps fails, so the gap shows instead of a false zero."""
     home = Path(home)
     now = time.time() if now is None else now
-    row = {"ts": now, **parse_workers(ps_runner()), "queued_jobs": None}
+    row = {"ts": now, **parse_workers(ps_runner()), "queued_jobs": None, "ds_queued": None, "kimi_queued": None}
     try:
-        row["queued_jobs"] = read_queued(home / "agentq.db")
+        by_tier = read_queued_by_tier(home / "agentq.db")
     except (sqlite3.Error, FileNotFoundError):
-        row["queued_jobs"] = None
+        by_tier = None
+    if by_tier is not None:
+        row["queued_jobs"] = sum(by_tier.values())
+        row["ds_queued"] = by_tier.get(DS_TIER, 0)
+        row["kimi_queued"] = by_tier.get(KIMI_TIER, 0)
     write_sample(home / DASH_DB_NAME, row)
     return row
 

@@ -224,6 +224,42 @@ class SamplerTest(unittest.TestCase):
         after = hashlib.sha256((self.home / "agentq.db").read_bytes()).hexdigest()
         self.assertEqual(before, after)
 
+    def test_queued_jobs_are_split_by_tier_in_the_sample(self) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(
+            "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label) "
+            "VALUES (?, 'queued', 'normal', 'pi-kimi', 'review', NULL, ?, NULL, NULL, 'kimi-wait')",
+            ("k" * 12, NOW - 5),
+        )
+        conn.commit()
+        conn.close()
+        row = dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
+        self.assertEqual((row["queued_jobs"], row["ds_queued"], row["kimi_queued"]), (2, 1, 1))
+        conn = sqlite3.connect(self.home / "dash.db")
+        stored = conn.execute("SELECT queued_jobs, ds_queued, kimi_queued FROM samples").fetchall()
+        conn.close()
+        self.assertEqual(stored, [(2, 1, 1)])
+
+    def test_old_samples_without_the_split_stay_unsplit_and_the_table_is_migrated(self) -> None:
+        dash_db = self.home / "dash.db"
+        conn = sqlite3.connect(dash_db)
+        conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
+                     "queue_workers INT, direct_workers INT, queued_jobs INT)")
+        conn.execute("INSERT INTO samples VALUES (?, 1, 0, 0, 0, 3)", (NOW - 600,))
+        conn.commit()
+        conn.close()
+        old = dash.read_samples(dash_db, NOW - 3600)
+        self.assertIsNone(old[0]["ds_queued"])
+        self.assertEqual(old[0]["queued_unsplit"], 3)
+        dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
+        conn = sqlite3.connect(dash_db)
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(samples)")]
+        conn.close()
+        self.assertIn("ds_queued", columns)
+        new = dash.read_samples(dash_db, NOW - 3600)
+        self.assertEqual([s["queued_unsplit"] for s in new], [3, None])
+        self.assertEqual(new[1]["ds_queued"], 1)
+
     def test_samples_older_than_seven_days_are_pruned(self) -> None:
         dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW - dash.SAMPLE_KEEP_S - 100)
         dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
@@ -1686,6 +1722,38 @@ def range_fixture(tmp: Path) -> Path:
 
 
 VERDICTS = ("PASS", "PARTIAL", "FAIL")
+
+
+class QueuedSplitChartTest(unittest.TestCase):
+    def test_worker_chart_plots_queued_per_tier_dashed_in_the_tier_hue(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-workers"')
+        block = html[start:html.index("var mix = d.token_mix", start)]
+        self.assertIn('{ key: "dsq", name: "DeepSeek queued", color: COLORS.s1, dash: "4 3" }', block)
+        self.assertIn('{ key: "kimiq", name: "Kimi queued", color: COLORS.s2, dash: "4 3" }', block)
+        self.assertIn('key: "unsplit"', block)
+        self.assertIn("dsq: w.ds_queued", html)
+        self.assertIn('{ key: "ds", name: "DeepSeek runs", color: COLORS.s1 }', block)
+        self.assertIn('{ key: "kimi", name: "Kimi runs", color: COLORS.s2 }', block)
+        self.assertNotIn("Queued jobs", block)
+        self.assertIn("stroke-dasharray", html)
+
+    def test_summary_workers_follow_the_selected_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            conn = sqlite3.connect(home / "dash.db")
+            conn.execute(dash.SAMPLES_DDL)
+            conn.executemany(
+                "INSERT INTO samples (ts, ds_workers, kimi_workers, queue_workers, direct_workers, queued_jobs, ds_queued, kimi_queued) "
+                "VALUES (?, 1, 0, 0, 0, 2, 1, 1)",
+                [(NOW - 2 * 3600,), (NOW - 600,)],
+            )
+            conn.commit()
+            conn.close()
+            one = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)["workers"]
+            six = dash.build_summary(home, 6, now=NOW, fetch_live=no_proxy)["workers"]
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(six), 2)
 
 
 class RangeConsistencyTest(unittest.TestCase):
