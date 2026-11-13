@@ -134,12 +134,34 @@ def proxy_available(status: dict | None) -> bool:
     return isinstance(status, dict) and bool(status.get("budgets")) and isinstance(status.get("budgets"), dict)
 
 
+def inflight_gate(status: dict) -> str | None:
+    """Hold filler while DeepSeek is at the in-flight limit and the limit is below its maximum.
+
+    When the limit is enforced, the test is requests held by it. In shadow or the A/B off arm nothing
+    is held, so the test is requests in flight at or above the limit the proxy would enforce, and the
+    reason says so. A limit at its maximum never holds filler here: the budgets decide that.
+    """
+    limit = status.get("inflight_limit")
+    maximum = status.get("inflight_max")
+    if not isinstance(limit, int) or not isinstance(maximum, int) or limit >= maximum:
+        return None
+    if status.get("inflight_enforcing") is True:
+        held = status.get("inflight_queued")
+        if isinstance(held, int) and held > 0:
+            return f"Morph slow: in-flight limit {limit} reached"
+        return None
+    in_flight = status.get("inflight_in_flight")
+    if isinstance(in_flight, int) and in_flight >= limit:
+        return f"Morph slow: in-flight limit {limit} reached (shadow: would limit to {limit})"
+    return None
+
+
 def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headroom | None, laptop_cfg: dict,
                 fill: dict) -> str | None:
     """Why filler must wait now, or None. Any one of these holds filler: the proxy status is unavailable,
-    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window, or the laptop past the
-    filler bars (CPU busy, memory free or swap used; stricter than the real-work bars so filler never pushes
-    real work out). An unreadable measure does not hold on its own."""
+    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window, the DeepSeek in-flight limit
+    reached, or the laptop past the filler bars (CPU busy, memory free or swap used; stricter than the
+    real-work bars so filler never pushes real work out). An unreadable measure does not hold on its own."""
     if not proxy_available(status):
         return "proxy status unavailable; filler held"
     blocked = ds_blocked(status)
@@ -147,6 +169,9 @@ def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headr
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
     if recent_429 > 0:
         return f"Morph gate: {recent_429} DeepSeek 429s in the last {int(fill['gate_429_window_s'])} s"
+    slow = inflight_gate(status)
+    if slow is not None:
+        return slow
     if laptop is None:
         return None
     breach = headroom_lib.pressure(
