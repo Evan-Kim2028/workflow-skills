@@ -105,10 +105,17 @@ instead of letting it swing between idle and burst.
   they are not judged and never change the ceiling. After a ceiling expires the
   controller may probe one step past it, and no further. While the long-run rate is
   unknown (fewer than `rate_min_samples` samples, so no busy workers yet) or below
-  `rate_min` (10k), the controller holds: no probes, no refills, no judgements. It
+  `rate_min` (10k), the controller holds, with one exception. With no busy DeepSeek
+  worker at all, it takes one bootstrap step of `step_workers` (4), judged against the
+  prior `bootstrap_rate` (150k per worker). Zero gain sets a ceiling at the real-job
+  count for `ceiling_ttl_s`, and no retry comes before that expires and the pool has
+  drained, so poor bootstraps cannot pile up idle workers. Good gain hands over to
+  measured probes once samples exist. It
   adds at most `step_workers` (4) per probe, and `max_workers` (64) caps everything.
   Above `high_frac` (0.97) of `target_billed_per_min` (8M) it stops, and it never kills
-  a running worker. Filler waits while real DeepSeek work is ready, while the proxy holds
+  a running worker. Filler is held with the reason "proxy status unavailable" when the
+  proxy's status is missing or empty. Filler waits while real DeepSeek work is ready,
+  while the proxy holds
   a DeepSeek request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and
   while the laptop is short of memory (`laptop_min_free_pct`, 20) or load
   (`laptop_max_load_per_cpu`, 1.0).
@@ -125,10 +132,12 @@ instead of letting it swing between idle and burst.
   the current Morph minute's uncached input, plus an estimate for each DeepSeek launch
   whose first request the proxy has not recorded yet, stays under `uncached_frac`
   (0.8) of `uncached_limit` (400k). The current minute comes from the proxy's live
-  `uncached_ds` budget (in-flight charges included), or from the store's current-minute
-  row when the proxy is down. Pending launches are running DeepSeek jobs started within
-  `first_request_grace_s` (120) with no `proxy_jobs` row, read from `jobs.started_at`, so
-  a broker restart keeps the count. The first-request cost is the `measure_percentile`
+  `uncached_ds` budget (in-flight charges included). When the proxy is unavailable it
+  falls back to the store's latest minute, the last known numbers. Pending launches are
+  running DeepSeek jobs with no `proxy_jobs` row, read from `jobs.started_at`. With the
+  proxy available they count only within `first_request_grace_s` (120); while it is
+  unavailable every such job counts, since nothing can be ruled out. A broker restart
+  keeps the count. The first-request cost is the `measure_percentile`
   (75th) of single-request DeepSeek jobs in `proxy_jobs`, once `min_measured_jobs` (20)
   are seen; otherwise `first_request_uncached` (40k). One urgent DeepSeek job per tick
   launches even when the allowance is spent.
