@@ -83,6 +83,7 @@ DEFAULT_TIERS = {"pi-kimi": 2, "pi-deepseek-flash": 48}
 DEFAULT_ADAPTIVE = {
     "enabled": True,
     "max_waiting_requests": 8,
+    "urgent_share": 0.7,
     "tests_floor": 4,
     "gauge_ttl_s": 15.0,
 }
@@ -270,7 +271,8 @@ def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) ->
     """Why a job for ``tier`` must wait on the Morph proxy, or None when it may launch.
 
     Returns (key, text). The key names the budget and threshold but not the live queue depth,
-    so a job held by a changing queue keeps one key. Urgent jobs never wait here. A normal job
+    so a job held by a changing queue keeps one key. Urgent jobs never wait here, and the launch loop
+    passes a normal job past its aging mark as urgent, so a steady stream of urgent work cannot starve it. A normal job
     waits while a budget its tier uses is holding more than ``max_waiting`` requests of the
     tier's own model family. A backlog job also waits while any such budget holds one of them.
     Requests from another family, such as Kimi's own uncached limit, never hold a DeepSeek job.
@@ -1144,9 +1146,14 @@ class Broker:
             tier_used[job["tier"]] = tier_used.get(job["tier"], 0) + 1
             res_used[job["res"]] = res_used.get(job["res"], 0) + 1
         busy_workspaces = {job["workspace"] for job in running if job["kind"] == "write"}
-        urgent_running = sum(1 for job in running if job["lane"] == "urgent")
-        urgent_cap = max(1, sum(cfg["slots"].values()) // 2)
-        others_waiting = any(job["lane"] != "urgent" for job in ready)
+        urgent_share = min(1.0, max(0.0, float(adaptive["urgent_share"])))
+        lane_used: dict[tuple[str, str], int] = {}
+        for job in running:
+            lane_used[(job["tier"], job["lane"])] = lane_used.get((job["tier"], job["lane"]), 0) + 1
+        normal_waiting: dict[str, int] = {}
+        for job in ready:
+            if job["lane"] == "normal":
+                normal_waiting[job["tier"]] = normal_waiting.get(job["tier"], 0) + 1
         saturated = bool(status and status.get("saturated"))
         laptop_cfg = cfg["laptop"]
         gauge_reading: list[headroom_lib.Headroom] = []
@@ -1167,13 +1174,25 @@ class Broker:
                 break
             name, reason = job["res"], None
             if on:
-                reason = morph_hold(job["tier"], job["lane"], status, adaptive["max_waiting_requests"])
+                gate_lane = job["lane"]
+                if queue_rank(job, now) == 0 or (
+                    job["lane"] == "normal"
+                    and lane_used.get((job["tier"], "normal"), 0) < (1 - urgent_share) * tier_used.get(job["tier"], 0)
+                ):
+                    gate_lane = "urgent"
+                reason = morph_hold(job["tier"], gate_lane, status, adaptive["max_waiting_requests"])
                 if reason:
                     name = job["tier"]
             elif saturated and job["lane"] == "backlog":
                 name, reason = job["tier"], plain_hold("proxy saturated")
-            if reason is None and job["lane"] == "urgent" and others_waiting and urgent_running >= urgent_cap:
-                reason = plain_hold("urgent share full")
+            if (
+                reason is None
+                and job["lane"] == "urgent"
+                and normal_waiting.get(job["tier"], 0) > 0
+                and lane_used.get((job["tier"], "urgent"), 0)
+                >= urgent_share * (tier_used.get(job["tier"], 0) + normal_waiting[job["tier"]])
+            ):
+                reason = plain_hold(f"urgent share full ({urgent_share:.0%} of {job['tier']} while normal jobs wait)")
             plan = None
             if reason is None and job["kind"] == "write":
                 try:
@@ -1208,8 +1227,9 @@ class Broker:
             res_used[job["res"]] = res_used.get(job["res"], 0) + 1
             if job["kind"] == "write":
                 busy_workspaces.add(job["workspace"])
-            if job["lane"] == "urgent":
-                urgent_running += 1
+            lane_used[(job["tier"], job["lane"])] = lane_used.get((job["tier"], job["lane"]), 0) + 1
+            if job["lane"] == "normal":
+                normal_waiting[job["tier"]] -= 1
             if self._launch(conn, job, now):
                 launched.append(job["id"])
                 if paced:

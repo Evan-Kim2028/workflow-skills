@@ -347,14 +347,27 @@ class LaneAndSlotTests(ProcessCleanup):
             broker.tick()
         self.assertEqual([call["id"] for call in launcher.calls], [a, d, c, b])
 
-    def test_urgent_holds_at_most_half_the_slots_while_others_wait(self):
-        write_config(self.home, slots={"light": 4, "tests": 0, "ssh": 0})
-        urgent = [submit(self.env, self.prompt, "--urgent", label=f"u{i}") for i in range(4)]
-        normal = submit(self.env, self.prompt, label="n")
+    def test_urgent_holds_at_most_its_share_while_normal_jobs_wait(self):
+        write_config(self.home, slots={"light": 10, "tests": 0, "ssh": 0})
+        urgent = [submit(self.env, self.prompt, "--urgent", label=f"u{i}") for i in range(6)]
+        normal = [submit(self.env, self.prompt, label=f"n{i}") for i in range(2)]
         launcher = self.fake(live_s=30)
         launched = make_broker(self.home, launcher).tick()
-        self.assertEqual(launched, urgent[:2] + [normal])
-        self.assertEqual(row(self.home, urgent[2])["state"], "queued")
+        self.assertEqual(launched, urgent[:5] + normal)
+        self.assertIn("urgent share full (70%", row(self.home, urgent[5])["detail"])
+
+    def test_urgent_takes_every_slot_when_no_normal_job_waits(self):
+        write_config(self.home, slots={"light": 4, "tests": 0, "ssh": 0})
+        urgent = [submit(self.env, self.prompt, "--urgent", label=f"u{i}") for i in range(4)]
+        self.assertEqual(make_broker(self.home, self.fake(live_s=30)).tick(), urgent)
+
+    def test_normal_jobs_below_their_share_launch_past_the_morph_gate(self):
+        write_config(self.home, slots={"light": 10, "tests": 0, "ssh": 0})
+        urgent = [submit(self.env, self.prompt, "--urgent", label=f"u{i}") for i in range(4)]
+        normal = [submit(self.env, self.prompt, label=f"n{i}") for i in range(4)]
+        broker = make_broker(self.home, self.fake(live_s=30), proxy=lambda: proxy_doc(total=50))
+        self.assertEqual(broker.tick(), urgent + normal[:2])
+        self.assertEqual(row(self.home, normal[2])["detail"], "hold pi-deepseek-flash: proxy total waiting 50 > 8")
 
     def test_resource_and_tier_slot_limits(self):
         write_config(self.home, slots={"light": 3, "tests": 1, "ssh": 0}, tiers={"pi-kimi": 1})
@@ -833,6 +846,16 @@ class AdaptiveAdmissionTests(ProcessCleanup):
     def test_urgent_jobs_ignore_the_morph_gate(self):
         urgent = submit(self.env, self.prompt, "--urgent", label="urgent")
         self.assertEqual(self.broker(proxy=lambda: proxy_doc(total=50)).tick(), [urgent])
+
+    def test_a_normal_job_past_its_aging_mark_ignores_the_morph_gate(self):
+        aged = submit(self.env, self.prompt, label="aged")
+        fresh = submit(self.env, self.prompt, label="fresh")
+        conn = db.connect(self.home)
+        conn.execute("UPDATE jobs SET priority_age_at = 0 WHERE id = ?", (aged,))
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.broker(proxy=lambda: proxy_doc(total=50)).tick(), [aged])
+        self.assertEqual(row(self.home, fresh)["detail"], "hold pi-deepseek-flash: proxy total waiting 50 > 8")
 
     def test_backlog_also_needs_its_budgets_queue_empty(self):
         backlog = submit(self.env, self.prompt, "--backlog", label="backlog")

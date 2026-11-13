@@ -61,6 +61,7 @@ SUSPENDED = "suspended"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 RESERVE_REFILL_S = 30 * 60.0
 RESERVE_TARGET_CEILING = 1.0
+URGENT_SHARE = 0.7
 UNCACHED_RATIO_FLOOR = 0.25
 UNCACHED_RATIO_CEIL = 1.25
 UNCACHED_RATIO_ALPHA = 0.05
@@ -1629,7 +1630,7 @@ class Governor:
         refusal is CAPACITY when the budget is full to its target, RESERVE when a backlog ticket would
         take the budget past ``backlog_max_frac`` of its target (the rest is kept for normal and urgent
         work), and GUARD when the budget has room and only the urgent share guard refuses: urgent
-        tickets may hold at most half of a budget while lower lanes wait. A budget with no charges
+        tickets may hold at most URGENT_SHARE (70%) of a budget while lower lanes wait, matching the broker's launch share. A budget with no charges
         in the window always admits one request, even an oversized one, so a large request cannot
         wait forever.
         """
@@ -1649,7 +1650,7 @@ class Governor:
                     return budget, RESERVE
             if ticket.lane == "urgent" and lower_waiting:
                 urgent_used = self._used(budget, lane="urgent")
-                if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
+                if urgent_used > 0 and urgent_used + estimate > URGENT_SHARE * cap:
                     return budget, GUARD
         return None
 
