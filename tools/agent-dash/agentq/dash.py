@@ -441,7 +441,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute; the bold line is the trailing 5-minute average of those minutes (the mean of that minute and the four before it). The dashed line is the limit; carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The dotted line is the average of those minutes over the selected range, from the first recorded minute, with idle minutes counted as zero; it is the same figure as the total pool tile. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -724,6 +724,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       if (s.block) sw.style.background = s.color;
       else sw.style.borderColor = s.color;
       if (s.dashed) sw.style.borderStyle = "dashed";
+      if (s.dotted) sw.style.borderStyle = "dotted";
       key.appendChild(sw);
       key.appendChild(document.createTextNode(s.name));
       el.appendChild(key);
@@ -850,7 +851,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
     var refs = (cfg.refs || []).slice();
     refs.forEach(function (r) {
-      svgEl("line", { x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: "var(--ink-3)", "stroke-width": 1, "stroke-dasharray": "5 4" }, svg);
+      svgEl("line", {
+        x1: m.l, x2: W - m.r, y1: Y(r.v), y2: Y(r.v), stroke: r.color || "var(--ink-3)", "stroke-width": r.width || 1,
+        "stroke-dasharray": r.dash || "5 4", "stroke-linecap": r.dash ? "round" : "butt"
+      }, svg);
+      if (r.end) {
+        svgEl("text", {
+          x: W - m.r - 4, y: Y(r.v) - 6, "text-anchor": "end", class: "direct",
+          style: "fill: " + (r.color || "var(--ink-3)") + "; stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
+        }, svg).textContent = r.label;
+      }
     });
     (cfg.offScale || []).forEach(function (text, i) {
       svgEl("text", {
@@ -858,7 +868,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         style: "fill: var(--ink-3); stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
       }, svg).textContent = text;
     });
-    var refPlaced = refs.map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
+    var refPlaced = refs.filter(function (r) { return !r.end; }).map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
       .sort(function (a, b) { return a.y - b.y; });
     refPlaced.forEach(function (r, i) {
       if (i && r.y - refPlaced[i - 1].y < 13) r.y = refPlaced[i - 1].y + 13;
@@ -1225,11 +1235,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: minutes,
       series: [
-        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 },
-        { key: "pct_total_avg5", name: "5-min average", color: COLORS.s2, width: 2.5 }
+        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }
       ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
-      refs: [{ v: 1, label: "Morph limit (10M/min)" }],
+      refs: [{ v: 1, label: "Morph limit (10M/min)" }].concat(
+        d.range_avg_pct_total === null || d.range_avg_pct_total === undefined ? [] : [{
+          v: d.range_avg_pct_total,
+          label: "avg " + RANGE_LABEL[d.hours] + ": " + Math.round(d.range_avg_pct_total * 100) + "%",
+          color: COLORS.s3, dash: "1 4", width: 2, end: true
+        }]
+      ),
       fmt: pctFmt
     });
     registerChart("c-workers", {
@@ -1265,7 +1280,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
       { name: "Per minute", color: COLORS.s1 },
-      { name: "5-min average", color: COLORS.s2 }
+      { name: "Average, " + RANGE_LABEL[d.hours], color: COLORS.s3, dotted: true }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -2179,17 +2194,20 @@ def apply_admitted_totals(points: list[dict], admitted: dict[int, int]) -> None:
             point["total_source"] = "completed"
 
 
-def add_trailing_average(points: list[dict], source: str, target: str, window: int) -> None:
-    """Set ``target`` on each point to the mean of ``source`` over it and the window - 1 minutes before it.
+def range_average_pct(minute_points: list[dict], until: int) -> float | None:
+    """Mean of ``pct_total`` over the selected range's minutes, from the first minute the chart plots to the last complete one.
 
-    Points are consecutive minutes (``minute_series`` fills gaps with zero), so a window is a time window.
-    The first window - 1 points have no full window and get None, which the chart draws as a gap.
+    The same minute points the chart draws: an idle minute between recorded minutes is zero, and so is an idle
+    minute after the last recorded one. None when the range has no minute points.
     """
-    for i, point in enumerate(points):
-        if i < window - 1:
-            point[target] = None
-        else:
-            point[target] = round(sum(p[source] for p in points[i - window + 1:i + 1]) / window, 4)
+    if not minute_points:
+        return None
+    first = minute_points[0]["t"]
+    by_minute = {point["t"]: point["pct_total"] for point in minute_points}
+    stamps = range(first, until, 60)
+    if not stamps:
+        return None
+    return round(sum(by_minute.get(t, 0.0) for t in stamps) / len(stamps), 4)
 
 
 def bucket_minutes(points: list[dict], size: int) -> list[dict]:
@@ -2218,8 +2236,6 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
         for key in PCT_KEYS:
             bucket[key] = round(sum(m[key] for m in members) / len(members), 4)
         bucket["r429_per_min"] = round(bucket["r429"] / len(members), 2)
-        averaged = [m["pct_total_avg5"] for m in members if m.get("pct_total_avg5") is not None]
-        bucket["pct_total_avg5"] = round(sum(averaged) / len(averaged), 4) if averaged else None
         buckets.append(bucket)
     return buckets
 
@@ -3207,21 +3223,21 @@ def build_summary(
     caps = read_caps(home)
     targets = live_targets(live)
     resolved = resolve_limits(live)
+    minute_points = minute_series(raw, since, until)
+    apply_admitted_totals(minute_points, admitted)
+    range_avg_total = range_average_pct(minute_points, until)
     limits = {
         name: {
             "label": LIMIT_LABELS[name],
             "limit": LIMITS[name],
             "last_min_frac": last_minute_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "avg_5m_frac": average_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
-            "range_avg_frac": range_average_fraction(raw, since, until, LIMIT_KEYS[name], LIMITS[name]),
+            "range_avg_frac": range_avg_total if name == "total" else range_average_fraction(raw, since, until, LIMIT_KEYS[name], LIMITS[name]),
             "target_frac": targets[name],
         }
         for name in LIMIT_KEYS
     }
     runs = shape_runs(run_rows, now)
-    minute_points = minute_series(raw, since, until)
-    apply_admitted_totals(minute_points, admitted)
-    add_trailing_average(minute_points, "pct_total", "pct_total_avg5", LIMIT_WINDOW_MINUTES)
     minutes = bucket_minutes(minute_points, bucket)
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
@@ -3267,6 +3283,7 @@ def build_summary(
         "r429_60m": recent_429s(raw, until),
         "ds_uncached_rejections": budget_rejections(calib_429s, "uncached_ds", since, until),
         "ds_output_5m_per_min": deepseek_output_rate(raw, until),
+        "range_avg_pct_total": range_avg_total,
         "bucket_s": bucket,
         "minutes": minutes,
         "token_mix": mix,

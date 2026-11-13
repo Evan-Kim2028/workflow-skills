@@ -1088,29 +1088,72 @@ class YAxisLabelTest(unittest.TestCase):
         self.assertEqual(html.count("margin: PAIR_LAYOUT.margin"), 3)
 
 
-class TrailingAverageTest(unittest.TestCase):
-    def test_five_minute_trailing_mean_with_gaps_before_the_first_full_window(self) -> None:
-        points = [{"pct_total": v} for v in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)]
-        dash.add_trailing_average(points, "pct_total", "pct_total_avg5", 5)
-        self.assertEqual([p["pct_total_avg5"] for p in points[:4]], [None, None, None, None])
-        self.assertEqual([p["pct_total_avg5"] for p in points[4:]], [0.3, 0.4, 0.5])
+class RangeAverageLineTest(unittest.TestCase):
+    """The dotted average is the mean of the chart's own minute points over the selected range, idle minutes as zero."""
 
-    def test_bucketed_points_average_the_minute_averages_they_contain(self) -> None:
-        minutes = [dash.minute_point(60 * i, {"total": (i + 1) * 1_000_000}) for i in range(10)]
-        dash.add_trailing_average(minutes, "pct_total", "pct_total_avg5", 5)
-        buckets = dash.bucket_minutes(minutes, 300)
-        self.assertEqual([b["pct_total_avg5"] for b in buckets], [0.3, 0.6])
+    AGES = (30 * 60, 2 * 3600, 10 * 3600, 3 * 24 * 3600)
+    TOTALS = (2_000_000, 4_000_000, 6_000_000, 8_000_000)
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        home = Path(self.tmp.name) / "agentq"
+        home.mkdir()
+        conn = sqlite3.connect(home / "agentq.db")
+        conn.execute(PROXY_MINUTES_DDL)
+        conn.executemany(
+            f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(minute_at(age), "morph-dsv41flash-1017", 1, 1, 0, total, 0, 0, 0, 0, 0, 0.9)
+             for age, total in zip(self.AGES, self.TOTALS)],
+        )
+        conn.commit()
+        conn.close()
+        self.home = home
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def expected(self, hours: int) -> float:
+        """Independent of the code under test: the sum of the in-range totals over the minutes from the first recorded one."""
+        in_range = [(age, total) for age, total in zip(self.AGES, self.TOTALS) if age <= hours * 3600]
+        minutes = max(age for age, _ in in_range) // 60
+        return round(sum(total for _, total in in_range) / 10_000_000 / minutes, 4)
+
+    def test_average_line_is_the_range_mean_of_the_minute_points_for_each_range(self) -> None:
+        for hours in (1, 6, 24, 168):
+            with self.subTest(hours=hours):
+                summary = dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)
+                self.assertEqual(summary["range_avg_pct_total"], self.expected(hours))
+
+    def test_each_range_gives_a_different_average(self) -> None:
+        values = [dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)["range_avg_pct_total"] for hours in (1, 6, 24, 168)]
+        self.assertEqual(len(set(values)), 4, values)
+
+    def test_total_pool_tile_uses_the_same_average_as_the_chart(self) -> None:
+        for hours in (1, 6):
+            summary = dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)
+            self.assertEqual(summary["limits"]["total"]["range_avg_frac"], summary["range_avg_pct_total"])
+
+    def test_idle_minutes_inside_the_range_count_as_zero(self) -> None:
+        points = [{"t": 0, "pct_total": 0.6}, {"t": 180, "pct_total": 0.3}]
+        self.assertEqual(dash.range_average_pct(points, 240), round((0.6 + 0 + 0 + 0.3) / 4, 4))
+
+    def test_no_minute_points_means_no_average_line(self) -> None:
+        self.assertIsNone(dash.range_average_pct([], 600))
 
 
 class EnforcedLimitsChartTest(unittest.TestCase):
-    def test_main_billed_chart_has_the_per_minute_line_and_its_five_minute_average(self) -> None:
+    def test_main_billed_chart_has_the_per_minute_line_and_a_dotted_range_average(self) -> None:
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-billed"')
         block = html[start:html.index('registerChart("c-workers"')]
-        self.assertEqual(block.count('key: "pct_'), 2)
+        self.assertEqual(block.count('key: "pct_'), 1)
+        self.assertNotIn("pct_total_avg5", html)
+        self.assertNotIn("5-min average", html)
         self.assertIn('{ key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }', block)
-        self.assertIn('{ key: "pct_total_avg5", name: "5-min average", color: COLORS.s2, width: 2.5 }', block)
-        self.assertIn("Morph limit (10M/min)", block)
+        self.assertIn('color: COLORS.s3, dash: "1 4", width: 2, end: true', block)
+        self.assertIn('"Average, " + RANGE_LABEL[d.hours]', html)
+        self.assertIn('"avg " + RANGE_LABEL[d.hours] + ": "', block)
+        self.assertIn('Morph limit (10M/min)', block)
         self.assertNotIn("pct_ds_uncached", block)
         self.assertNotIn("70k", block)
 
