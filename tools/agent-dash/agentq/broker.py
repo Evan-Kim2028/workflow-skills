@@ -998,8 +998,7 @@ class Broker:
         """
         if not pacing["enabled"]:
             return None
-        current, source = fill_lib.current_uncached(status, conn, now)
-        pending = fill_lib.pending_launches(conn, now, pacing["first_request_grace_s"])
+        current, source, pending = fill_lib.pacing_inputs(conn, now, status, pacing)
         left, cost = fill_lib.pacing_allowance(current, pending, pacing, self._measured_cost(conn, now, pacing))
         cap = pacing["uncached_frac"] * pacing["uncached_limit"]
         text = (f"proxy uncached pacing: {current:,} uncached this minute ({source}), {pending} pending "

@@ -61,6 +61,7 @@ DEFAULT_FILL = {
     "rate_window_s": 1800.0,
     "rate_min_samples": 3,
     "rate_min": 10_000.0,
+    "bootstrap_rate": 150_000.0,
     "gate_429_window_s": 120.0,
     "laptop_min_free_pct": 20.0,
     "laptop_max_load_per_cpu": 1.0,
@@ -129,12 +130,17 @@ def ds_blocked(status: dict | None) -> int:
     return total
 
 
+def proxy_available(status: dict | None) -> bool:
+    """True when the proxy answered with a status that has budgets. None, or an empty document, is unavailable."""
+    return isinstance(status, dict) and bool(status.get("budgets")) and isinstance(status.get("budgets"), dict)
+
+
 def gate_reason(status: dict | None, recent_429: int, laptop: tuple, fill: dict) -> str | None:
-    """Why filler must wait now, or None. Any one of these holds filler: no proxy reading, DeepSeek
-    requests blocked at the proxy, a DeepSeek 429 in the recent window, or the laptop short of memory
-    or CPU. An unreadable gauge does not hold on its own."""
-    if status is None:
-        return "no proxy status; filler waits"
+    """Why filler must wait now, or None. Any one of these holds filler: the proxy status is unavailable,
+    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window, or the laptop short of
+    memory or CPU. An unreadable gauge does not hold on its own."""
+    if not proxy_available(status):
+        return "proxy status unavailable; filler held"
     blocked = ds_blocked(status)
     if blocked > 0:
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
@@ -222,22 +228,45 @@ class FillController:
         if added <= 0:
             self.judgement = "step void: no filler worker started, nothing to judge"
             return
-        rate = self.measured_rate(now, step["start"], fill)
+        bootstrap = step.get("bootstrap", False)
+        rate = fill["bootstrap_rate"] if bootstrap else self.measured_rate(now, step["start"], fill)
         if rate is None:
             self.judgement = "step not judged: per-worker rate unknown"
             return
         gain = (billed_avg - step["avg_before"]) / added
         if gain > 0 and gain >= fill["min_marginal_frac"] * rate:
             self.last_ceiling = None
-            self.judgement = f"step of {added} judged good: {gain:,.0f} per added worker against {rate:,.0f}"
+            kind = "bootstrap step" if bootstrap else "step"
+            self.judgement = f"{kind} of {added} judged good: {gain:,.0f} per added worker against {rate:,.0f}"
             return
-        workers = max(step["workers_before"], self.last_ceiling or 0, real_running)
+        if bootstrap:
+            workers = real_running
+        else:
+            workers = max(step["workers_before"], self.last_ceiling or 0, real_running)
         self.ceiling = (workers, now)
         self.last_ceiling = workers
         self.peak = active
         self.new_ceiling = self.ceiling
         self.judgement = (f"step of {added} judged poor: {gain:,.0f} per added worker against "
                           f"{rate:,.0f} per worker; ceiling {workers} workers")
+
+    def _bootstrap(self, now: float, fill: dict, active: int, billed_avg: float, queued_filler: int,
+                   average: str) -> FillPlan:
+        """With no measured per-worker rate and no busy DeepSeek worker, take one bootstrap step judged against the
+        prior rate.
+
+        It waits while any worker is busy (so poor bootstraps cannot pile up idle filler), while a ceiling is
+        fresh, while filler is still queued, and at the worker cap. A poor bootstrap sets a ceiling at the real
+        count, so the next one comes only after the ceiling expires and the pool has drained.
+        """
+        to_add = min(int(fill["step_workers"]), int(fill["max_workers"]) - active - queued_filler)
+        if active > 0 or self.active_ceiling(now, fill) is not None or queued_filler > 0 or to_add <= 0:
+            return FillPlan(True, 0, "per-worker rate unknown; bootstrap waits on a ceiling, queued filler or the cap",
+                            "rate-unknown")
+        self.step = {"start": now, "workers_before": active, "avg_before": billed_avg, "added": to_add,
+                     "bootstrap": True}
+        return FillPlan(True, to_add, f"{average}; no measured per-worker rate, so one bootstrap step of {to_add} "
+                        f"filler workers judged at the prior {fill['bootstrap_rate']:,.0f} per worker", "bootstrap")
 
     def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int,
              real_running: int, ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
@@ -268,7 +297,7 @@ class FillController:
             left = max(0.0, fill["step_interval_s"] - (now - self.step["start"]))
             return FillPlan(True, 0, f"step of {self.step['added']} in progress; judged in {left:.0f} s", "step-wait")
         if self.measured_rate(now, now, fill) is None:
-            return FillPlan(True, 0, "per-worker rate unknown or below rate_min; holding, no steps", "rate-unknown")
+            return self._bootstrap(now, fill, active, billed_avg, queued_filler, average)
         limit, cause = self.worker_limit(now, fill, real_running)
         room = limit - active - queued_filler
         if room <= 0:
@@ -334,8 +363,7 @@ def decide(
         real_running=counts["running_ds"] - counts["running_filler"],
         ready_real=counts["ready_real"], queued_filler=counts["queued_filler"], gate=gate,
     )
-    current, source = current_uncached(status, conn, now)
-    pending = pending_launches(conn, now, pacing["first_request_grace_s"])
+    current, source, pending = pacing_inputs(conn, now, status, pacing)
     left, cost = pacing_allowance(current, pending, pacing, measured)
     return Decision(
         plan=plan, billed_avg=billed_avg, active_now=active, direct_ds=direct,
@@ -386,32 +414,47 @@ def current_uncached(status: dict | None, conn, now: float) -> tuple[int, str]:
         return int(budget["used_60s"]), "proxy"
     try:
         row = conn.execute(
-            "SELECT COALESCE(SUM(input), 0) FROM proxy_minutes WHERE model LIKE ? AND minute = ?",
+            """SELECT SUM(input) FROM proxy_minutes WHERE model LIKE ? AND minute <= ?
+               GROUP BY minute ORDER BY minute DESC LIMIT 1""",
             (DS_MODEL_LIKE, minute_stamp(now)),
         ).fetchone()
     except sqlite3.OperationalError:
         return 0, "store"
-    return int(row[0]), "store"
+    return (int(row[0] or 0) if row else 0), "store"
 
 
-def pending_launches(conn, now: float, grace_s: float) -> int:
-    """DeepSeek jobs started within ``grace_s`` whose first request the proxy has not recorded yet.
+def pacing_inputs(conn, now: float, status: dict | None, pacing: dict) -> tuple[int, str, int]:
+    """(current uncached input, its source, pending launches) for the pacing allowance.
+
+    With the proxy available, a requestless launch counts only inside the first-request grace period.
+    With it unavailable, every requestless launch counts: the proxy is not seeing traffic, so nothing
+    can be ruled out, and the store's last known minute stands in for the current one.
+    """
+    current, source = current_uncached(status, conn, now)
+    grace = pacing["first_request_grace_s"] if proxy_available(status) else None
+    return current, source, pending_launches(conn, now, grace)
+
+
+def pending_launches(conn, now: float, grace_s: float | None) -> int:
+    """DeepSeek jobs whose first request the proxy has not recorded yet.
 
     A job with a proxy_jobs row has been seen (its usage is in the live budget). A job without one may
-    still be starting, so it counts at the first-request estimate. Each launch is counted once, and the
-    count comes from the store, so a broker restart keeps it.
+    still be starting, so it counts at the first-request estimate. With ``grace_s`` only jobs started
+    within it count; None counts every such job. Each launch is counted once, and the count comes from
+    the store, so a broker restart keeps it.
     """
-    since = now - grace_s
+    since = None if grace_s is None else now - grace_s
     try:
         row = conn.execute(
-            """SELECT COUNT(*) FROM jobs j WHERE j.state = 'running' AND j.tier = ? AND j.started_at >= ?
+            """SELECT COUNT(*) FROM jobs j WHERE j.state = 'running' AND j.tier = ?
+               AND (? IS NULL OR j.started_at >= ?)
                AND NOT EXISTS (SELECT 1 FROM proxy_jobs p WHERE p.job = j.id AND p.model LIKE ?)""",
-            (DS_TIER, since, DS_MODEL_LIKE),
+            (DS_TIER, since, since, DS_MODEL_LIKE),
         ).fetchone()
     except sqlite3.OperationalError:
         row = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'running' AND tier = ? AND started_at >= ?",
-            (DS_TIER, since),
+            "SELECT COUNT(*) FROM jobs WHERE state = 'running' AND tier = ? AND (? IS NULL OR started_at >= ?)",
+            (DS_TIER, since, since),
         ).fetchone()
     return int(row[0])
 

@@ -72,11 +72,48 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(tick(ctl, NOW, 1e6, 10, paused=True).key, "paused")
         self.assertIsNone(ctl.step)
 
-    def test_an_unknown_rate_holds_everything(self):
+    def test_an_unknown_rate_with_busy_workers_holds_everything(self):
         ctl = F.FillController()
         plan = tick(ctl, NOW, 1_000_000, 8)
         self.assertEqual((plan.submit, plan.key), (0, "rate-unknown"))
         self.assertIsNone(ctl.step)
+
+    def test_empty_pool_at_night_takes_one_bootstrap_step_then_grows_only_on_good_gains(self):
+        ctl = F.FillController()
+        active, now, plans, judgements = 0, NOW, [], []
+        for _ in range(int(2 * 3600 / 2)):
+            plan = tick(ctl, now, 150_000.0 * active, active)
+            plans.append(plan)
+            if ctl.judgement:
+                judgements.append(ctl.judgement)
+                ctl.judgement = None
+            active += plan.submit
+            now += 2
+        bootstraps = [p for p in plans if p.key == "bootstrap"]
+        self.assertEqual([p.submit for p in bootstraps], [4])
+        self.assertEqual(judgements[0], "bootstrap step of 4 judged good: 150,000 per added worker against 150,000")
+        self.assertGreaterEqual(150_000.0 * active, 0.9 * 8_000_000)
+        self.assertIsNone(ctl.new_ceiling)
+        self.assertGreater(sum(1 for p in plans if p.key == "stepping"), 1)
+
+    def test_a_zero_gain_bootstrap_stops_at_a_ceiling_and_retries_only_after_it_expires(self):
+        ctl = F.FillController()
+        now, plans, launches = NOW, [], []
+        active = 0
+        for _ in range(int(7200 / 2)):
+            launches = [(t, n) for t, n in launches if now - t < 600]
+            active = sum(n for _, n in launches)
+            plan = tick(ctl, now, 0.0, active)
+            if plan.submit:
+                launches.append((now, plan.submit))
+            plans.append((now, plan))
+            now += 2
+        starts = [t for t, p in plans if p.key == "bootstrap"]
+        self.assertEqual(starts[0], NOW)
+        self.assertEqual(len(starts), 4)
+        self.assertTrue(all(b - a >= 1800 for a, b in zip(starts, starts[1:])))
+        self.assertIn("ceiling 0 workers", ctl.judgement)
+        self.assertTrue(all(p.submit in (0, 4) for _, p in plans))
 
     def test_zero_billed_ticks_with_four_busy_workers_never_grow_or_clear_a_ceiling(self):
         ctl = F.FillController(ceiling=(47, NOW))
@@ -96,6 +133,12 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual((plan.submit, plan.key), (4, "stepping"))
         self.assertEqual(tick(ctl, NOW + 2, 1_400_000, 8).key, "step-wait")
         self.assertEqual(tick(ctl, NOW + 2, 1_400_000, 8).submit, 0)
+
+    def test_no_proxy_status_holds_the_controller_with_its_reason(self):
+        ctl = seeded()
+        plan = tick(ctl, NOW, 1_400_000, 8, gate="proxy status unavailable; filler held")
+        self.assertEqual((plan.submit, plan.key), (0, "gate"))
+        self.assertIn("proxy status unavailable", plan.reason)
 
     def test_real_work_and_gates_hold_before_a_step_starts(self):
         self.assertEqual(tick(seeded(), NOW, 1e6, 10, ready_real=2).key, "real-ready")
@@ -198,6 +241,17 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(ctl.measured_rate(NOW, NOW, FILL))
 
 
+class ProxyUnavailableTests(unittest.TestCase):
+    def test_no_status_and_an_empty_status_are_unavailable(self):
+        self.assertFalse(F.proxy_available(None))
+        self.assertFalse(F.proxy_available({}))
+        self.assertTrue(F.proxy_available(status_doc()))
+
+    def test_filler_is_held_with_the_proxy_unavailable_reason(self):
+        for status in (None, {}):
+            self.assertEqual(F.gate_reason(status, 0, (90.0, 0.1), FILL), "proxy status unavailable; filler held")
+
+
 class PacingTests(unittest.TestCase):
     def test_the_default_launch_cost_is_40k_against_80_percent_of_400k(self):
         self.assertEqual(F.pacing_allowance(0, 0, PACING, None), (8, 40_000))
@@ -231,6 +285,41 @@ class SectionAndWorkerTests(unittest.TestCase):
         ])
         self.assertEqual(F.direct_ds_workers(ps), 1)
         self.assertIsNone(F.direct_ds_workers(None))
+
+
+class PendingWhileUnreachableTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.conn = db.connect(Path(tmp.name) / "home")
+        self.addCleanup(self.conn.close)
+        self.conn.execute(
+            "CREATE TABLE proxy_minutes (minute TEXT, model TEXT, input INT, cache_read INT, output INT, r429 INT,"
+            " PRIMARY KEY (minute, model))"
+        )
+        self.conn.execute(
+            "CREATE TABLE proxy_jobs (job TEXT, model TEXT, req INT, input INT, first_ts REAL, last_ts REAL,"
+            " PRIMARY KEY (job, model))"
+        )
+        db.insert_job(self.conn, {
+            "id": "old", "lane": "normal", "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
+            "label": "x", "workspace": "/tmp", "session": "sess", "harness": "pi", "prompt_path": "/tmp/p",
+        }, NOW)
+        self.conn.execute("UPDATE jobs SET state = 'running', started_at = ? WHERE id = 'old'", (NOW - 3600,))
+
+    def test_a_requestless_launch_older_than_the_grace_counts_only_while_unreachable(self):
+        self.assertEqual(F.pending_launches(self.conn, NOW, 120), 0)
+        self.assertEqual(F.pending_launches(self.conn, NOW, None), 1)
+
+    def test_pacing_inputs_drop_the_grace_only_when_the_proxy_is_unavailable(self):
+        pacing = F.section(None, F.DEFAULT_PACING)
+        self.assertEqual(F.pacing_inputs(self.conn, NOW, status_doc(), pacing)[2], 0)
+        self.assertEqual(F.pacing_inputs(self.conn, NOW, None, pacing)[2], 1)
+
+    def test_unreachable_pacing_uses_the_store_last_known_minute(self):
+        self.conn.execute("INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?)",
+                          (stamp(NOW - 120), DS_MODEL, 300_000, 0, 0, 0))
+        self.assertEqual(F.current_uncached(None, self.conn, NOW), (300_000, "store"))
 
 
 class StoreTest(unittest.TestCase):
@@ -315,7 +404,7 @@ class StoreTest(unittest.TestCase):
             self.conn, NOW, controller=F.FillController(), fill=FILL, pacing=PACING, status=status, ps_text="",
             laptop=(90.0, 0.2), paused=False, measured=None,
         )
-        self.assertEqual((decision.plan.submit, decision.plan.key), (0, "rate-unknown"))
+        self.assertEqual((decision.plan.submit, decision.plan.key), (4, "bootstrap"))
         self.assertEqual(decision.billed_avg, 20_000)
         self.assertEqual(decision.direct_ds, 0)
         self.assertEqual(decision.pacing_current, 100_000)
@@ -545,6 +634,34 @@ class BrokerWiringTest(unittest.TestCase):
         self.assertEqual(normal["state"], "queued")
         self.assertIn("proxy uncached pacing", normal["detail"])
         self.assertIn("390,000 uncached this minute (proxy)", normal["detail"])
+
+
+class ProxyDownBrokerTest(BrokerWiringTest):
+    def test_with_no_proxy_status_filler_is_held_and_the_log_says_why(self):
+        self.set_billed(1_000_000)
+        self.status = None
+        self.tick(self.broker())
+        self.assertEqual(self.filler_jobs(), [])
+        self.assertIn("proxy status unavailable", self.log_text())
+
+    def test_unreachable_proxy_keeps_one_urgent_launch_and_paces_normal_jobs_on_store_numbers(self):
+        self.write_json("broker.json", {"fill": {"enabled": False}, "pacing": {"enabled": True}})
+        self.status = None
+        self.conn.execute("INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?)",
+                          (stamp(NOW), DS_MODEL, 390_000, 0, 0, 0))
+        for job_id, lane in (("normal-1", "normal"), ("urgent-1", "urgent")):
+            db.insert_job(self.conn, {
+                "id": job_id, "lane": lane, "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
+                "label": f"hub-exec-{job_id}", "workspace": str(self.ws), "session": "sess-a", "harness": "pi",
+                "prompt_path": str(self.prompt),
+            }, NOW)
+        broker = self.broker()
+        self.tick(broker)
+        self.assertIn("urgent-1", broker._inflight)
+        self.assertNotIn("normal-1", broker._inflight)
+        normal = db.get_job(self.conn, "normal-1")
+        self.assertIn("proxy uncached pacing", normal["detail"])
+        self.assertIn("390,000 uncached this minute (store)", normal["detail"])
 
 
 class NeverPool:
