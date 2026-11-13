@@ -438,14 +438,14 @@ def job_counts(conn, now: float) -> dict[str, int]:
     """DeepSeek jobs by role: running (queue and filler), ready real (urgent or normal lane), queued and
     running filler."""
     row = conn.execute(
-        """SELECT
-             SUM(CASE WHEN state = 'running' AND tier = ? THEN 1 ELSE 0 END) AS running_ds,
-             SUM(CASE WHEN state = 'queued' AND tier = ? AND lane IN ('urgent', 'normal')
-                       AND not_before <= ? THEN 1 ELSE 0 END) AS ready_real,
-             SUM(CASE WHEN state = 'queued' AND label LIKE ? THEN 1 ELSE 0 END) AS queued_filler,
-             SUM(CASE WHEN state = 'running' AND label LIKE ? THEN 1 ELSE 0 END) AS running_filler
-           FROM jobs""",
-        (DS_TIER, DS_TIER, now, FILLER_LABEL_LIKE, FILLER_LABEL_LIKE),
+        f"""SELECT
+             SUM(CASE WHEN jobs.state = 'running' AND jobs.tier = ? THEN 1 ELSE 0 END) AS running_ds,
+             SUM(CASE WHEN jobs.state = 'queued' AND jobs.tier = ? AND jobs.lane IN ('urgent', 'normal')
+                       AND jobs.not_before <= ? THEN 1 ELSE 0 END) AS ready_real,
+             SUM(CASE WHEN jobs.state = 'queued' AND {filler_lib.FILLER_WHERE} THEN 1 ELSE 0 END) AS queued_filler,
+             SUM(CASE WHEN jobs.state = 'running' AND {filler_lib.FILLER_WHERE} THEN 1 ELSE 0 END) AS running_filler
+           FROM jobs {filler_lib.FILLER_JOIN}""",
+        (DS_TIER, DS_TIER, now),
     ).fetchone()
     return {name: int(row[name] or 0) for name in ("running_ds", "ready_real", "queued_filler", "running_filler")}
 
@@ -540,7 +540,7 @@ def main(argv=None, out=None) -> int:
     print(f"DeepSeek billed 5-min average {decision.billed_avg:,.0f}/min; busy {decision.active_now} "
           f"(queue {decision.running_ds}, filler {decision.running_filler}, direct {decision.direct_ds})", file=out)
     print(f"ready real {decision.ready_real}; queued filler {decision.queued_filler}; "
-          f"Morph gate: {decision.gate or 'open'}; DeepSeek 429s in gate window {decision.recent_429}", file=out)
+          f"gate: {decision.gate or 'open'}; DeepSeek 429s in gate window {decision.recent_429}", file=out)
     cost_source = "measured" if measured else "default"
     print(f"pacing: current minute uncached {decision.pacing_current:,} ({decision.pacing_source}), "
           f"{decision.pacing_pending} pending launch(es) at {decision.pacing_cost:,} ({cost_source}), "

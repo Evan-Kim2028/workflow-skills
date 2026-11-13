@@ -730,6 +730,73 @@ class ProxyDownBrokerTest(BrokerWiringTest):
         self.assertIn("390,000 uncached this minute (store)", normal["detail"])
 
 
+class QuotaBrokerTest(BrokerWiringTest):
+    """The controller asks for four; with 100 PR reviews and thousands of pairs due, exactly four are submitted."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_json("backlog-seed.json", {"filler": {
+            "report_dir": str(self.tmp / "reports"),
+            "repos": {"alpha": {"workspace": str(self.ws), "modules": ["pkg/a", "pkg/b"], "github": "o/alpha"}},
+        }})
+        self.prs = [{"number": 500 + i, "title": f"pr {i}", "url": f"u{i}", "mergedAt": "1970-01-02T00:00:00Z",
+                     "merge_commit": f"c{i}"} for i in range(100)]
+
+    def legacy_work(self):
+        return Fl.pr_work({**self.prs[0], "repo": "alpha", "slug": "o/alpha", "workspace": str(self.ws),
+                           "report_dir": str(self.tmp / "reports")})
+
+    def tick_with_prs(self, broker):
+        from agentq import pr_source
+        with mock.patch.object(pr_source, "merged_prs", return_value=self.prs):
+            return self.tick(broker)
+
+    def test_the_controller_asking_for_four_submits_exactly_four_and_they_are_pr_reviews_first(self):
+        self.set_billed(1_000_000)
+        broker = self.broker()
+        self.tick_with_prs(broker)
+        jobs = [j for j in db.select_jobs(self.conn) if j["tier"] == "pi-deepseek-flash"]
+        self.assertEqual(len(jobs), 4)
+        self.assertTrue(all("-backlog-filler-pr-" in j["label"] for j in jobs))
+
+    def test_queued_pr_reviews_count_as_queued_filler_so_the_controller_adds_nothing_more(self):
+        self.set_billed(1_000_000)
+        broker = self.broker()
+        self.tick_with_prs(broker)
+        self.assertEqual(len(Fl.queued_filler_ids(self.conn)), 4)
+        for _ in range(5):
+            self.tick_with_prs(broker)
+        jobs = [j for j in db.select_jobs(self.conn) if j["tier"] == "pi-deepseek-flash"]
+        self.assertEqual(len(jobs), 4)
+
+    def test_a_pr_review_queued_before_the_label_fix_still_counts_as_queued_filler(self):
+        db.insert_job(self.conn, {
+            "id": "legacy", "lane": "backlog", "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
+            "label": "hub-exec-pr-alpha-500", "workspace": str(self.ws), "session": "backlog", "harness": "backlog",
+            "prompt_path": "/p",
+        }, NOW)
+        with db.tx(self.conn):
+            Fl.record_filler_job(self.conn, "legacy", self.legacy_work())
+        self.write_json("broker.json", {"fill": {"enabled": True}, "pacing": {"enabled": True}})
+        self.status = {"budgets": {"uncached_ds": {"used_60s": 390_000}}}
+        self.set_billed(1_000_000)
+        self.tick_with_prs(self.broker())
+        queued = [j for j in db.select_jobs(self.conn) if j["state"] == "queued" and j["tier"] == "pi-deepseek-flash"]
+        self.assertEqual([j["id"] for j in queued], ["legacy"])
+
+    def test_a_pause_holds_a_legacy_queued_pr_review_too(self):
+        db.insert_job(self.conn, {
+            "id": "legacy", "lane": "backlog", "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
+            "label": "hub-exec-pr-alpha-500", "workspace": str(self.ws), "session": "backlog", "harness": "backlog",
+            "prompt_path": "/p",
+        }, NOW)
+        with db.tx(self.conn):
+            Fl.record_filler_job(self.conn, "legacy", self.legacy_work())
+        Fl.set_paused(self.conn, True)
+        self.tick_with_prs(self.broker())
+        self.assertIn("filler paused", db.get_job(self.conn, "legacy")["detail"])
+
+
 class NeverPool:
     def submit(self, fn, *args):
         return concurrent.futures.Future()

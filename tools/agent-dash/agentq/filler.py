@@ -178,6 +178,16 @@ def is_filler_label(label: str) -> bool:
     return LABEL_MARKER in (label or "")
 
 
+FILLER_JOIN = "LEFT JOIN filler_jobs ON filler_jobs.job_id = jobs.id"
+FILLER_WHERE = "(jobs.label LIKE '%-backlog-filler-%' OR filler_jobs.job_id IS NOT NULL)"
+
+
+def queued_filler_ids(conn) -> set[str]:
+    """Ids of queued filler jobs of every kind: audits and PR reviews, by label or by their recorded filler job."""
+    rows = conn.execute(f"SELECT jobs.id FROM jobs {FILLER_JOIN} WHERE jobs.state = 'queued' AND {FILLER_WHERE}")
+    return {row[0] for row in rows.fetchall()}
+
+
 def _folder(spec: dict, name: str, where: str) -> str:
     value = spec.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -514,7 +524,7 @@ def pr_work(candidate: dict) -> Work:
     return Work(
         kind="pr", repo=repo, workspace=candidate["workspace"], module="", commit=candidate.get("merge_commit", ""),
         report_path=str(Path(candidate["report_dir"]) / "filler" / repo / "pr" / f"{number}.md"),
-        slug=f"pr-{module_slug(repo)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
+        slug=f"{LABEL_SLUG}-pr-{module_slug(repo)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
         pr_title=candidate.get("title", ""), pr_url=candidate.get("url", ""), pr_slug=candidate.get("slug", ""),
         report_dir=candidate["report_dir"],
     )
@@ -528,27 +538,58 @@ def audit_work(target: Target, kind: str, head: str) -> Work:
     )
 
 
-def next_work(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_head, prs=()) -> Work | None:
-    """The next job to submit: the oldest unreviewed merged PR first, else the next due target and kind.
+def due_works(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_head, prs=(),
+              count: int = 1) -> list[Work]:
+    """The filler jobs to submit now, at most ``count``, from one priority-ordered due list.
 
-    Targets rotate from the saved cursor. A target with no known head commit is skipped. Nothing is written here.
+    Unreviewed merged PRs come first, newest first. Then target and kind pairs: targets rotate from the saved
+    cursor, and each pass takes one due kind per target, so a batch spreads across targets before it repeats one.
+    A target without a known head commit is skipped. Nothing is written here; the caller records each work it
+    submits, in the order returned, so the cursor ends on the last target taken.
     """
+    works: list[Work] = []
+    if count <= 0:
+        return works
+    seen_prs: set[tuple[str, int]] = set()
     for candidate in prs:
-        if not _pr_reviewed(conn, candidate["repo"], int(candidate["number"])):
-            return pr_work(candidate)
-    if not targets:
-        return None
+        if len(works) >= count:
+            return works
+        key = (candidate["repo"], int(candidate["number"]))
+        if key in seen_prs or _pr_reviewed(conn, *key):
+            continue
+        seen_prs.add(key)
+        works.append(pr_work(candidate))
+    if not targets or len(works) >= count:
+        return works
     cursor = state_get(conn, "cursor")
     keys = [t.key for t in targets]
     start = keys.index(cursor) + 1 if cursor in keys else 0
-    for target in targets[start:] + targets[:start]:
-        head = head_of(target)
-        if head is None:
-            continue
-        due = due_kinds(conn, target, kinds, head)
-        if due:
-            return audit_work(target, due[0], head)
-    return None
+    order = targets[start:] + targets[:start]
+    heads: dict[str, str | None] = {}
+    chosen: set[tuple[str, str]] = set()
+    progressed = True
+    while progressed and len(works) < count:
+        progressed = False
+        for target in order:
+            if len(works) >= count:
+                break
+            if target.key not in heads:
+                heads[target.key] = head_of(target)
+            head = heads[target.key]
+            if head is None:
+                continue
+            due = [kind for kind in due_kinds(conn, target, kinds, head) if (target.key, kind) not in chosen]
+            if due:
+                chosen.add((target.key, due[0]))
+                works.append(audit_work(target, due[0], head))
+                progressed = True
+    return works
+
+
+def next_work(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_head, prs=()) -> Work | None:
+    """The single next job to submit (see ``due_works``), or None when nothing is due."""
+    found = due_works(conn, targets, kinds=kinds, head_of=head_of, prs=prs, count=1)
+    return found[0] if found else None
 
 
 def record_work(conn, work: Work, job_id: str, now: float, target_key: str | None = None) -> None:
