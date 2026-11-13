@@ -48,6 +48,9 @@ RESERVE = "reserve"
 GUARD = "guard"
 INFLIGHT = "inflight"
 INFLIGHT_MODES = ("shadow", "enforce", "off")
+UNARMED = "unarmed"
+ARMED = "armed"
+SUSPENDED = "suspended"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
@@ -106,6 +109,7 @@ DEFAULT_CONFIG = {
         "min_samples": 3,
         "min_gradient": 0.5,
         "smoothing": 0.5,
+        "rearm_adjusts": 2,
     },
 }
 
@@ -216,6 +220,17 @@ MINUTE_SEED_COLUMNS = (
     "req", "ok", "r429", "input", "cache_read", "output", "uncached_est",
     "upstream_ms_sum", "upstream_n", "in_flight_max", "inflight_over",
 )
+
+
+INFLIGHT_MINUTES_DDL = """
+CREATE TABLE IF NOT EXISTS inflight_minutes (
+    minute TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    arm TEXT NOT NULL,
+    inflight_limit INT,
+    enforcing INT
+)
+"""
 
 
 PROXY_CALIB_DDL = """
@@ -572,6 +587,25 @@ def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
         connection.close()
 
 
+def write_inflight_minute_rows(db_path: Path, rows: list[tuple]) -> None:
+    """Upsert the limiter's record for each calendar minute the proxy was running: (minute, mode, arm, limit,
+    enforcing). Written on every flush, so a minute keeps its last state. A minute with no row was not recorded
+    (the proxy was down or not yet instrumented), and the report leaves it out. Runs in a worker thread."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(INFLIGHT_MINUTES_DDL)
+        connection.executemany(
+            "INSERT OR REPLACE INTO inflight_minutes (minute, mode, arm, inflight_limit, enforcing) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def write_job_rows(db_path: Path, rows: list[tuple]) -> None:
     """Add per-run deltas to proxy_jobs. Additive upserts, so two processes or restarts never overwrite.
     Runs in a worker thread."""
@@ -630,28 +664,25 @@ class InflightLimiter:
         self.min_samples = int(values["min_samples"])
         self.min_gradient = float(values["min_gradient"])
         self.smoothing = float(values["smoothing"])
+        self.rearm_adjusts = max(1, int(values["rearm_adjusts"]))
         self.limit = float(self.max_limit)
         self.baseline_s: float | None = None
         self.samples: deque[tuple[float, float]] = deque()
         self.last_adjust = now
+        self.state = UNARMED
+        self.streak = 0
 
     @property
     def measuring(self) -> bool:
         return self.mode != "off"
 
-    def fresh(self, now: float) -> bool:
-        """True when the short window holds enough recent first-byte samples to trust the limit."""
-        return self.short_run_s(now) is not None
+    def active(self) -> bool:
+        """The latched state: armed. Changes only in adjust(), never from the sample count at read time."""
+        return self.measuring and self.state == ARMED
 
-    def active(self, now: float) -> bool:
-        """A measured limit that still has fresh samples behind it. Without them the limit is suspended, and the
-        baseline is kept so the limit re-arms as soon as samples return."""
-        return self.measuring and self.baseline_s is not None and self.fresh(now)
-
-    def current_limit(self, now: float) -> int | None:
-        """The limit the proxy computes and reports (shadow included); None before the first measurement,
-        while the mode is off, and while the short window has no fresh samples."""
-        return round(self.limit) if self.active(now) else None
+    def current_limit(self) -> int | None:
+        """The limit the proxy computes and reports (shadow included); None unless the latched state is armed."""
+        return round(self.limit) if self.active() else None
 
     def arm_at(self, wall: float) -> str:
         """Which arm the wall-clock time falls in: shadow, off, enforce, or off for a disabled limiter."""
@@ -661,9 +692,9 @@ class InflightLimiter:
             return "enforce"
         return "enforce" if int(wall // self.ab_period_s) % 2 == 0 else "off"
 
-    def enforcing(self, wall: float, now: float) -> bool:
-        """True when a request above the limit must wait at this wall-clock time (and the limit is active)."""
-        return self.active(now) and self.arm_at(wall) == "enforce"
+    def enforcing(self, wall: float) -> bool:
+        """True when a request above the limit must wait at this wall-clock time (and the latched state is armed)."""
+        return self.active() and self.arm_at(wall) == "enforce"
 
     def observe(self, ttfb_s: float, now: float) -> None:
         self.samples.append((now, ttfb_s))
@@ -682,24 +713,38 @@ class InflightLimiter:
         return statistics.median(value for _, value in self.samples)
 
     def adjust(self, now: float) -> bool:
-        """Re-measure when an interval has passed. Returns True when the reported limit changed."""
+        """The only place the state changes. Runs once per interval. Returns True when the reported limit changed.
+
+        A short window with fewer than min_samples fresh samples suspends an armed limit at once and resets the
+        re-arm streak. A suspended or unarmed limit re-arms only after rearm_adjusts consecutive adjusts that each
+        find enough fresh samples; samples that arrive between adjusts never re-arm it. The baseline is kept
+        across suspension.
+        """
         if not self.measuring or now - self.last_adjust < self.interval_s:
             return False
         self.last_adjust = now
+        before = self.current_limit()
         short = self.short_run_s(now)
         if short is None or short <= 0:
-            return False
-        before = self.current_limit(now)
+            self.streak = 0
+            if self.state == ARMED:
+                self.state = SUSPENDED
+            return self.current_limit() != before
         if self.baseline_s is None:
             self.baseline_s = short
-        else:
-            weight = 1.0 - math.exp(-self.interval_s / self.baseline_tau_s)
-            self.baseline_s += weight * (short - self.baseline_s)
+        if self.state != ARMED:
+            self.streak += 1
+            if self.streak < self.rearm_adjusts:
+                return False
+            self.state = ARMED
+            self.streak = 0
+            return self.current_limit() != before
+        weight = 1.0 - math.exp(-self.interval_s / self.baseline_tau_s)
+        self.baseline_s += weight * (short - self.baseline_s)
         gradient = min(1.0, max(self.min_gradient, self.baseline_s / short))
         raw = self.limit * gradient + math.sqrt(self.limit)
         self.limit = min(float(self.max_limit), max(float(self.min_limit), self.limit + self.smoothing * (raw - self.limit)))
-        return self.current_limit(now) != before
-
+        return self.current_limit() != before
 
 @dataclass(eq=False)
 class Entry:
@@ -1110,7 +1155,7 @@ class Governor:
                     if not head.over_counted:
                         head.over_counted = True
                         self.row(head.model)["inflight_over"] += 1
-                    if self.inflight.enforcing(self.wall(), self.clock()):
+                    if self.inflight.enforcing(self.wall()):
                         head.blocked_by = None
                         head.last_refusal = INFLIGHT
                         index += 1
@@ -1157,7 +1202,7 @@ class Governor:
 
     def inflight_limit(self) -> int | None:
         """The DeepSeek in-flight limit now (shadow included), or None when no fresh measurement backs one."""
-        return self.inflight.current_limit(self.clock())
+        return self.inflight.current_limit()
 
     def inflight_above(self, ticket: Ticket) -> bool | None:
         """Whether a DeepSeek request sent now is above the cap (its own flight counted), or None when no cap is computed."""
@@ -1524,6 +1569,17 @@ class Governor:
             del self.minute_rows[key]
         return rows
 
+    def inflight_minute_row(self) -> tuple:
+        """This calendar minute's limiter record, written whether or not any DeepSeek request arrived."""
+        now = self.wall()
+        return (
+            minute_stamp(now),
+            self.inflight.mode,
+            self.inflight.arm_at(now),
+            self.inflight_limit(),
+            int(self.inflight.enforcing(now)),
+        )
+
     def inflight_columns(self, model: str, minute: str) -> tuple:
         """The limit, mode and arm recorded on a row. DeepSeek rows only; other models record nothing."""
         if family_of(model) != DS_FAMILY:
@@ -1696,7 +1752,7 @@ class Governor:
             "inflight_max": self.inflight.max_limit if self.inflight.measuring else None,
             "inflight_mode": self.inflight.mode,
             "inflight_arm": self.inflight.arm_at(self.wall()),
-            "inflight_enforcing": self.inflight.enforcing(self.wall(), now),
+            "inflight_enforcing": self.inflight.enforcing(self.wall()),
             "inflight_in_flight": self.ds_flight,
             "inflight_queued": inflight_queued,
             "ttfb_baseline_ms": ms_or_none(self.inflight.baseline_s),
@@ -2051,6 +2107,11 @@ class Proxy:
                 await asyncio.to_thread(write_minute_rows, self.gov.db_path, rows)
             except sqlite3.Error as exc:
                 self.gov.log("flush_error", kind=type(exc).__name__)
+        record = [self.gov.inflight_minute_row()]
+        try:
+            await asyncio.to_thread(write_inflight_minute_rows, self.gov.db_path, record)
+        except sqlite3.Error as exc:
+            self.gov.log("flush_error", kind=type(exc).__name__)
         calib_rows = self.gov.take_calib_rows()
         if calib_rows:
             try:

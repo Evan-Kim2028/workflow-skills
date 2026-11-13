@@ -27,6 +27,9 @@ from agentq.proxy import (
     Entry,
     Governor,
     INFLIGHT,
+    ARMED,
+    SUSPENDED,
+    UNARMED,
     InflightLimiter,
     Proxy,
     body_snippet,
@@ -47,6 +50,7 @@ from agentq.proxy import (
     seconds_to_next_minute,
     tokens_for_chars,
     write_calib_rows,
+    write_inflight_minute_rows,
     write_minute_rows,
 )
 
@@ -2009,7 +2013,7 @@ INFLIGHT_FAST = {"min_limit": 16, "max_limit": 96, "interval_s": 10.0, "short_wi
 
 
 class InflightLimiterMathTest(unittest.TestCase):
-    """The gradient controller on its own: a clock, samples and adjust calls, no governor."""
+    """The gradient controller and its latched state, driven by adjust() calls with an explicit clock."""
 
     def limiter(self, **settings) -> InflightLimiter:
         return InflightLimiter({**INFLIGHT_FAST, "mode": "enforce", **settings}, now=0.0)
@@ -2026,87 +2030,108 @@ class InflightLimiterMathTest(unittest.TestCase):
             lim.adjust(now)
         return now
 
-    def test_steady_latency_keeps_the_limit_at_its_maximum(self) -> None:
+    def test_steady_latency_arms_after_two_adjusts_and_holds_the_maximum(self) -> None:
         lim = self.limiter()
-        self.run_intervals(lim, 0.0, 10, 5.0, 12)
-        self.assertTrue(lim.active(lim.last_adjust))
-        self.assertEqual(lim.current_limit(lim.last_adjust), 96)
+        self.run_intervals(lim, 0.0, 10, 5.0, 1)
+        self.assertEqual(lim.state, UNARMED)
+        self.assertIsNone(lim.current_limit())
+        self.run_intervals(lim, 10.0, 10, 5.0, 12)
+        self.assertTrue(lim.active())
+        self.assertEqual(lim.current_limit(), 96)
 
     def test_rising_latency_pulls_the_limit_down(self) -> None:
         lim = self.limiter()
         now = self.run_intervals(lim, 0.0, 10, 5.0, 6)
-        before = lim.current_limit(lim.last_adjust)
-        now = self.run_intervals(lim, now, 10, 12.0, 10)
-        self.assertLess(lim.current_limit(lim.last_adjust), before)
+        before = lim.current_limit()
+        self.run_intervals(lim, now, 10, 12.0, 10)
+        self.assertLess(lim.current_limit(), before)
 
     def test_recovering_latency_lets_the_limit_rise_again(self) -> None:
         lim = self.limiter()
         now = self.run_intervals(lim, 0.0, 10, 5.0, 6)
         now = self.run_intervals(lim, now, 10, 15.0, 15)
-        low = lim.current_limit(lim.last_adjust)
+        low = lim.current_limit()
         self.run_intervals(lim, now, 10, 5.0, 15)
-        self.assertGreater(lim.current_limit(lim.last_adjust), low)
+        self.assertGreater(lim.current_limit(), low)
 
-    def test_expired_samples_suspend_an_armed_limit_and_it_rearms_on_fresh_samples(self) -> None:
+    def test_the_reviewer_sequence_never_flaps_between_adjusts(self) -> None:
+        """Armed by the adjusts at t10 and t20. Samples from t40 expire, so the adjust at t80 suspends. A sparse batch
+        at t85 arrives between adjusts and does not re-arm. The adjust at t90 counts one qualifying window (streak 1),
+        and the adjust at t100 re-arms. No change happens between adjusts."""
+        lim = self.limiter(min_samples=3)
+        self.run_intervals(lim, 0.0, 10, 5.0, 4)
+        self.assertEqual(lim.current_limit(), 96)
+        self.assertTrue(lim.adjust(80.0))
+        self.assertEqual(lim.state, SUSPENDED)
+        self.assertIsNone(lim.current_limit())
+        self.feed(lim, 85.0, 5.0, count=3)
+        self.assertIsNone(lim.current_limit())
+        self.assertFalse(lim.enforcing(0.0))
+        self.assertFalse(lim.adjust(88.0))
+        self.assertIsNone(lim.current_limit())
+        self.assertFalse(lim.adjust(90.0))
+        self.assertEqual(lim.state, SUSPENDED)
+        self.assertTrue(lim.adjust(100.0))
+        self.assertEqual(lim.state, ARMED)
+        self.assertEqual(lim.current_limit(), 96)
+
+    def test_a_suspended_limit_stays_suspended_across_adjusts_without_fresh_samples(self) -> None:
         lim = self.limiter()
         now = self.run_intervals(lim, 0.0, 10, 5.0, 4)
-        self.assertEqual(lim.current_limit(now), 96)
-        stale = now + 120
-        self.assertIsNone(lim.current_limit(stale))
-        self.assertFalse(lim.enforcing(stale, stale))
+        for k in range(5):
+            lim.adjust(now + 60 + 10 * k)
+            self.assertIsNone(lim.current_limit())
+        self.assertEqual(lim.state, SUSPENDED)
         self.assertIsNotNone(lim.baseline_s)
-        self.feed(lim, stale, 5.0)
-        self.assertEqual(lim.current_limit(stale), 96)
 
     def test_no_samples_fails_open_and_the_limit_never_moves(self) -> None:
         lim = self.limiter()
         self.assertFalse(lim.adjust(10.0))
-        self.assertFalse(lim.active(lim.last_adjust))
-        self.assertIsNone(lim.current_limit(lim.last_adjust))
-        self.assertFalse(lim.enforcing(10.0, 10.0))
+        self.assertFalse(lim.active())
+        self.assertIsNone(lim.current_limit())
+        self.assertFalse(lim.enforcing(10.0))
 
     def test_fewer_than_min_samples_is_still_no_data(self) -> None:
         lim = self.limiter()
         lim.observe(30.0, 10.0)
         self.assertIsNone(lim.short_run_s(10.0))
         self.assertFalse(lim.adjust(10.0))
-        self.assertIsNone(lim.current_limit(lim.last_adjust))
+        self.assertIsNone(lim.current_limit())
 
     def test_the_limit_is_clamped_to_the_minimum_under_extreme_latency(self) -> None:
         lim = self.limiter()
         now = self.run_intervals(lim, 0.0, 10, 5.0, 3)
         self.run_intervals(lim, now, 10, 500.0, 30)
-        self.assertEqual(lim.current_limit(lim.last_adjust), 16)
+        self.assertEqual(lim.current_limit(), 16)
 
     def test_the_limit_never_exceeds_the_maximum(self) -> None:
         lim = self.limiter(max_limit=40)
         self.run_intervals(lim, 0.0, 10, 5.0, 40)
-        self.assertEqual(lim.current_limit(lim.last_adjust), 40)
+        self.assertEqual(lim.current_limit(), 40)
 
     def test_off_computes_nothing(self) -> None:
         lim = self.limiter(mode="off")
         self.run_intervals(lim, 0.0, 10, 5.0, 3)
-        self.assertFalse(lim.active(lim.last_adjust))
-        self.assertIsNone(lim.current_limit(lim.last_adjust))
+        self.assertFalse(lim.active())
+        self.assertIsNone(lim.current_limit())
 
     def test_shadow_computes_but_never_enforces(self) -> None:
         lim = self.limiter(mode="shadow")
         self.run_intervals(lim, 0.0, 10, 5.0, 3)
-        self.assertTrue(lim.active(lim.last_adjust))
-        self.assertFalse(lim.enforcing(0.0, lim.last_adjust))
+        self.assertTrue(lim.active())
+        self.assertFalse(lim.enforcing(0.0))
         self.assertEqual(lim.arm_at(0.0), "shadow")
 
     def test_ab_arms_alternate_on_calendar_periods(self) -> None:
         lim = self.limiter(ab_period_s=600)
+        lim.state = ARMED
         lim.baseline_s = 5.0
-        for k in range(3):
-            lim.observe(5.0, 600.0 - k)
         self.assertEqual(lim.arm_at(0.0), "enforce")
         self.assertEqual(lim.arm_at(599.0), "enforce")
         self.assertEqual(lim.arm_at(600.0), "off")
         self.assertEqual(lim.arm_at(1200.0), "enforce")
-        self.assertTrue(lim.enforcing(0.0, 600.0))
-        self.assertFalse(lim.enforcing(600.0, 600.0))
+        self.assertTrue(lim.enforcing(0.0))
+        self.assertFalse(lim.enforcing(600.0))
 
     def test_bad_settings_are_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -2135,6 +2160,7 @@ class InflightAdmissionTest(unittest.TestCase):
         if armed:
             gov.inflight.baseline_s = 5.0
             gov.inflight.limit = float(cap)
+            gov.inflight.state = ARMED
             for k in range(3):
                 gov.inflight.observe(5.0, self.mono[0] - k * 0.1)
         return gov
@@ -2146,6 +2172,7 @@ class InflightAdmissionTest(unittest.TestCase):
         second = make_ticket(gov, job="b", model=MODEL_OUT)
         third = make_ticket(gov, job="c", model=MODEL_OUT)
         self.mono[0] += 120
+        gov.adjust_inflight()
         gov.enqueue(second)
         gov.enqueue(third)
         gov.pump()
@@ -2289,3 +2316,56 @@ class InflightMigrationTest(unittest.TestCase):
         self.assertEqual(connection.execute("SELECT req FROM proxy_minutes WHERE minute = '2026-11-01T00:00'").fetchone()[0], 7)
         self.assertEqual(connection.execute("SELECT inflight_mode, inflight_over FROM proxy_minutes WHERE minute = '2026-11-01T00:01'").fetchone(), ("enforce", 2))
         connection.close()
+
+
+class InflightMinuteRecordTest(unittest.TestCase):
+    """The per-minute limiter record that the report reads: written with no DeepSeek traffic, carrying the
+    mode, arm and limit the proxy was actually running."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.wall = [WALL_MINUTE]
+        self.mono = [1000.0]
+
+    def governor(self, **inflight) -> Governor:
+        gov = Governor(
+            self.home, config_with(inflight=inflight),
+            clock=lambda: self.mono[0], wall=lambda: self.wall[0], log=quiet,
+        )
+        return gov
+
+    def test_an_idle_armed_minute_is_recorded_with_its_mode_arm_and_limit(self) -> None:
+        gov = self.governor(mode="shadow")
+        gov.inflight.state = ARMED
+        gov.inflight.limit = 40.0
+        self.assertEqual(gov.inflight_minute_row(), (minute_stamp(WALL_MINUTE), "shadow", "shadow", 40, 0))
+
+    def test_a_suspended_minute_records_no_limit(self) -> None:
+        gov = self.governor(mode="shadow")
+        self.assertEqual(gov.inflight_minute_row(), (minute_stamp(WALL_MINUTE), "shadow", "shadow", None, 0))
+
+    def test_an_ab_enforce_minute_and_its_off_minute_are_recorded_by_the_running_arm(self) -> None:
+        gov = self.governor(mode="enforce", ab_period_s=600)
+        gov.inflight.state = ARMED
+        gov.inflight.limit = 28.0
+        period_start = WALL_MINUTE // 1200 * 1200  # an even period, so its first minute is the enforce arm
+        self.wall[0] = period_start
+        on = gov.inflight_minute_row()
+        self.wall[0] = period_start + 600
+        off = gov.inflight_minute_row()
+        self.assertEqual((on[2], on[4]), ("enforce", 1))
+        self.assertEqual((off[2], off[4]), ("off", 0))
+
+    def test_the_writer_upserts_one_row_per_minute_and_creates_the_table_once(self) -> None:
+        gov = self.governor(mode="shadow")
+        db = gov.db_path
+        row = gov.inflight_minute_row()
+        write_inflight_minute_rows(db, [row])
+        write_inflight_minute_rows(db, [row])
+        connection = sqlite3.connect(db)
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM inflight_minutes").fetchone()[0], 1)
+        connection.close()
+
+
