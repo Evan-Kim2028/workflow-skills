@@ -104,18 +104,14 @@ def filling_decision(was_filling: bool, window_avg: float, live_rate: float | No
                      high_frac: float) -> bool:
     """Hysteresis on the window average and the live projection.
 
-    The window average is the rate over complete minutes, so after a sudden drop it still reads high for up to two minutes,
-    and a burst it has not yet seen still reads low. When the live projection is outside the band, it decides: below the
-    low mark starts filling, at or above the high mark stops it. Inside the band the window decides: below the low mark
-    starts filling (the lower of the two signals is below it), at or above the high mark stops it (the higher of the two is
-    at or above it). With no live projection the window average alone decides. Between the marks the state is kept.
+    The window average is the rate over complete minutes, so after a sudden drop it still reads high for up to two minutes.
+    The live projection counts in-flight reservations (each request charged at its full estimated size when admitted), so
+    it can only overstate the minute; it is therefore used in one direction only: a projection below the low mark starts
+    filling. It never stops filling. The window average decides everything else. Between the marks the state is kept.
     """
     low, high = low_frac * target, high_frac * target
-    if live_rate is not None:
-        if live_rate < low:
-            return True
-        if live_rate >= high:
-            return False
+    if live_rate is not None and live_rate < low:
+        return True
     if window_avg < low:
         return True
     if window_avg >= high:
@@ -260,13 +256,11 @@ def minute_gate(status: dict | None, last_minute: dict | None = None,
             free = limit * frac
         if not isinstance(used, (int, float)) or free <= 0:
             continue
-        projected = minute_projection(budget)
         history = last_minute.get(field)
-        pressure = max(v for v in (float(used), projected, history) if v is not None)
+        pressure = max(v for v in (float(used), history) if v is not None)
         if pressure >= free:
-            return (f"Morph gate: {name} budget at {pressure:,.0f} (this minute {used:,.0f}, projected "
-                    f"{projected or 0:,.0f}, last minute {history or 0:,.0f}), at its {free:,.0f} free allowance "
-                    f"(reserve kept for real work)")
+            return (f"Morph gate: {name} budget at {pressure:,.0f} (this minute {used:,.0f}, last minute "
+                    f"{history or 0:,.0f}), at its {free:,.0f} free allowance (reserve kept for real work)")
         reserve = budget.get("reserve")
         if isinstance(reserve, dict):
             level, capacity = reserve.get("level"), reserve.get("capacity")
