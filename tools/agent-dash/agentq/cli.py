@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 
 from agentq import backlog as backlog_lib
+from agentq import fill as fill_lib
+from agentq import filler as filler_lib
 from agentq import broker as broker_lib
 from agentq import db
 from agentq import slots as slots_lib
@@ -268,6 +270,12 @@ def cmd_status(args, ctx: Context) -> int:
     enabled = sum(1 for template in templates if template["enabled"])
     ctx.print(f"backlog templates: {enabled} enabled of {len(templates)}; "
               f"template jobs open: {backlog_lib.open_backlog_jobs(conn)}")
+    fill_on = broker_lib.load_config(ctx.home)["fill"]["enabled"]
+    filler_state = "paused" if filler_lib.paused(conn) else ("on" if fill_on else "off")
+    filler_running = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE state = 'running' AND label LIKE ?", (fill_lib.FILLER_LABEL_LIKE,)
+    ).fetchone()[0]
+    ctx.print(f"filler: {filler_state}; filler jobs running: {filler_running}")
     proxy = broker_lib.proxy_status()
     ctx.print(f"proxy: {'reachable' if proxy is not None else 'unreachable (static slots)'}")
     daemon = "not running" if pid is None else f"running (pid {pid or '?'})"
@@ -339,12 +347,20 @@ def cmd_backlog_ls(args, ctx: Context) -> int:
 
 
 def _set_paused(args, ctx: Context, enabled: bool) -> int:
+    """Pause or resume one named template. With no name, every template and the filler at once."""
     conn = db.connect(ctx.home)
+    state = "resumed" if enabled else "paused"
+    if args.name is None:
+        with db.tx(conn):
+            for template in backlog_lib.select_all(conn):
+                backlog_lib.set_enabled(conn, template["name"], enabled)
+            filler_lib.set_paused(conn, not enabled)
+        count = len(backlog_lib.select_all(conn))
+        return answer(ctx, f"{state} all {count} backlog template(s) and the filler", 0)
     with db.tx(conn):
         found = backlog_lib.set_enabled(conn, args.name, enabled)
     if not found:
         return answer(ctx, f"no backlog template {args.name}", 1)
-    state = "resumed" if enabled else "paused"
     return answer(ctx, f"{state} backlog {args.name}", 0)
 
 
@@ -432,11 +448,12 @@ def build_parser() -> argparse.ArgumentParser:
     b = bsub.add_parser("rm", help="delete a template (its past jobs stay)")
     b.add_argument("name")
     b.set_defaults(func=cmd_backlog_rm)
-    b = bsub.add_parser("pause", help="stop submitting a template; a running job finishes")
-    b.add_argument("name")
+    b = bsub.add_parser("pause", help="stop submitting a template, or with no name every template and the filler; "
+                                      "a running job finishes")
+    b.add_argument("name", nargs="?", help="one template to pause; omit to pause all templates and the filler")
     b.set_defaults(func=cmd_backlog_pause)
-    b = bsub.add_parser("resume", help="submit a paused template again")
-    b.add_argument("name")
+    b = bsub.add_parser("resume", help="submit a paused template again; with no name, resume all templates and the filler")
+    b.add_argument("name", nargs="?", help="one template to resume; omit to resume all templates and the filler")
     b.set_defaults(func=cmd_backlog_resume)
     return parser
 

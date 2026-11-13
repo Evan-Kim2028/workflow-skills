@@ -13,11 +13,12 @@ import contextlib
 import os
 import random
 import sqlite3
+import sys
 import time
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
@@ -46,6 +47,18 @@ BACKLOG_TABLE = """CREATE TABLE backlog_templates (
     enabled INTEGER NOT NULL DEFAULT 1,
     last_submitted REAL,
     created_at REAL NOT NULL
+)"""
+
+FILLER_TARGETS_TABLE = """CREATE TABLE IF NOT EXISTS filler_targets (
+    target TEXT PRIMARY KEY,
+    last_commit TEXT,
+    last_submitted REAL,
+    last_job TEXT
+)"""
+
+FILLER_STATE_TABLE = """CREATE TABLE IF NOT EXISTS filler_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
 )"""
 
 _STATEMENTS = (
@@ -93,6 +106,8 @@ _STATEMENTS = (
         detail TEXT
     )""",
     BACKLOG_TABLE,
+    FILLER_TARGETS_TABLE,
+    FILLER_STATE_TABLE,
 )
 
 # Each step upgrades a store from the version it names to the next one.
@@ -102,6 +117,7 @@ _UPGRADES = {
         "ALTER TABLE jobs ADD COLUMN in_place INTEGER NOT NULL DEFAULT 0",
     ),
     2: (BACKLOG_TABLE.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),),
+    3: (FILLER_TARGETS_TABLE, FILLER_STATE_TABLE),
 }
 
 JOB_COLUMNS = frozenset(
@@ -195,16 +211,29 @@ def ensure_wal(conn: sqlite3.Connection) -> None:
     retrying(lambda: conn.execute("PRAGMA journal_mode = WAL").fetchone())
 
 
+_NEWER_STORE_WARNED: set[str] = set()
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the schema once, or upgrade an older store step by step.
 
-    A current schema is read without a write lock.
+    A current schema is read without a write lock. A store newer than this code is left as it is:
+    the version is never written back down, so an older process cannot flap the store between versions.
+    The refusal is logged once per store file.
     """
-    if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == SCHEMA_VERSION:
+        return
+    if version > SCHEMA_VERSION:
+        key = str(conn.execute("PRAGMA database_list").fetchone()[2])
+        if key not in _NEWER_STORE_WARNED:
+            _NEWER_STORE_WARNED.add(key)
+            print(f"agentq: store schema {version} is newer than this code ({SCHEMA_VERSION}); "
+                  "leaving it unchanged", file=sys.stderr)
         return
     with tx(conn):
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == SCHEMA_VERSION:
+        if version == SCHEMA_VERSION or version > SCHEMA_VERSION:
             return
         if version == 0:
             for statement in _STATEMENTS:

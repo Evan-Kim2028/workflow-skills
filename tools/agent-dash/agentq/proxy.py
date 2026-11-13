@@ -39,6 +39,9 @@ MORPH_FAMILIES = ("morph-dsv41flash", "morph-kimik31")
 OTHER_FAMILY = "other"
 FAMILY_KEYS = (*MORPH_FAMILIES, OTHER_FAMILY)
 RESTORED_LANE = "restored"
+CAPACITY = "capacity"
+RESERVE = "reserve"
+GUARD = "guard"
 FAST_LIMIT_QUIET_S = 30 * 60.0
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
@@ -79,6 +82,7 @@ DEFAULT_CONFIG = {
     "window_mode": "rolling",
     "charge_basis": "billed",
     "calendar_jitter_s": 1.5,
+    "backlog_max_frac": 0.9,
     "budgets": {
         "total": {"limit_type": "total", "limit": 10_000_000},
         "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
@@ -644,6 +648,8 @@ class Ticket:
     holds: list[tuple[Budget, Entry]] = field(default_factory=list)
     blocked_by: str | None = None
     backoff_by: str | None = None
+    last_refusal: str | None = None
+    reserve_seen: bool = False
 
     def blocking_budget(self, now: float) -> str | None:
         """The budget holding this waiting ticket now: the budget its 429 named while it backs off,
@@ -671,6 +677,7 @@ class Governor:
         self.wall = wall
         self.log = log
         self.window = float(config["window_s"])
+        self.backlog_max_frac = float(config.get("backlog_max_frac", DEFAULT_CONFIG["backlog_max_frac"]))
         start = clock()
         hold_s = float(config["give_up_s"]) + float(config["upstream_idle_s"])
         self.budgets: dict[str, Budget] = {}
@@ -910,6 +917,8 @@ class Governor:
         holds on each budget without stalling tickets that use other budgets. A ticket backing off
         after a 429 blocks nothing, and while it waits its budgets stay closed to backlog.
         Backlog runs only on budgets that no waiting urgent or normal ticket is blocked on.
+        A backlog ticket also waits once its budget is past backlog_max_frac of its target, so
+        normal and urgent work keep the rest of the budget. That hold does not raise the target.
 
         A block caused only by the urgent share guard closes its budget for the rest of the urgent
         lane. Normal and backlog tickets still use that budget, which is what the guard intends.
@@ -933,10 +942,12 @@ class Governor:
                 closed = blocked | urgent_guarded if lane == "urgent" else blocked
                 if head.not_before > now:
                     head.blocked_by = None
+                    head.last_refusal = None
                     index += 1
                     continue
                 if not closed.isdisjoint(head.estimates):
                     head.blocked_by = next(name for name in head.estimates if name in closed)
+                    head.last_refusal = None
                     index += 1
                     continue
                 found = self._blocker(head, now, lower_waiting)
@@ -944,18 +955,23 @@ class Governor:
                     del queue[index]
                     self._admit(head, now)
                     continue
-                blocker, guard_only = found
+                blocker, refusal = found
                 head.blocked_by = blocker.name
-                if not guard_only:
+                head.last_refusal = refusal
+                if refusal == RESERVE:
+                    head.reserve_seen = True
+                if refusal == CAPACITY:
                     blocker.saturated = True
                     blocker.saturated_since_tick = True
-                (urgent_guarded if guard_only else blocked).add(blocker.name)
+                (urgent_guarded if refusal == GUARD else blocked).add(blocker.name)
                 index += 1
 
-    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> tuple[Budget, bool] | None:
-        """Return (budget, guard_only) for the first budget that refuses this ticket now, or None.
+    def _blocker(self, ticket: Ticket, now: float, lower_waiting: bool) -> tuple[Budget, str] | None:
+        """Return (budget, refusal) for the first budget that refuses this ticket now, or None.
 
-        guard_only is True when the budget has room and only the urgent share guard refuses: urgent
+        refusal is CAPACITY when the budget is full to its target, RESERVE when a backlog ticket would
+        take the budget past ``backlog_max_frac`` of its target (the rest is kept for normal and urgent
+        work), and GUARD when the budget has room and only the urgent share guard refuses: urgent
         tickets may hold at most half of a budget while lower lanes wait. A budget with no charges
         in the window always admits one request, even an oversized one, so a large request cannot
         wait forever.
@@ -965,11 +981,13 @@ class Governor:
             cap = budget.cap()
             used = self._used(budget)
             if used > 0 and used + estimate > cap:
-                return budget, False
+                return budget, CAPACITY
+            if ticket.lane == "backlog" and used > 0 and used + estimate > self.backlog_max_frac * cap:
+                return budget, RESERVE
             if ticket.lane == "urgent" and lower_waiting:
                 urgent_used = self._used(budget, lane="urgent")
                 if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
-                    return budget, True
+                    return budget, GUARD
         return None
 
     def _admit(self, ticket: Ticket, now: float) -> None:
@@ -984,7 +1002,8 @@ class Governor:
             ticket.holds.append((budget, entry))
         self.note_calib_admitted(ticket)
         wait = now - ticket.queued_at
-        self.waits.append((now, wait))
+        if not ticket.reserve_seen:
+            self.waits.append((now, wait))
         row = self.row(ticket.model)
         row["req"] += 1
         if len(row["waits"]) < ROW_WAIT_SAMPLES:
@@ -1402,7 +1421,12 @@ class Governor:
         window = self.window
         while self.waits and self.waits[0][0] < now - window:
             self.waits.popleft()
-        queued_ages = [now - t.queued_at for lane in LANES for t in self.queues[lane]]
+        queued_ages = [
+            now - t.queued_at
+            for lane in LANES
+            for t in self.queues[lane]
+            if lane != "backlog" or t.last_refusal in (CAPACITY, GUARD)
+        ]
         saturated = any(wait > SATURATION_WAIT_S for _, wait in self.waits) or any(
             age > SATURATION_WAIT_S for age in queued_ages
         )
