@@ -5,7 +5,7 @@ import os
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -159,7 +159,7 @@ class GcSafetyTests(GcBase):
         self.assertIn("under 7 days", verdict["reason"])
 
     def test_folder_without_owner_marker_is_kept(self):
-        folder = self.root / "WS4" / "ws4-plan-stranger"
+        folder = self.root / "WS4" / "ws4-notes-stranger"
         (folder / "env").mkdir(parents=True)
         (folder / "env" / "data.bin").write_bytes(b"x")
         age(folder, OLD)
@@ -218,6 +218,150 @@ class GcSafetyTests(GcBase):
         self.assertIn("reclaim  WS4/ws4-plan-print", out)
         self.assertIn("removed 1 folder(s)", out)
         self.assertFalse(folder.exists())
+
+
+class FinishedRunTests(GcBase):
+    def test_finished_run_idle_two_hours_is_reclaimed_with_the_flag(self):
+        folder = self.make("ws4-plan-idle2h", age_when=NOW - 2 * 3600)
+        verdict = scratchgc.assess(folder, NOW, 7, scratchgc.live_labels(NOW), 1)
+        self.assertEqual(verdict["action"], "reclaim", verdict)
+        self.assertEqual(verdict["reason"], "finished run, idle over 1 h")
+        report = scratchgc.gc(self.root, 7, apply=True, now=NOW, finished_after_hours=1)
+        self.assertEqual(report["removed_count"], 1)
+        self.assertFalse(folder.exists())
+
+    def test_finished_run_idle_two_hours_is_kept_without_the_flag(self):
+        folder = self.make("ws4-plan-idle2h-off", age_when=NOW - 2 * 3600)
+        verdict = self.row(folder)
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertIn("under 7 days", verdict["reason"])
+        report = scratchgc.gc(self.root, 7, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+    def test_finished_run_idle_thirty_minutes_is_kept(self):
+        folder = self.make("ws4-plan-idle30m", age_when=NOW - 30 * 60)
+        verdict = scratchgc.assess(folder, NOW, 7, scratchgc.live_labels(NOW), 1)
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertIn("under 7 days", verdict["reason"])
+
+    def test_live_run_idle_two_hours_is_kept(self):
+        folder = self.make("ws4-plan-idle2h-live", age_when=NOW - 2 * 3600)
+        self.live.return_value = {"ws4-plan-idle2h-live"}
+        verdict = scratchgc.assess(folder, NOW, 7, scratchgc.live_labels(NOW), 1)
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertEqual(verdict["reason"], "live launcher")
+        report = scratchgc.gc(self.root, 7, apply=True, now=NOW, finished_after_hours=1)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+    def test_finished_after_hours_flag_is_parsed(self):
+        folder = self.make("hub-exec-flag", age_when=NOW - 2 * 3600)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = scratchgc.cmd_scratch(["gc", "--finished-after-hours", "1", "--apply"])
+        self.assertEqual(code, 0)
+        self.assertIn("finished runs idle over 1 h", buf.getvalue())
+        self.assertFalse(folder.exists())
+
+    def test_finished_after_hours_rejects_a_bad_value(self):
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(scratchgc.cmd_scratch(["gc", "--finished-after-hours", "soon"]), 2)
+
+
+class UnmarkedWorkerTests(GcBase):
+    def unmarked(self, label, *, age_when=OLD, ws="hub"):
+        folder = self.root / ws / label
+        (folder / "env").mkdir(parents=True)
+        (folder / "env" / "data.bin").write_bytes(b"x" * 1024)
+        age(folder, age_when)
+        return folder
+
+    def test_unmarked_worker_folder_stale_six_hours_is_reclaimed(self):
+        folder = self.unmarked("hub-exec-foo", age_when=NOW - 6 * 3600)
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "reclaim", verdict)
+        self.assertEqual(verdict["reason"], "unmarked worker folder, stale")
+        report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 1)
+        self.assertFalse(folder.exists())
+
+    def test_unmarked_worker_folder_two_hours_old_is_kept(self):
+        folder = self.unmarked("hub-exec-foo", age_when=NOW - 2 * 3600)
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertIn("under 0.208333 days", verdict["reason"])
+        report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+    def test_unmarked_hand_made_folder_is_kept(self):
+        folder = self.unmarked("serving-history-plan", age_when=NOW - 86400)
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertIn("no owner marker", verdict["reason"])
+        report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+    def test_unmarked_postgres_data_folder_is_kept(self):
+        folder = self.unmarked("hub-exec-pgdata-x", age_when=NOW - 86400)
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertIn("no owner marker", verdict["reason"])
+        report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+    def test_unmarked_worker_folder_with_a_live_launcher_is_kept(self):
+        folder = self.unmarked("hub-exec-busy", age_when=NOW - 86400)
+        self.live.return_value = {"hub-exec-busy"}
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertEqual(verdict["reason"], "live launcher")
+
+    def test_unmarked_worker_folder_in_use_is_kept(self):
+        folder = self.unmarked("hub-exec-open", age_when=NOW - 86400)
+        self.open_flag = True
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertEqual(verdict["reason"], "in use")
+
+    def test_unmarked_worker_folder_is_kept_when_the_live_check_cannot_run(self):
+        folder = self.unmarked("hub-exec-nolive", age_when=NOW - 86400)
+        self.live.return_value = None
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertEqual(verdict["reason"], "live-process check did not run")
+
+    def test_unmarked_worker_folder_is_kept_without_an_age_cutoff(self):
+        folder = self.unmarked("hub-exec-noage", age_when=NOW - 86400)
+        verdict = scratchgc.assess(folder, NOW, None, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertIn("no owner marker", verdict["reason"])
+
+    def test_unreadable_owner_marker_keeps_the_folder(self):
+        folder = self.unmarked("hub-exec-foo", age_when=NOW - 6 * 3600)
+        (folder / scratchdir.OWNER_FILE).write_text("{not json", encoding="utf-8")
+        age(folder, NOW - 6 * 3600)
+        verdict = scratchgc.assess(folder, NOW, 5 / 24, scratchgc.live_labels(NOW))
+        self.assertEqual(verdict["action"], "keep", verdict)
+        self.assertEqual(verdict["reason"], "owner marker unreadable")
+        report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+
+
+class CliFlagTests(GcBase):
+    def test_non_finite_flags_are_rejected(self):
+        for flag in ("--finished-after-hours", "--older-than-days"):
+            for value in ("nan", "inf", "-inf"):
+                with self.subTest(flag=flag, value=value):
+                    err = io.StringIO()
+                    with redirect_stderr(err):
+                        code = scratchgc.cmd_scratch(["gc", flag, value])
+                    self.assertEqual(code, 2)
+                    self.assertIn("finite", err.getvalue())
 
 
 class WorkstreamHelperTests(GcBase):
