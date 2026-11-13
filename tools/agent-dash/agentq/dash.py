@@ -42,6 +42,10 @@ BUCKET_S = {1: 60, 6: 60, 24: 300, 168: 1800}
 DEFAULT_HOURS = 6
 RECENT_JOBS = 200
 LIMIT_WINDOW_MINUTES = 5
+LIVE_MINUTE_MIN_ELAPSED_S = 20
+LIVE_PACE_KEYS = (
+    "total", "ds_output", "kimi_uncached", "ds_uncached", "input", "cache_read", "output", "ok", "req", "r429",
+)
 TOKEN_BUCKET_S = {1: 300, 6: 300, 24: 300, 168: 1800}
 AVERAGE_SATURATION_FRAC = 0.90
 ROOM_FRAC = 0.95
@@ -476,7 +480,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The step line is the average of each complete Eastern clock hour over its minutes, with idle minutes counted as zero; the hour in progress has no step until it completes. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute, and the hollow marker at the right edge is the minute in progress, projected to a full minute at its pace so far. The step line is the average of each complete Eastern clock hour over its minutes, with idle minutes counted as zero; the hour in progress has no step until it completes. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -997,21 +1001,44 @@ td.wrap .cont { color: var(--ink-3); display: block; }
           }, svg);
         });
       });
+      var liveIdx = -1;
+      points.forEach(function (p, idx) { if (p.live) liveIdx = idx; });
       cfg.series.filter(function (s) { return !s.stacked && !s.tooltipOnly; }).forEach(function (s) {
         var d = "";
         var lastPoint = null;
-        points.forEach(function (p) {
+        var solidTo = liveIdx > 0 ? liveIdx : points.length;
+        for (var i = 0; i < solidTo; i++) {
+          var p = points[i];
           var v = p[s.key];
-          if (v === null || v === undefined) { lastPoint = null; return; }
+          if (v === null || v === undefined) { lastPoint = null; continue; }
           d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + Yc(v).toFixed(1);
           lastPoint = p;
-        });
+        }
         var attrs = {
           d: d.trim(), fill: "none", stroke: s.color, "stroke-width": s.width || 2,
           "stroke-opacity": s.opacity === undefined ? 1 : s.opacity, "stroke-linejoin": "round", "stroke-linecap": "round"
         };
         if (s.dash) attrs["stroke-dasharray"] = s.dash;
         if (d) svgEl("path", attrs, svg);
+        if (liveIdx > 0) {
+          var prev = null;
+          for (var j = liveIdx - 1; j >= 0; j--) {
+            var pv = points[j][s.key];
+            if (pv !== null && pv !== undefined) { prev = points[j]; break; }
+          }
+          var lv = points[liveIdx][s.key];
+          if (prev && lv !== null && lv !== undefined) {
+            svgEl("path", {
+              d: "M" + X(prev.t).toFixed(1) + "," + Yc(prev[s.key]).toFixed(1) +
+                " L" + X(points[liveIdx].t).toFixed(1) + "," + Yc(lv).toFixed(1),
+              fill: "none", stroke: s.color, "stroke-width": s.width || 2,
+              "stroke-dasharray": "4 3", "stroke-opacity": 0.5, "stroke-linecap": "round"
+            }, svg);
+            svgEl("circle", {
+              cx: X(points[liveIdx].t), cy: Yc(lv), r: 3.5, fill: "var(--surface)", stroke: s.color, "stroke-width": 2
+            }, svg);
+          }
+        }
         if (cfg.y.clip !== undefined) {
           points.forEach(function (p) {
             if (p[s.key] > cfg.y.clip) {
@@ -1065,7 +1092,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         var note = s.overNote && typeof v === "number" && v > 1 ? s.overNote : null;
         return { color: s.color, text: text, note: note };
       });
-      fillTip(tip, fmtX(p.t) + span, rows);
+      var head = fmtX(p.t) + span;
+      if (p.live) {
+        head = fmtX(p.t) + " \u00b7 in progress, " + p.elapsed_s + "s in";
+        if (p.live_note) rows = rows.concat([{ color: null, text: p.live_note }]);
+      }
+      fillTip(tip, head, rows);
       place(X(p.t), 8);
     }
     hit.addEventListener("mouseenter", function () { cross.setAttribute("visibility", "visible"); });
@@ -1135,7 +1167,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var slot = (cfg.bucket_s / Math.max(1, x1 - x0)) * iw;
     var barW = Math.min(24, Math.max(1, slot - 2));
     function X(t) { return m.l + ((t - x0) / Math.max(1, x1 - x0)) * iw; }
-    function center(p) { return X(p.t) + slot / 2; }
+    function center(p) { return Math.min(X(p.t) + slot / 2, W - m.r - barW / 2 - 1); }
     function YL(v) { return plotBottom - (v / (left.max || 1)) * ih; }
     function YR(v) { return plotBottom - (v / (right.max || 1)) * ih; }
 
@@ -1166,7 +1198,14 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var l = cx - barW / 2, rt = cx + barW / 2;
       var d = "M" + l + "," + base + " L" + l + "," + (top + r) + " Q" + l + "," + top + " " + (l + r) + "," + top +
         " L" + (rt - r) + "," + top + " Q" + rt + "," + top + " " + rt + "," + (top + r) + " L" + rt + "," + base + " Z";
-      svgEl("path", { d: d, fill: cfg.series[0].color }, svg);
+      var barAttrs = { d: d, fill: cfg.series[0].color };
+      if (p.live) {
+        barAttrs["fill-opacity"] = 0.45;
+        barAttrs.stroke = cfg.series[0].color;
+        barAttrs["stroke-dasharray"] = "4 3";
+        barAttrs["stroke-width"] = 1;
+      }
+      svgEl("path", barAttrs, svg);
     });
 
     var line = points.map(function (p, idx) {
@@ -1175,7 +1214,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     svgEl("path", { d: line, fill: "none", stroke: "var(--surface)", "stroke-width": 4.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
     svgEl("path", { d: line, fill: "none", stroke: COLORS.muted, "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
     var lastP = points[points.length - 1];
-    svgEl("circle", { cx: center(lastP), cy: YR(lastP.cumulative), r: 4, fill: COLORS.muted, stroke: "var(--surface)", "stroke-width": 2 }, svg);
+    var lastDot = { cx: center(lastP), cy: YR(lastP.cumulative), r: 4, "stroke-width": 2 };
+    lastDot.fill = lastP.live ? "var(--surface)" : COLORS.muted;
+    lastDot.stroke = lastP.live ? COLORS.muted : "var(--surface)";
+    svgEl("circle", lastDot, svg);
 
     var tip = document.createElement("div");
     tip.className = "tip";
@@ -1187,13 +1229,18 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       band.setAttribute("x", X(p.t));
       band.setAttribute("visibility", "visible");
       var head = (cfg.tickFmt || hm)(p.t) + " \u2013 " + hm(p.t + cfg.bucket_s);
-      fillTip(tip, head, [
+      var rows = [
         { color: cfg.series[0].color, text: "Total: " + fmtTokens(p.total) },
         { color: null, text: "Cache read: " + fmtTokens(p.cache_read) + " (" + shareText(p.cache_read, p.total) + ")" },
         { color: null, text: "Uncached input: " + fmtTokens(p.uncached) + " (" + shareText(p.uncached, p.total) + ")" },
         { color: null, text: "Output: " + fmtTokens(p.output) + " (" + shareText(p.output, p.total) + ")" },
         { color: COLORS.muted, text: "Cumulative (right axis): " + fmtTokens(p.cumulative) }
-      ]);
+      ];
+      if (p.live) {
+        head = (cfg.tickFmt || hm)(p.t) + " \u00b7 in progress, " + p.elapsed_s + "s in";
+        if (p.live_note) rows = rows.concat([{ color: null, text: p.live_note }]);
+      }
+      fillTip(tip, head, rows);
       placeTip(tip, W, center(p), 8);
     }
     function hide() {
@@ -1310,6 +1357,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var unit = unitLabel(bucket);
     var fmtX = d.hours >= 168 ? dateHM : hm;
     var minutes = d.minutes || [];
+    var completeMinutes = minutes.filter(function (p) { return !p.live; });
     var axis = d.runs_axis;
     var tb = d.token_bucket_s || bucket;
     var tunit = unitLabel(tb);
@@ -1398,11 +1446,11 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var smallChart = function (id, cfg) {
       return Object.assign({
         kind: "line", bucket_s: bucket, tickFmt: fmtX, xSteps: 2, margin: smallLayout.margin,
-        x0: win.start, x1: win.end, height: smallLayout.height, points: minutes
+        x0: win.start, x1: win.end, height: smallLayout.height, points: completeMinutes
       }, cfg);
     };
-    var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429_per_min); }, 0);
-    var waitPoints = minutes.map(function (p) {
+    var maxR = completeMinutes.reduce(function (a, p) { return Math.max(a, p.r429_per_min); }, 0);
+    var waitPoints = completeMinutes.map(function (p) {
       return { t: p.t, wait: p.wait_p95_ms === null || p.wait_p95_ms === undefined ? null : p.wait_p95_ms / 1000 };
     });
     var maxW = waitPoints.reduce(function (a, p) { return p.wait === null ? a : Math.max(a, p.wait); }, 0);
@@ -1448,7 +1496,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       y: labelled({ min: 0, max: waitTop, ticks: [0, waitTop / 2, waitTop], fmt: waitFmt }, "seconds"),
       fmt: waitFmt
     }));
-    var upPoints = minutes.map(function (p) {
+    var upPoints = completeMinutes.map(function (p) {
       var sec = function (v) { return v === null || v === undefined ? null : v / 1000; };
       return { t: p.t, p50: sec(p.upstream_p50_ms), p95: sec(p.upstream_p95_ms) };
     });
@@ -1697,7 +1745,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   function renderMinuteTable(d) {
     var t = tables.minute;
-    t.rows = (d.minutes || []).slice().reverse();
+    t.rows = (d.minutes || []).filter(function (p) { return !p.live; }).reverse();
     t.empty = "No minutes in this range";
     paint(t);
   }
@@ -2154,6 +2202,35 @@ def minute_series(raw: dict[int, dict], since: int, until: int) -> list[dict]:
     if not stamped:
         return []
     return [minute_point(t, raw.get(t)) for t in range(first, stamped[-1] + 60, 60)]
+
+
+def live_minute_point(row: dict | None, until: int, elapsed_s: int) -> dict | None:
+    """The minute in progress as one extra chart point, or None before LIVE_MINUTE_MIN_ELAPSED_S or without a row.
+
+    Its token, request and 429 counts are projected to a full minute at the pace so far (value x 60 / elapsed_s).
+    ``so_far`` keeps the raw values the proxy has written for the minute. Every average, rate and fraction in
+    the summary is computed from complete minutes before this point is built, so it only feeds the charts.
+    """
+    if row is None or elapsed_s < LIVE_MINUTE_MIN_ELAPSED_S:
+        return None
+    point = minute_point(until, row)
+    so_far = {key: point[key] for key in LIVE_PACE_KEYS}
+    pace = 60 / elapsed_s
+    for key in LIVE_PACE_KEYS:
+        point[key] = int(round(point[key] * pace))
+    point["r429_per_min"] = point["r429"]
+    point["pct_total"] = fraction(point["total"], LIMITS["total"])
+    point["pct_ds_output"] = fraction(point["ds_output"], LIMITS["output"])
+    point["pct_kimi_uncached"] = fraction(point["kimi_uncached"], LIMITS["uncached"])
+    point["pct_ds_uncached"] = fraction(point["ds_uncached"], LIMITS["uncached_ds"])
+    point["total_source"] = "projected"
+    point["live"] = True
+    point["elapsed_s"] = elapsed_s
+    point["so_far"] = so_far
+    point["live_note"] = (
+        f"this minute so far {so_far['total']:,} tokens; projected {point['total']:,}/min after {elapsed_s}s"
+    )
+    return point
 
 
 def average_fraction(raw: dict[int, dict], until: int, key: str, limit: int) -> float:
@@ -2827,6 +2904,29 @@ def token_mix(minutes: list[dict]) -> list[dict]:
         running += total
         mix.append({"t": point["t"], "minute": point["minute"], "total": total, **parts, "cumulative": running})
     return mix
+
+
+def live_mix_point(live_point: dict, mix: list[dict], bucket_s: int) -> dict:
+    """The minute in progress as one extra token-mix bar, at the live pace for a whole bucket.
+
+    Its cumulative total carries on from the last complete bucket, so the running line stays monotonic and
+    the range totals and axes, which are built from complete buckets, do not move with every poll.
+    """
+    factor = max(1, bucket_s // 60)
+    total = live_point["total"] * factor
+    return {
+        "t": live_point["t"],
+        "minute": live_point["minute"],
+        "total": total,
+        "cache_read": live_point["cache_read"] * factor,
+        "uncached": live_point["input"] * factor,
+        "output": live_point["output"] * factor,
+        "cumulative": (mix[-1]["cumulative"] if mix else 0) + total,
+        "live": True,
+        "elapsed_s": live_point["elapsed_s"],
+        "so_far": live_point["so_far"],
+        "live_note": live_point["live_note"],
+    }
 
 
 def token_totals(mix: list[dict]) -> dict:
@@ -3601,6 +3701,10 @@ def build_summary(
     errors: dict[str, str] = {}
     bucket = BUCKET_S[hours]
     raw = _guard("minutes", errors, read_minute_rows, {}, agentq_db, since, until)
+    elapsed_s = int(now - until)
+    live_row: dict | None = None
+    if elapsed_s >= LIVE_MINUTE_MIN_ELAPSED_S:
+        live_row = _guard("minutes_live", errors, read_minute_rows, {}, agentq_db, until, until + 60).get(until)
     admitted = _guard("admitted", errors, read_calib, {}, agentq_db, since, until)
     live = _guard("live", errors, fetch_live, None)
     jobs = _guard("jobs", errors, read_jobs, None, agentq_db)
@@ -3630,7 +3734,13 @@ def build_summary(
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
     mix = token_mix(token_minutes)
+    totals = token_totals(mix)
     limit = token_limit(resolved["total"], token_bucket)
+    axes = token_axes(mix, limit)
+    live_point = live_minute_point(live_row, until, elapsed_s)
+    if live_point is not None:
+        minutes = minutes + [live_point]
+        mix = mix + [live_mix_point(live_point, mix, token_bucket)]
     range_verdicts = _guard("range_verdicts", errors, read_verdicts, {}, agentq_db, float(since), float(until))
     workers_bucketed = bucket_workers(samples, bucket)
     kpis = run_kpis(runs, since, caps)
@@ -3675,10 +3785,10 @@ def build_summary(
         "bucket_s": bucket,
         "minutes": minutes,
         "token_mix": mix,
-        "token_totals": token_totals(mix),
+        "token_totals": totals,
         "token_bucket_s": token_bucket,
         "token_limit": limit,
-        "token_axes": token_axes(mix, limit),
+        "token_axes": axes,
         "range_totals": range_totals(raw, since, until, runs, range_verdicts),
         "jobs": jobs,
         "workers": workers_bucketed,

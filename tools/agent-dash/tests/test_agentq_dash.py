@@ -120,11 +120,17 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(limits["total"]["target_frac"], 0.9)
         self.assertEqual(limits["uncached"]["target_frac"], 1.18)
 
-    def test_current_minute_is_excluded_from_minutes_and_rates(self) -> None:
+    def test_current_minute_feeds_only_the_projected_live_point(self) -> None:
         summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)
         self.assertEqual(summary["window"]["end"], UNTIL)
-        self.assertNotIn(UNTIL, [p["t"] for p in summary["minutes"]])
-        self.assertTrue(all(p["total"] != 999999 for p in summary["minutes"]))
+        complete = [p for p in summary["minutes"] if not p.get("live")]
+        self.assertNotIn(UNTIL, [p["t"] for p in complete])
+        self.assertTrue(all(p["total"] != 999999 for p in complete))
+        live = summary["minutes"][-1]
+        self.assertTrue(live["live"])
+        self.assertEqual(live["t"], UNTIL)
+        self.assertEqual(live["so_far"]["total"], 999999 * 2)
+        self.assertEqual(summary["ds_output_5m_per_min"], (7000 + 500_000 + 5) / 5)
 
     def test_minute_points_sum_models_and_compute_fractions(self) -> None:
         summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)
@@ -506,9 +512,11 @@ class RunsTest(unittest.TestCase):
     def test_token_mix_uses_five_minute_buckets_and_keeps_every_token(self) -> None:
         mix = self.summary["token_mix"]
         self.assertEqual(self.summary["token_bucket_s"], 300)
-        self.assertTrue(all(row["t"] % 300 == 0 for row in mix))
+        complete = [row for row in mix if not row.get("live")]
+        self.assertTrue(all(row["t"] % 300 == 0 for row in complete))
+        minutes = [p for p in self.summary["minutes"] if not p.get("live")]
         for key, source in (("cache_read", "cache_read"), ("uncached", "input"), ("output", "output")):
-            self.assertEqual(sum(row[key] for row in mix), sum(p[source] for p in self.summary["minutes"]))
+            self.assertEqual(sum(row[key] for row in complete), sum(p[source] for p in minutes))
 
     def test_direct_run_past_the_seven_day_lookback_is_absent(self) -> None:
         self.assertNotIn("hub-direct-launch-x", self.runs)
@@ -603,9 +611,9 @@ class IncompleteMinuteTest(unittest.TestCase):
         self.assertIsNone(limits["output"]["last_min_frac"])
         self.assertIsNone(limits["total"]["last_min_frac"])
 
-    def test_series_ends_at_the_last_minute_with_a_row_and_keeps_idle_gaps_as_zero(self) -> None:
+    def test_series_ends_at_the_last_complete_minute_with_a_row_and_keeps_idle_gaps_as_zero(self) -> None:
         self.delete_minute(60)
-        minutes = self.summary()["minutes"]
+        minutes = [p for p in self.summary()["minutes"] if not p.get("live")]
         self.assertEqual(minutes[-1]["minute"], minute_at(120))
         by_minute = {p["minute"]: p for p in minutes}
         self.assertNotIn(minute_at(60), by_minute)
@@ -614,6 +622,83 @@ class IncompleteMinuteTest(unittest.TestCase):
     def test_deepseek_output_rate_averages_five_complete_minutes(self) -> None:
         # 11:59 = 7000, 11:58 = 500000, 11:57 = 5, 11:56 and 11:55 have no rows; the current minute is excluded.
         self.assertEqual(self.summary()["ds_output_5m_per_min"], (7000 + 500_000 + 5) / 5)
+
+
+CURRENT_MINUTE_ROW = (dash.minute_stamp(UNTIL), "morph-dsv41flash-1017", 9, 9, 9, 999999, 0, 999999, 0, 99, 99, 0.9)
+
+
+class LiveMinuteTest(unittest.TestCase):
+    """The minute in progress is one extra projected chart point; no average, rate or table reads it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def set_current_minute(self, present: bool) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute("DELETE FROM proxy_minutes WHERE minute = ?", (minute_at(0),))
+        if present:
+            conn.execute(f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", CURRENT_MINUTE_ROW)
+        conn.commit()
+        conn.close()
+
+    def summary(self, *, now: float = NOW, hours: int = 1) -> dict:
+        return dash.build_summary(self.home, hours, now=now, fetch_live=proxy_status)
+
+    def test_live_point_is_the_last_minute_projected_at_the_pace_so_far(self) -> None:
+        point = self.summary()["minutes"][-1]
+        self.assertTrue(point["live"])
+        self.assertEqual(point["t"], UNTIL)
+        self.assertEqual(point["elapsed_s"], 30)
+        self.assertEqual(point["so_far"]["total"], 1_999_998)
+        self.assertEqual(point["total"], 1_999_998 * 2)
+        self.assertEqual(point["r429"], 9 * 2)
+        self.assertEqual(point["req"], 9 * 2)
+        self.assertEqual(point["pct_total"], dash.fraction(1_999_998 * 2, 10_000_000))
+        self.assertEqual(point["total_source"], "projected")
+        self.assertIn("this minute so far", point["live_note"])
+
+    def test_no_live_point_in_the_first_twenty_seconds(self) -> None:
+        minutes = self.summary(now=UNTIL + 10)["minutes"]
+        self.assertNotIn(UNTIL, [p["t"] for p in minutes])
+        self.assertFalse(any(p.get("live") for p in minutes))
+        self.assertIsNotNone(dash.live_minute_point({"total": 10}, UNTIL, 20))
+        self.assertIsNone(dash.live_minute_point({"total": 10}, UNTIL, 19))
+        self.assertIsNone(dash.live_minute_point(None, UNTIL, 40))
+
+    def test_averages_rates_fractions_and_the_minute_table_ignore_the_live_minute(self) -> None:
+        for hours in (1, 6):
+            self.set_current_minute(True)
+            with_live = self.summary(hours=hours)
+            self.assertTrue(with_live["minutes"][-1]["live"])
+            self.set_current_minute(False)
+            without = self.summary(hours=hours)
+            self.assertNotIn(UNTIL, [p["t"] for p in without["minutes"]])
+            with self.subTest(hours=hours):
+                self.assertEqual(with_live["range_avg_pct_total"], without["range_avg_pct_total"])
+                self.assertEqual(with_live["hourly_avg_pct_total"], without["hourly_avg_pct_total"])
+                self.assertEqual(with_live["limits"], without["limits"])
+                self.assertEqual(with_live["capacity"], without["capacity"])
+                self.assertEqual(with_live["ds_output_5m_per_min"], without["ds_output_5m_per_min"])
+                self.assertEqual(with_live["r429_60m"], without["r429_60m"])
+                self.assertEqual(with_live["activity"], without["activity"])
+                self.assertEqual(with_live["range_totals"], without["range_totals"])
+                self.assertEqual(with_live["perf_kpis"], without["perf_kpis"])
+                self.assertEqual(with_live["token_totals"], without["token_totals"])
+                self.assertEqual(with_live["token_axes"], without["token_axes"])
+                complete = [p for p in with_live["minutes"] if not p.get("live")]
+                self.assertEqual(complete, without["minutes"])
+
+    def test_page_styles_the_live_point_and_keeps_it_out_of_the_minute_table(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('lastDot.fill = lastP.live ? "var(--surface)" : COLORS.muted', html)
+        self.assertIn('lastDot.stroke = lastP.live ? COLORS.muted : "var(--surface)"', html)
+        self.assertIn('"stroke-dasharray": "4 3"', html)
+        self.assertIn('(d.minutes || []).filter(function (p) { return !p.live; })', html)
+        self.assertIn('head = fmtX(p.t) + " \\u00b7 in progress, " + p.elapsed_s + "s in";', html)
 
 
 CALIB_DDL = """
@@ -639,14 +724,16 @@ class BucketAndTotalsTest(unittest.TestCase):
     def test_24h_uses_five_minute_buckets_that_keep_every_token(self) -> None:
         summary = dash.build_summary(self.home, 24, now=NOW, fetch_live=proxy_status)
         self.assertEqual(summary["bucket_s"], 300)
-        self.assertTrue(all(p["t"] % 300 == 0 for p in summary["minutes"]))
-        self.assertEqual(sum(p["total"] for p in summary["minutes"]), sum(p["total"] for p in self.raw_minutes(24)))
-        self.assertEqual(sum(p["r429"] for p in summary["minutes"]), sum(p["r429"] for p in self.raw_minutes(24)))
+        complete = [p for p in summary["minutes"] if not p.get("live")]
+        self.assertTrue(all(p["t"] % 300 == 0 for p in complete))
+        self.assertEqual(sum(p["total"] for p in complete), sum(p["total"] for p in self.raw_minutes(24)))
+        self.assertEqual(sum(p["r429"] for p in complete), sum(p["r429"] for p in self.raw_minutes(24)))
+        self.assertTrue(summary["minutes"][-1]["live"])
 
     def test_7d_uses_thirty_minute_buckets_and_averages_percent_over_members(self) -> None:
         summary = dash.build_summary(self.home, 168, now=NOW, fetch_live=proxy_status)
         self.assertEqual(summary["bucket_s"], 1800)
-        self.assertTrue(all(p["t"] % 1800 == 0 for p in summary["minutes"]))
+        self.assertTrue(all(p["t"] % 1800 == 0 for p in summary["minutes"] if not p.get("live")))
         members = [p for p in self.raw_minutes(168) if p["t"] // 1800 * 1800 == UNTIL // 1800 * 1800 - 1800 * 2]
         bucket = next(p for p in summary["minutes"] if p["t"] == UNTIL // 1800 * 1800 - 1800 * 2)
         self.assertEqual(bucket["minutes"], len(members))
@@ -675,11 +762,16 @@ class BucketAndTotalsTest(unittest.TestCase):
     def test_cumulative_token_mix_is_a_running_sum_over_the_range(self) -> None:
         summary = dash.build_summary(self.home, 6, now=NOW, fetch_live=proxy_status)
         mix = summary["token_mix"]
+        complete = [row for row in mix if not row.get("live")]
         running = 0
-        for row in mix:
+        for row in complete:
             running += row["cache_read"] + row["uncached"] + row["output"]
             self.assertEqual(row["cumulative"], running)
-        self.assertEqual(mix[-1]["cumulative"], sum(p["total"] for p in summary["minutes"]))
+        minutes = [p for p in summary["minutes"] if not p.get("live")]
+        self.assertEqual(complete[-1]["cumulative"], sum(p["total"] for p in minutes))
+        live = mix[-1]
+        self.assertTrue(live["live"])
+        self.assertEqual(live["cumulative"], complete[-1]["cumulative"] + live["total"])
 
     def test_range_totals_sum_the_range_and_count_runs_and_verdicts(self) -> None:
         totals = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)["range_totals"]
@@ -860,7 +952,7 @@ class TokenChartTest(unittest.TestCase):
             summary = self.summary(hours)
             with self.subTest(hours=hours):
                 axis = summary["token_axes"]["left"]
-                peak = max(row["total"] for row in summary["token_mix"])
+                peak = max(row["total"] for row in summary["token_mix"] if not row.get("live"))
                 self.assertGreaterEqual(axis["max"], summary["token_limit"]["value"] * 1.05)
                 self.assertGreaterEqual(axis["max"], peak * 1.1)
                 self.assertEqual(axis["ticks"][0], 0)
@@ -879,7 +971,7 @@ class TokenChartTest(unittest.TestCase):
             summary = self.summary(hours)
             totals = summary["token_totals"]
             with self.subTest(hours=hours):
-                self.assertEqual(totals["total"], sum(row["total"] for row in summary["token_mix"]))
+                self.assertEqual(totals["total"], sum(row["total"] for row in summary["token_mix"] if not row.get("live")))
                 self.assertAlmostEqual(sum(totals["shares"].values()), 1.0, places=9)
                 self.assertEqual(totals["shares"]["output"], totals["output"] / totals["total"])
 
@@ -1795,7 +1887,7 @@ class SmallChartRowTest(unittest.TestCase):
                 block = html[start:end]
                 self.assertIn("smallChart(", block)
                 self.assertIn("var smallChart = function", html)
-                self.assertIn("points: minutes", html)
+                self.assertIn("points: completeMinutes", html)
                 self.assertIn("bucket_s: bucket", html)
                 self.assertIn("x0: win.start", html)
 
