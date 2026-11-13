@@ -91,7 +91,8 @@ class ControllerTests(unittest.TestCase):
             now += 2
         bootstraps = [p for p in plans if p.key == "bootstrap"]
         self.assertEqual([p.submit for p in bootstraps], [4])
-        self.assertEqual(judgements[0], "bootstrap step of 4 judged good: 150,000 per added worker against 150,000")
+        self.assertEqual(judgements[0],
+                         "bootstrap step of 4 judged good: 150,000 per added worker against 150,000 per worker")
         self.assertGreaterEqual(150_000.0 * active, 0.9 * 8_000_000)
         self.assertIsNone(ctl.new_ceiling)
         self.assertGreater(sum(1 for p in plans if p.key == "stepping"), 1)
@@ -239,6 +240,55 @@ class ControllerTests(unittest.TestCase):
         for k in range(1, 4):
             ctl.samples.append((NOW - 60 * k, 0.0, 4))
         self.assertIsNone(ctl.measured_rate(NOW, NOW, FILL))
+
+
+def simulate(ctl, *, seconds, billed_fn, start_filler, start_real=0, real_events=(), life=None):
+    """Drive the controller tick by tick. Filler workers the controller submits start at once and live ``life``
+    seconds (forever when None). Real DeepSeek workers follow ``real_events``: (second, count) pairs.
+    Returns (plans, filler peak, filler count at the end)."""
+    launches, plans, peak = [], [], start_filler
+    real = start_real
+    t = 0
+    while t < seconds:
+        for when, count in real_events:
+            if when == t:
+                real = count
+        filler = start_filler + sum(n for lt, n in launches if life is None or t - lt < life)
+        plan = tick(ctl, NOW + t, billed_fn(filler, real), filler + real, real=real)
+        if plan.submit:
+            launches.append((t, plan.submit))
+        filler_after = filler + plan.submit
+        peak = max(peak, filler_after)
+        plans.append(plan)
+        t += 2
+    return plans, peak, start_filler + sum(n for lt, n in launches if life is None or seconds - lt < life)
+
+
+class RealWorkerTests(unittest.TestCase):
+    def test_kimi_real_arrival_probe_stays_within_51_filler_workers(self):
+        ctl = seeded(active=47, per_worker=100_000.0)
+        billed = lambda filler, real: 4_700_000 + 25_000 * (filler - 47) + 175_000 * real  # noqa: E731
+        plans, peak, _ = simulate(ctl, seconds=3 * 3600, billed_fn=billed, start_filler=47,
+                                  real_events=[(100, 4)])
+        self.assertLessEqual(peak, 51)
+        self.assertNotIn("judged good", ctl.judgement or "")
+        self.assertFalse(any("judged good" in (p.reason or "") for p in plans))
+        self.assertEqual(ctl.last_ceiling, 47)
+
+    def test_real_departures_during_a_good_probe_do_not_stall_growth_forever(self):
+        ctl = seeded(active=8, per_worker=175_000.0)
+        billed = lambda filler, real: 175_000.0 * (filler + real)  # noqa: E731
+        plans, peak, final = simulate(ctl, seconds=6 * 3600, billed_fn=billed, start_filler=8,
+                                      real_events=[(100, 4), (200, 0)], life=1200)
+        self.assertGreaterEqual(175_000.0 * final, 0.9 * 8_000_000)
+        self.assertIsNone(ctl.last_ceiling)
+
+    def test_good_gains_from_twenty_workers_reach_the_target_band(self):
+        ctl = seeded(active=20, per_worker=175_000.0)
+        billed = lambda filler, real: 175_000.0 * (filler + real)  # noqa: E731
+        plans, peak, final = simulate(ctl, seconds=3 * 3600, billed_fn=billed, start_filler=20)
+        self.assertGreaterEqual(175_000.0 * final, 0.9 * 8_000_000)
+        self.assertIsNone(ctl.new_ceiling)
 
 
 class ProxyUnavailableTests(unittest.TestCase):

@@ -222,22 +222,52 @@ class FillController:
         rate = statistics.median(rates)
         return rate if rate >= fill["rate_min"] else None
 
+    def _start_step(self, now: float, fill: dict, active: int, real_running: int, billed_avg: float,
+                    added: int, bootstrap: bool = False) -> None:
+        """Begin a probe or bootstrap step. Its judgement comes ``step_interval_s`` later, from the filler it started."""
+        self.step = {
+            "start": now, "judge_at": now + fill["step_interval_s"], "added": added,
+            "workers_before": active, "filler_before": active - real_running, "real_before": real_running,
+            "avg_before": billed_avg, "bootstrap": bootstrap, "real_changed": False, "extended": False,
+        }
+
     def _judge(self, now: float, billed_avg: float, active: int, real_running: int, fill: dict) -> None:
-        step, self.step = self.step, None
-        added = active - step["workers_before"]
-        if added <= 0:
+        """Judge the step by the filler it started, never by total busy workers.
+
+        ``added`` is this step's filler still running, capped at what it submitted. Any change in real DeepSeek
+        work during the step makes it unclean, and real work bills too, so an unclean step is never judged good.
+        The first unclean judgement extends the window once; an unclean judgement after that is poor.
+        """
+        step = self.step
+        filler_now = active - real_running
+        added = min(step["added"], max(0, filler_now - step["filler_before"]))
+        if added == 0 and not step["real_changed"]:
+            self.step = None
             self.judgement = "step void: no filler worker started, nothing to judge"
             return
-        bootstrap = step.get("bootstrap", False)
-        rate = fill["bootstrap_rate"] if bootstrap else self.measured_rate(now, step["start"], fill)
-        if rate is None:
-            self.judgement = "step not judged: per-worker rate unknown"
+        unclean = step["real_changed"] or added < step["added"]
+        if unclean and not step["extended"]:
+            step["extended"] = True
+            step["judge_at"] = now + fill["step_interval_s"]
+            self.judgement = "step window extended once: real work changed or filler fell short of the step"
             return
-        gain = (billed_avg - step["avg_before"]) / added
-        if gain > 0 and gain >= fill["min_marginal_frac"] * rate:
+        self.step = None
+        bootstrap = step["bootstrap"]
+        rate = fill["bootstrap_rate"] if bootstrap else self.measured_rate(now, step["start"], fill)
+        if unclean:
+            poor = True
+            evidence = "real work changed during the probe"
+        else:
+            if rate is None:
+                self.judgement = "step not judged: per-worker rate unknown"
+                return
+            gain = (billed_avg - step["avg_before"]) / added
+            poor = not (gain > 0 and gain >= fill["min_marginal_frac"] * rate)
+            evidence = f"{gain:,.0f} per added worker against {rate:,.0f} per worker"
+        kind = "bootstrap step" if bootstrap else "step"
+        if not poor:
             self.last_ceiling = None
-            kind = "bootstrap step" if bootstrap else "step"
-            self.judgement = f"{kind} of {added} judged good: {gain:,.0f} per added worker against {rate:,.0f}"
+            self.judgement = f"{kind} of {added} judged good: {evidence}"
             return
         if bootstrap:
             workers = real_running
@@ -245,13 +275,11 @@ class FillController:
             workers = max(step["workers_before"], self.last_ceiling or 0, real_running)
         self.ceiling = (workers, now)
         self.last_ceiling = workers
-        self.peak = active
         self.new_ceiling = self.ceiling
-        self.judgement = (f"step of {added} judged poor: {gain:,.0f} per added worker against "
-                          f"{rate:,.0f} per worker; ceiling {workers} workers")
+        self.judgement = f"{kind} of {added} judged poor: {evidence}; ceiling {workers} workers"
 
-    def _bootstrap(self, now: float, fill: dict, active: int, billed_avg: float, queued_filler: int,
-                   average: str) -> FillPlan:
+    def _bootstrap(self, now: float, fill: dict, active: int, real_running: int, billed_avg: float,
+                   queued_filler: int, average: str) -> FillPlan:
         """With no measured per-worker rate and no busy DeepSeek worker, take one bootstrap step judged against the
         prior rate.
 
@@ -263,8 +291,7 @@ class FillController:
         if active > 0 or self.active_ceiling(now, fill) is not None or queued_filler > 0 or to_add <= 0:
             return FillPlan(True, 0, "per-worker rate unknown; bootstrap waits on a ceiling, queued filler or the cap",
                             "rate-unknown")
-        self.step = {"start": now, "workers_before": active, "avg_before": billed_avg, "added": to_add,
-                     "bootstrap": True}
+        self._start_step(now, fill, active, real_running, billed_avg, to_add, bootstrap=True)
         return FillPlan(True, to_add, f"{average}; no measured per-worker rate, so one bootstrap step of {to_add} "
                         f"filler workers judged at the prior {fill['bootstrap_rate']:,.0f} per worker", "bootstrap")
 
@@ -284,8 +311,11 @@ class FillController:
         target = float(fill["target_billed_per_min"])
         low, high = fill["low_frac"] * target, fill["high_frac"] * target
         self.filling = filling_state(self.filling, billed_avg, target, fill["low_frac"], fill["high_frac"])
-        if self.step is not None and now - self.step["start"] >= fill["step_interval_s"]:
-            self._judge(now, billed_avg, active, real_running, fill)
+        if self.step is not None:
+            if real_running != self.step["real_before"]:
+                self.step["real_changed"] = True
+            if now >= self.step["judge_at"]:
+                self._judge(now, billed_avg, active, real_running, fill)
         average = f"5-min average {billed_avg / 1e6:.2f}M/min"
         if not self.filling:
             return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; no filler", "high-mark")
@@ -294,20 +324,20 @@ class FillController:
         if gate is not None:
             return FillPlan(True, 0, gate, "gate")
         if self.step is not None:
-            left = max(0.0, fill["step_interval_s"] - (now - self.step["start"]))
+            left = max(0.0, self.step["judge_at"] - now)
             return FillPlan(True, 0, f"step of {self.step['added']} in progress; judged in {left:.0f} s", "step-wait")
         if self.measured_rate(now, now, fill) is None:
-            return self._bootstrap(now, fill, active, billed_avg, queued_filler, average)
+            return self._bootstrap(now, fill, active, real_running, billed_avg, queued_filler, average)
         limit, cause = self.worker_limit(now, fill, real_running)
         room = limit - active - queued_filler
         if room <= 0:
             return FillPlan(True, 0, f"{average}; {active} busy at the {cause} of {limit}", "at-limit")
         to_add = min(int(fill["step_workers"]), room)
-        top = max(self.peak, self.last_ceiling or 0)
+        top = self.last_ceiling if self.last_ceiling is not None else self.peak
         if active + to_add <= top:
             return FillPlan(True, to_add, f"{average}; refilling {to_add} to {active + to_add} busy (at or below "
                             f"the peak {top}; not a probe)", "refill")
-        self.step = {"start": now, "workers_before": active, "avg_before": billed_avg, "added": to_add}
+        self._start_step(now, fill, active, real_running, billed_avg, to_add)
         return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; probing {to_add} "
                         f"filler workers from {active} busy (limit {limit})", "stepping")
 
