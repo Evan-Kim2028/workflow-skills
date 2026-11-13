@@ -34,7 +34,6 @@ BUCKET_S = {1: 60, 6: 60, 24: 300, 168: 1800}
 DEFAULT_HOURS = 6
 RECENT_JOBS = 200
 LIMIT_WINDOW_MINUTES = 5
-RECENT_WINDOW_MINUTES = 60
 TOKEN_BUCKET_S = {1: 300, 6: 300, 24: 300, 168: 1800}
 AVERAGE_SATURATION_FRAC = 0.90
 ROOM_FRAC = 0.95
@@ -82,6 +81,12 @@ RATE_WINDOW_MINUTES = 60
 SAMPLE_INTERVAL_S = 60.0
 SAMPLE_KEEP_S = 7 * 24 * 3600
 LIVE_TIMEOUT_S = 2.0
+RANGE_CADENCE_S = {1: 5.0, 6: 5.0, 24: 15.0, 168: 60.0}
+READER_CADENCE_S = 5.0
+IDLE_AFTER_S = 120.0
+WORKER_TICK_S = 1.0
+FIRST_READ_WAIT_S = LIVE_TIMEOUT_S + 1.0
+GONE_LOG_S = 60.0
 DB_TIMEOUT_S = 2.0
 PS_TIMEOUT_S = 10.0
 ERROR_CHARS = 200
@@ -98,7 +103,6 @@ LIMIT_LABELS = {
 UNTAGGED_JOBS = frozenset({"", "none"})
 UNTAGGED_LABEL = "untagged (pre-tagging workers)"
 ACTIVE_WINDOW_S = 120
-PERF_WINDOW_MINUTES = 15
 RUN_LOOKBACK_S = 7 * 24 * 3600
 RUN_ROWS = 200
 TOP_CONSUMERS = 10
@@ -377,32 +381,33 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     <div class="room" id="v-room">—</div>
   </section>
 
-  <div class="activity" aria-label="Activity">
+  <h3 class="group" id="g-now">Now</h3>
+  <div class="activity" aria-label="Now">
     <div class="stat"><div class="label">Tokens, last 5 min</div><div class="value" id="a5-tokens">—</div><div class="note" id="a5-note">—</div><div class="note" id="a5-min">—</div></div>
     <div class="stat"><div class="label">Tokens, last 15 min</div><div class="value" id="a15-tokens">—</div><div class="note" id="a15-note">—</div><div class="note" id="a15-min">—</div></div>
     <div class="stat"><div class="label">DeepSeek output, 5 min avg per min</div><div class="value" id="a-ds">—</div><div class="note">tokens per minute, plain count</div></div>
+    <div class="stat"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
+    <div class="stat"><div class="label">Requests in flight</div><div class="value" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
+    <div class="stat"><div class="label">DeepSeek runs active</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
+    <div class="stat"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note">waiting for a worker</div></div>
+    <div class="stat"><div class="label">Filler runs</div><div class="value" id="r-filler">—</div><div class="note">backlog audits running now</div></div>
   </div>
 
   <div class="panels">
     <section class="panel" aria-labelledby="g-cap">
-      <h3 class="group" id="g-cap">Capacity</h3>
+      <h3 class="group" id="g-cap">Capacity, <span class="rng">last 6 h</span></h3>
       <div class="kpis">
-        <div class="kpi head"><div class="label">Total pool, 5 min avg</div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
-        <div class="kpi"><div class="label">DeepSeek uncached, 5 min avg</div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
-        <div class="kpi"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
-        <div class="kpi"><div class="label">Requests in flight now</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
-        <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
+        <div class="kpi head"><div class="label">Total pool, avg <span class="rng">last 6 h</span></div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
+        <div class="kpi"><div class="label">DeepSeek uncached, avg <span class="rng">last 6 h</span></div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
+        <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note"><span class="rng">last 6 h</span>, per request; p95 is the worst minute</div></div>
       </div>
     </section>
     <section class="panel" aria-labelledby="g-runs">
-      <h3 class="group" id="g-runs">Work</h3>
+      <h3 class="group" id="g-runs">Work, <span class="rng">last 6 h</span></h3>
       <div class="kpis">
-        <div class="kpi"><div class="label">DeepSeek runs active</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
-        <div class="kpi"><div class="label">Filler runs</div><div class="value" id="r-filler">—</div><div class="note">backlog audits running now</div></div>
-        <div class="kpi"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note">waiting for a worker</div></div>
-        <div class="kpi"><div class="label">Finished today</div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL</div></div>
-        <div class="kpi"><div class="label">Tokens today</div><div class="value" id="r-tokens">—</div><div class="note">all runs, local day</div></div>
-        <div class="kpi"><div class="label">429s absorbed</div><div class="value" id="r-429">—</div><div class="note" id="r-429-note">retried by the proxy</div></div>
+        <div class="kpi"><div class="label">Finished, <span class="rng">last 6 h</span></div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL</div></div>
+        <div class="kpi"><div class="label">Tokens, <span class="rng">last 6 h</span></div><div class="value" id="r-tokens">—</div><div class="note">all runs, billed</div></div>
+        <div class="kpi"><div class="label">429s absorbed, <span class="rng">last 6 h</span></div><div class="value" id="r-429">—</div><div class="note">retried by the proxy</div></div>
       </div>
     </section>
   </div>
@@ -440,7 +445,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   <section class="grid3">
     <div class="card" aria-labelledby="h-kimi">
       <div class="card-head"><h2 id="h-kimi">Kimi uncached (est.)</h2></div>
-      <div class="note-line">last 60 min</div>
+      <div class="note-line"><span class="rng">last 6 h</span></div>
       <div class="chart" id="c-kimi"></div>
     </div>
     <div class="card" aria-labelledby="h-dsu">
@@ -450,12 +455,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     </div>
     <div class="card" aria-labelledby="h-429">
       <div class="card-head"><h2 id="h-429">Morph 429s</h2></div>
-      <div class="note-line">last 60 min</div>
+      <div class="note-line"><span class="rng">last 6 h</span></div>
       <div class="chart" id="c-429"></div>
     </div>
     <div class="card" aria-labelledby="h-wait">
       <div class="card-head"><h2 id="h-wait">Proxy wait p95</h2></div>
-      <div class="note-line">last 60 min</div>
+      <div class="note-line"><span class="rng">last 6 h</span></div>
       <div class="chart" id="c-wait"></div>
     </div>
   </section>
@@ -493,7 +498,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   <section class="card" aria-labelledby="h-top">
     <div class="card-head">
-      <h2 id="h-top">Top consumers today</h2>
+      <h2 id="h-top">Top consumers, <span class="rng">last 6 h</span></h2>
       <div class="sub" id="top-total"></div>
     </div>
     <div class="table-wrap">
@@ -578,13 +583,14 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 (function () {
   "use strict";
   var NS = "http://www.w3.org/2000/svg";
-  var POLL_MS = 30000;
-  var SLOW_POLL_MS = 120000;
+  var POLL_MS_BY_HOURS = { 1: 5000, 6: 5000, 24: 15000, 168: 60000 };
+  var LOG_POLL_MS = 15000;
   var RANGE_NAME = { 1: "1h", 6: "6h", 24: "24h", 168: "7d" };
+  var RANGE_LABEL = { 1: "last 1 h", 6: "last 6 h", 24: "last 24 h", 168: "last 7 d" };
   var NAME_RANGE = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
   var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)", muted: "var(--ink-3)" };
-  var state = { hours: 6, data: null, seq: 0, lastFetch: 0, lastGood: null, stale: null, timer: null };
-  var log = { source: "proxy", page: 1, q: "", seq: 0, data: null, qTimer: null };
+  var state = { hours: 6, data: null, seq: 0, lastFetch: 0, stale: null, timer: null };
+  var log = { source: "proxy", page: 1, q: "", seq: 0, data: null, qTimer: null, fetchedAt: 0 };
   var charts = [];
   var tables = {};
 
@@ -1139,9 +1145,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var limits = d.limits || {};
     var total = limits.total || {};
     var dsu = limits.uncached_ds || {};
-    setText("cap-used", pct(total.avg_5m_frac));
+    setText("cap-used", pct(total.range_avg_frac));
     setText("cap-binding", "of the " + compact(total.limit) + " per minute limit");
-    setText("cap-ds-unc", pct(dsu.avg_5m_frac));
+    setText("cap-ds-unc", pct(dsu.range_avg_frac));
     setText("cap-ds-unc-note", "of " + compact(dsu.limit) + " per minute");
     setTile("k-waiting", cap.waiting_now);
     var lanes = cap.waiting_by_lane || {};
@@ -1157,9 +1163,6 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var queued = ((d.jobs || {}).by_state || {}).queued;
     setTile("r-queued", queued === undefined ? null : queued);
     setTile("r-filler", (d.jobs || {}).filler_running);
-    var fin = rk.finished_today || {};
-    setTileList("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
-    setTile("r-tokens", rk.tokens_today);
   }
 
   function renderPerf(d) {
@@ -1170,8 +1173,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 
   function renderRange(d) {
     var rt = d.range_totals || {};
+    var fin = rt.finished || {};
+    setTileList("r-finished", ["PASS", "PARTIAL", "FAIL"].map(function (v) { return fin[v] || 0; }));
+    setTile("r-tokens", (rt.tokens || {}).total);
     setTile("r-429", rt.r429);
-    setText("r-429-note", "retried by the proxy, " + (RANGE_NAME[d.hours] || "") + " range");
   }
 
   function renderCharts(d) {
@@ -1247,19 +1252,16 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       { name: "Tokens billed", color: COLORS.s1, block: true },
       { name: "Cumulative (right axis)", color: COLORS.muted }
     ]);
-    var recent = d.recent || { window: { start: 0, end: 0 }, minutes: [] };
-    var recentMinutes = recent.minutes || [];
-    var recentWin = recent.window || { start: 0, end: 0 };
     var smallLayout = { height: 200, margin: { l: 48, r: 12, t: 26, b: 24 } };
     var smallPctAxis = { min: 0, max: 2, clip: 2, ticks: [0, 1, 2], fmt: pctFmt };
     var smallChart = function (id, cfg) {
       return Object.assign({
-        kind: "line", bucket_s: 60, tickFmt: hm, xSteps: 2, margin: smallLayout.margin,
-        x0: recentWin.start, x1: recentWin.end, height: smallLayout.height, points: recentMinutes
+        kind: "line", bucket_s: bucket, tickFmt: fmtX, xSteps: 2, margin: smallLayout.margin,
+        x0: win.start, x1: win.end, height: smallLayout.height, points: minutes
       }, cfg);
     };
-    var maxR = recentMinutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
-    var waitPoints = recentMinutes.map(function (p) {
+    var maxR = minutes.reduce(function (a, p) { return Math.max(a, p.r429); }, 0);
+    var waitPoints = minutes.map(function (p) {
       return { t: p.t, wait: p.wait_p95_ms === null || p.wait_p95_ms === undefined ? null : p.wait_p95_ms / 1000 };
     });
     var maxW = waitPoints.reduce(function (a, p) { return p.wait === null ? a : Math.max(a, p.wait); }, 0);
@@ -1276,10 +1278,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       refs: [{ v: 1, label: "limit" }],
       fmt: pctFmt
     }));
-    var rej = d.recent && d.recent.ds_uncached_rejections ? d.recent.ds_uncached_rejections : {};
+    var rej = d.ds_uncached_rejections || {};
     setText("dsu-sub", rej.count === null || rej.count === undefined
       ? "rejections not recorded"
-      : "Morph rejections on this limit, last 60 min: " + count(rej.count) + (rej.partial ? " (proxy log tail only)" : ""));
+      : "Morph rejections on this limit, " + RANGE_LABEL[d.hours] + ": " + count(rej.count) + (rej.partial ? " (proxy log tail only)" : ""));
     registerChart("c-dsu", smallChart("c-dsu", {
       title: "DeepSeek uncached input, estimated percent of 400k per minute",
       series: [{ key: "pct_ds_uncached", name: "DeepSeek uncached (estimate)", color: COLORS.s2 }],
@@ -1468,7 +1470,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var none = document.createElement("tr");
       var cell = document.createElement("td");
       cell.colSpan = 3;
-      cell.textContent = "No runs today";
+      cell.textContent = "No runs in " + RANGE_LABEL[d.hours];
       none.appendChild(cell);
       body.appendChild(none);
     }
@@ -1482,8 +1484,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       });
       body.appendChild(tr);
     });
-    var today = (d.run_kpis || {}).tokens_today;
-    $("top-total").textContent = today === undefined ? "" : "Today: " + tokens(today) + " tokens";
+    var rk = d.run_kpis || {};
+    $("top-total").textContent = rk.tokens_in_range === undefined ? "" :
+      RANGE_LABEL[d.hours] + ": " + tokens(rk.tokens_in_range) + " tokens across " + count(rk.seen_in_range) + " runs";
   }
 
   function renderRuns(d) {
@@ -1599,8 +1602,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       status.appendChild(warn);
       status.appendChild(document.createTextNode(" · " + state.stale + " · "));
     }
-    var text = state.lastGood
-      ? "updated " + Math.max(0, Math.floor((Date.now() - state.lastGood) / 1000)) + "s ago"
+    var text = state.data && state.data.generated_at
+      ? "updated " + Math.max(0, Math.floor(Date.now() / 1000 - state.data.generated_at)) + "s ago"
       : "loading";
     var errs = state.data && state.data.errors ? Object.keys(state.data.errors) : [];
     if (errs.length) text += " · partial: " + errs.join(", ");
@@ -1618,22 +1621,26 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       })
       .then(function (data) {
         if (seq !== state.seq) return;
+        var unchanged = state.data && state.data.hours === data.hours && state.data.generated_at === data.generated_at;
         state.data = data;
-        state.lastGood = Date.now();
         state.stale = null;
-        render(data);
+        if (unchanged) renderStatus();
+        else render(data);
       })
       .catch(function (err) {
         if (seq !== state.seq) return;
         state.stale = err && err.message ? err.message : "network error";
         renderStatus();
       });
-    refreshLog();
+    if (Date.now() - log.fetchedAt >= LOG_POLL_MS) refreshLog();
   }
 
   function setRangeButtons() {
     document.querySelectorAll(".range button").forEach(function (btn) {
       btn.setAttribute("aria-pressed", Number(btn.getAttribute("data-hours")) === state.hours ? "true" : "false");
+    });
+    document.querySelectorAll(".rng").forEach(function (el) {
+      el.textContent = RANGE_LABEL[state.hours];
     });
   }
 
@@ -1641,9 +1648,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     stopPolling();
     state.timer = setInterval(function () {
       if (document.visibilityState !== "visible") return;
-      if (state.hours === 168 && Date.now() - state.lastFetch < SLOW_POLL_MS - 1000) return;
+      if (Date.now() - state.lastFetch < POLL_MS_BY_HOURS[state.hours] - 500) return;
       refresh();
-    }, POLL_MS);
+    }, 1000);
   }
   function stopPolling() {
     if (state.timer) clearInterval(state.timer);
@@ -1907,6 +1914,21 @@ def average_fraction(raw: dict[int, dict], until: int, key: str, limit: int) -> 
     return fraction(billed / LIMIT_WINDOW_MINUTES, limit)
 
 
+def range_average_fraction(raw: dict[int, dict], since: int, until: int, key: str, limit: int) -> float | None:
+    """Mean billed fraction of a limit over the selected range, counted from the first minute the proxy recorded.
+
+    None when the range holds no proxy minutes, so the tile shows a gap rather than a zero.
+    """
+    if not raw:
+        return None
+    first = max(min(raw), since)
+    minutes = (until - first) // 60
+    if minutes <= 0:
+        return None
+    billed = sum(int((raw.get(t) or {}).get(key) or 0) for t in range(first, until, 60))
+    return fraction(billed / minutes, limit)
+
+
 def recent_429s(raw: dict[int, dict], until: int) -> int:
     """Upstream 429 responses over the last RATE_WINDOW_MINUTES complete minutes."""
     stamps = range(until - RATE_WINDOW_MINUTES * 60, until, 60)
@@ -2007,12 +2029,6 @@ def window_sum(raw: dict[int, dict], until: int, minutes: int, key: str) -> int:
 def deepseek_output_rate(raw: dict[int, dict], until: int) -> float:
     """Average DeepSeek output tokens per minute over the last LIMIT_WINDOW_MINUTES complete minutes."""
     return window_sum(raw, until, LIMIT_WINDOW_MINUTES, "ds_output") / LIMIT_WINDOW_MINUTES
-
-
-def day_start(now: float) -> float:
-    """Epoch second of local midnight on the day ``now`` falls in."""
-    local = time.localtime(now)
-    return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
 
 
 def median_or_none(values: list[float]) -> float | None:
@@ -2377,20 +2393,19 @@ def run_tier(run: dict) -> str | None:
     return "kimi" if "kimi" in tiers else None
 
 
-def run_kpis(runs: list[dict], day: float, caps: dict[str, int], verdicts: dict[str, int]) -> dict:
-    """Active runs against their caps, runs and tokens seen today, and today's finished queue verdicts."""
+def run_kpis(runs: list[dict], since: int, caps: dict[str, int]) -> dict:
+    """Active runs against their caps now, and the runs and tokens seen since ``since`` (the selected range)."""
     active_tiers = [run_tier(run) for run in runs if run["active"]]
-    today = [run for run in runs if run["last_ts"] >= day]
+    in_range = [run for run in runs if run["last_ts"] >= since]
     return {
         "active_deepseek": active_tiers.count("deepseek"),
         "active_kimi": active_tiers.count("kimi"),
         "cap_deepseek": caps["deepseek"],
         "cap_kimi": caps["kimi"],
-        "seen_today": len(today),
-        "finished_today": {verdict: int(verdicts.get(verdict, 0)) for verdict in VERDICTS},
-        "tokens_today": sum(run["total_tokens"] for run in today),
-        "median_tokens_per_run": median_or_none([run["total_tokens"] for run in today]),
-        "median_requests_per_run": median_or_none([run["requests"] for run in today]),
+        "seen_in_range": len(in_range),
+        "tokens_in_range": sum(run["total_tokens"] for run in in_range),
+        "median_tokens_per_run": median_or_none([run["total_tokens"] for run in in_range]),
+        "median_requests_per_run": median_or_none([run["requests"] for run in in_range]),
     }
 
 
@@ -2403,22 +2418,22 @@ def in_flight_total(live: dict | None) -> int | None:
     return sum(int(value) for value in in_flight.values())
 
 
-def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float, live: dict | None = None) -> dict:
-    """Proxy wait, upstream time, 429 rate and request rate. Wait p50 is request-weighted; p95 is the worst minute.
+def perf_kpis(raw: dict[int, dict], since: int, until: int, runs: list[dict], now: float, live: dict | None = None) -> dict:
+    """Proxy wait, upstream time, 429 rate and request rate over the selected range. Wait p50 is request-weighted; p95 is the worst minute.
     The Morph response time uses the same weighting: p50 is request-weighted over the minutes, p95 the worst minute."""
-    window = [raw[t] for t in range(until - PERF_WINDOW_MINUTES * 60, until, 60) if t in raw]
+    window = [raw[t] for t in range(since, until, 60) if t in raw]
     upstream_weight = sum(int(row.get("upstream_p50_weight") or 0) for row in window)
     upstream_p95s = [row["upstream_p95_ms"] for row in window if row.get("upstream_p95_ms") is not None]
-    req_15m = sum(row["req"] for row in window)
+    req_window = sum(row["req"] for row in window)
     p95s = [row["wait_p95_ms"] for row in window if row["wait_p95_ms"] is not None]
     upstream = [
         run["upstream_ms_per_req"]
         for run in runs
-        if run["upstream_ms_per_req"] is not None and now - run["last_ts"] <= PERF_WINDOW_MINUTES * 60
+        if run["upstream_ms_per_req"] is not None and now - run["last_ts"] <= until - since
     ]
     req_60m = window_sum(raw, until, RATE_WINDOW_MINUTES, "req")
     return {
-        "wait_p50_ms": sum(row["wait_p50_weighted"] for row in window) / req_15m if req_15m else None,
+        "wait_p50_ms": sum(row["wait_p50_weighted"] for row in window) / req_window if req_window else None,
         "wait_p95_ms": max(p95s) if p95s else None,
         "upstream_response_p50_ms": (
             round(sum(int(row.get("upstream_p50_weighted") or 0) for row in window) / upstream_weight)
@@ -2489,17 +2504,17 @@ def token_axes(mix: list[dict], limit: dict) -> dict:
     }
 
 
-def top_consumers(runs: list[dict], day: float, tokens_today: int) -> list[dict]:
-    """The runs with the most tokens today, each with its share of today's total."""
-    today = sorted((run for run in runs if run["last_ts"] >= day), key=lambda run: run["total_tokens"], reverse=True)
+def top_consumers(runs: list[dict], since: int, tokens_in_range: int) -> list[dict]:
+    """The runs with the most tokens since ``since``, each with its share of the tokens of those runs."""
+    in_range = sorted((run for run in runs if run["last_ts"] >= since), key=lambda run: run["total_tokens"], reverse=True)
     return [
         {
             "run": run["run"],
             "job": run["job"],
             "total_tokens": run["total_tokens"],
-            "share": run["total_tokens"] / tokens_today if tokens_today else None,
+            "share": run["total_tokens"] / tokens_in_range if tokens_in_range else None,
         }
-        for run in today[:TOP_CONSUMERS]
+        for run in in_range[:TOP_CONSUMERS]
     ]
 
 
@@ -3037,9 +3052,7 @@ def build_summary(
     live = _guard("live", errors, fetch_live, None)
     jobs = _guard("jobs", errors, read_jobs, None, agentq_db)
     samples = _guard("workers", errors, read_samples, [], home / DASH_DB_NAME, float(since))
-    day = day_start(now)
     run_rows = _guard("runs", errors, read_run_rows, [], agentq_db, int(now - RUN_LOOKBACK_S))
-    verdicts = _guard("verdicts", errors, read_verdicts, {}, agentq_db, day)
     caps = read_caps(home)
     targets = live_targets(live)
     resolved = resolve_limits(live)
@@ -3049,6 +3062,7 @@ def build_summary(
             "limit": LIMITS[name],
             "last_min_frac": last_minute_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "avg_5m_frac": average_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
+            "range_avg_frac": range_average_fraction(raw, since, until, LIMIT_KEYS[name], LIMITS[name]),
             "target_frac": targets[name],
         }
         for name in LIMIT_KEYS
@@ -3064,7 +3078,7 @@ def build_summary(
     limit = token_limit(resolved["total"], token_bucket)
     range_verdicts = _guard("range_verdicts", errors, read_verdicts, {}, agentq_db, float(since), float(until))
     workers_bucketed = bucket_workers(samples, bucket)
-    kpis = run_kpis(runs, day, caps, verdicts)
+    kpis = run_kpis(runs, since, caps)
     laptop_now = laptop if laptop is not None else laptop_reading(home, now)
     baseline_raw = raw if hours >= 6 else _guard("minutes_6h", errors, read_minute_rows, {}, agentq_db, until - 6 * 3600, until)
     five = range(until - LIMIT_WINDOW_MINUTES * 60, until, 60)
@@ -3098,16 +3112,9 @@ def build_summary(
         "tokens_15m": window_tokens(raw, until, 15),
         "pool_per_minute": pool_per_minute(raw, admitted, until),
     }
-    recent_since = until - RECENT_WINDOW_MINUTES * 60
-    recent = {
-        "window": {"start": recent_since, "end": until},
-        "minutes": minute_series(raw, recent_since, until),
-        "ds_uncached_rejections": budget_rejections(calib_429s, "uncached_ds", recent_since, until),
-    }
     return {
         "generated_at": now,
         "hours": hours,
-        "recent": recent,
         "window": {"start": since, "end": until},
         "live": live,
         "limits": limits,
@@ -3133,8 +3140,8 @@ def build_summary(
         "room": room_now,
         "activity": activity,
         "laptop": laptop_now,
-        "perf_kpis": perf_kpis(raw, until, runs, now, live),
-        "top_consumers": top_consumers(runs, day, kpis["tokens_today"]),
+        "perf_kpis": perf_kpis(raw, since, until, runs, now, live),
+        "top_consumers": top_consumers(runs, since, kpis["tokens_in_range"]),
         "errors": errors,
     }
 
@@ -3205,6 +3212,156 @@ class Sampler(threading.Thread):
             self.stop_event.wait(self.interval)
 
 
+class BackgroundReader(threading.Thread):
+    """Keeps the last value of one slow reader (a subprocess or an HTTP probe) current on its own thread.
+
+    The request path only reads ``latest()``, so a slow reader never holds up a response. Reads run only
+    while ``active()`` is true, and ``wake`` starts one at once when a page asks for data.
+    """
+
+    def __init__(self, name: str, read, active, unread=None, cadence_s: float = READER_CADENCE_S, clock=time.time) -> None:
+        super().__init__(name=f"agentq-dash-{name}", daemon=True)
+        self.read = read
+        self.active = active
+        self.unread = unread
+        self.cadence_s = cadence_s
+        self.clock = clock
+        self.value = None
+        self.at: float | None = None
+        self.ready = threading.Event()
+        self.wake = threading.Event()
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            if self.active():
+                self.refresh()
+            self.wake.wait(self.cadence_s)
+            self.wake.clear()
+
+    def refresh(self) -> None:
+        try:
+            value = self.read()
+        except Exception:
+            value = None
+        self.value, self.at = value, self.clock()
+        self.ready.set()
+
+    def latest(self):
+        """The last value read; waits up to FIRST_READ_WAIT_S for the very first read; ``unread`` when there is none."""
+        if self.at is None and self.is_alive():
+            self.ready.wait(FIRST_READ_WAIT_S)
+        return self.value if self.at is not None else self.unread
+
+    def age(self, now: float) -> float | None:
+        return None if self.at is None else round(max(0.0, now - self.at), 1)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+
+
+class SummaryCache:
+    """Serves the summary JSON as stored bytes, and recomputes every range on a cadence while a page is open.
+
+    The first request for a range computes it on the request thread; later requests return the stored bytes.
+    Nothing is recomputed unless a request arrived within IDLE_AFTER_S, so an unattended dashboard costs nothing.
+    """
+
+    def __init__(self, home: Path, fetch_live=fetch_live_status, clock=time.time) -> None:
+        self.home = Path(home)
+        self.clock = clock
+        self.last_request: float | None = None
+        self.bodies: dict[int, tuple[bytes, float]] = {}
+        self.compute_lock = threading.Lock()
+        self.wake = threading.Event()
+        self.stop_event = threading.Event()
+        self.live = BackgroundReader("live", fetch_live, self.active, clock=clock)
+        self.laptop = BackgroundReader(
+            "laptop", lambda: laptop_reading(self.home, time.time()), self.active, unread=laptop_unread(), clock=clock
+        )
+        self.thread = threading.Thread(target=self._loop, name="agentq-dash-summary", daemon=True)
+
+    def start(self) -> None:
+        self.live.start()
+        self.laptop.start()
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+        self.live.stop()
+        self.laptop.stop()
+
+    def touch(self) -> None:
+        """Record that someone is looking, and wake the workers so the data is current within a tick."""
+        self.last_request = self.clock()
+        self.wake.set()
+        self.live.wake.set()
+        self.laptop.wake.set()
+
+    def active(self) -> bool:
+        return self.last_request is not None and self.clock() - self.last_request <= IDLE_AFTER_S
+
+    def get(self, hours: int) -> tuple[bytes, float]:
+        """The stored JSON bytes and their generated_at for one range; computed here only when nothing is stored yet."""
+        self.touch()
+        entry = self.bodies.get(hours)
+        if entry is None:
+            with self.compute_lock:
+                entry = self.bodies.get(hours) or self._compute(hours)
+        return entry
+
+    def _compute(self, hours: int) -> tuple[bytes, float]:
+        now = self.clock()
+        summary = build_summary(
+            self.home, hours, now=now, fetch_live=self.live.latest, laptop=self.laptop.latest()
+        )
+        summary["source_age_s"] = {"live": self.live.age(now), "laptop": self.laptop.age(now)}
+        entry = (json.dumps(summary).encode("utf-8"), now)
+        self.bodies[hours] = entry
+        return entry
+
+    def tick(self) -> None:
+        """One worker pass: recompute each range whose cadence has run out, but only while a page is in use."""
+        if not self.active():
+            return
+        for hours in RANGE_HOURS:
+            if self.stop_event.is_set():
+                return
+            if not self._due(hours):
+                continue
+            with self.compute_lock:
+                if self._due(hours):
+                    try:
+                        self._compute(hours)
+                    except Exception as exc:
+                        sys.stderr.write(f"agentq dash: {hours}h summary skipped: {type(exc).__name__}: {exc}\n")
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            self.tick()
+            self.wake.wait(WORKER_TICK_S)
+            self.wake.clear()
+
+    def _due(self, hours: int) -> bool:
+        entry = self.bodies.get(hours)
+        return entry is None or self.clock() - entry[1] >= RANGE_CADENCE_S[hours]
+
+
+def laptop_unread() -> dict:
+    """The laptop reading served before the first read lands: the CPU count is known, nothing else is."""
+    return {"load1": None, "cpus": os.cpu_count() or 1, "load_per_cpu": None, "memory_free_pct": None}
+
+
+def note_client_gone(server: "DashServer") -> None:
+    """Log that a client hung up, at most once per GONE_LOG_S. A browser that stops waiting is not a server error."""
+    now = time.time()
+    if now - server.gone_logged_at >= GONE_LOG_S:
+        server.gone_logged_at = now
+        sys.stderr.write("agentq dash: client closed the connection early (logged at most once a minute)\n")
+
+
 class Handler(BaseHTTPRequestHandler):
     """GET / serves the page; GET /api/summary?hours=N serves the JSON summary."""
 
@@ -3214,6 +3371,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         query = parse_qs(parts.query)
         if parts.path == "/":
+            self.server.summaries.touch()
             self._send(200, "text/html; charset=utf-8", PAGE_HTML.encode("utf-8"))
         elif parts.path == "/api/summary":
             requested = query.get("hours", [None])[0]
@@ -3224,8 +3382,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(400, {"error": "hours must be one of 1, 6, 24, 168"})
                 return
-            summary = build_summary(self.server.home, hours, fetch_live=self.server.fetch_live)
-            self._send_json(200, summary)
+            body, _ = self.server.summaries.get(hours)
+            self._send(200, "application/json", body)
         elif parts.path == "/api/log":
             source = query.get("source", ["proxy"])[0]
             requested = query.get("page", ["1"])[0]
@@ -3239,6 +3397,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, read_log(self.server.home, source, int(requested), q))
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            note_client_gone(self.server)
+            self.close_connection = True
 
     def _send_json(self, status: int, body: dict) -> None:
         self._send(status, "application/json", json.dumps(body).encode("utf-8"))
@@ -3255,12 +3420,24 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-def make_server(home: Path, port: int, *, fetch_live=fetch_live_status) -> ThreadingHTTPServer:
+class DashServer(ThreadingHTTPServer):
+    """The dashboard's HTTP server on 127.0.0.1, with the summary cache and its workers attached."""
+
+    def __init__(self, address: tuple[str, int], home: Path, fetch_live) -> None:
+        super().__init__(address, Handler)
+        self.home = Path(home)
+        self.gone_logged_at = float("-inf")
+        self.summaries = SummaryCache(self.home, fetch_live)
+        self.summaries.start()
+
+    def server_close(self) -> None:
+        self.summaries.stop()
+        super().server_close()
+
+
+def make_server(home: Path, port: int, *, fetch_live=fetch_live_status) -> DashServer:
     """A server bound to 127.0.0.1. Port 0 picks a free port."""
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    server.home = Path(home)
-    server.fetch_live = fetch_live
-    return server
+    return DashServer(("127.0.0.1", port), home, fetch_live)
 
 
 def main(argv: list[str] | None = None) -> int:

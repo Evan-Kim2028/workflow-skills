@@ -1,4 +1,5 @@
 import calendar
+import io
 import re
 import hashlib
 import shutil
@@ -11,7 +12,9 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agentq"))
 
@@ -286,7 +289,7 @@ class ServerTest(unittest.TestCase):
             "Active runs over time, with caps",
             "Tokens billed per 5 min",
             "Runs",
-            "Top consumers today",
+            "Top consumers, ",
             "Morph 429s",
             "Proxy wait p95",
             "Recent jobs",
@@ -301,8 +304,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(ctype, "application/json")
         data = json.loads(body)
-        self.assertEqual(sorted(data["recent"]), ["ds_uncached_rejections", "minutes", "window"])
-        self.assertEqual(data["recent"]["window"]["end"] - data["recent"]["window"]["start"], 3600)
+        self.assertEqual(sorted(data["source_age_s"]), ["laptop", "live"])
         for key in (
             "live", "limits", "capacity", "minutes", "token_mix", "jobs", "workers", "caps", "runs",
             "run_kpis", "perf_kpis", "top_consumers", "errors", "r429_60m", "window",
@@ -335,13 +337,12 @@ class PlistAndPageTest(unittest.TestCase):
         self.assertIn("visibilitychange", dash.PAGE_HTML)
         self.assertIn("api/summary", dash.PAGE_HTML)
 
-    def test_poll_interval_is_thirty_seconds_in_the_served_html(self) -> None:
-        self.assertIn("var POLL_MS = 30000;", dash.PAGE_HTML)
-        self.assertNotIn("POLL_MS = 15000", dash.PAGE_HTML)
+    def test_poll_interval_follows_the_range_in_the_served_html(self) -> None:
+        self.assertIn("var POLL_MS_BY_HOURS = { 1: 5000, 6: 5000, 24: 15000, 168: 60000 };", dash.PAGE_HTML)
+        self.assertNotIn("POLL_MS = 30000", dash.PAGE_HTML)
 
 
-DAY_START = dash.day_start(NOW)
-RUN_TODAY = max(NOW - 30, DAY_START)
+RUN_LAST_TS = NOW - 30
 
 
 def make_runs_home(tmp: Path, *, proxy_jobs=True) -> Path:
@@ -365,7 +366,7 @@ def make_runs_home(tmp: Path, *, proxy_jobs=True) -> Path:
         conn.executemany(
             "INSERT INTO proxy_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
-                ("a" * 12, "morph-dsv41flash-1017", NOW - 600, RUN_TODAY, 4, 4, 1, 1000, 3000, 500, 800, 4000),
+                ("a" * 12, "morph-dsv41flash-1017", NOW - 600, RUN_LAST_TS, 4, 4, 1, 1000, 3000, 500, 800, 4000),
                 ("b" * 12, "morph-kimik31", NOW - 900, NOW - 100, 10, 10, 2, 5000, 0, 200, 2000, 20000),
                 ("c" * 12, "morph-dsv41flash-1017", NOW - 300, NOW - 200, 1, 1, 0, 100, 0, 50, 10, 200),
                 ("none", "morph-dsv41flash-1017", NOW - 60, NOW - 50, 2, 2, 0, 300, 0, 100, 40, 1000),
@@ -402,7 +403,7 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(run["cache_read_pct"], 0.75)
         self.assertEqual(run["avg_wait_s"], 0.2)
         self.assertEqual(run["avg_upstream_s"], 1.0)
-        self.assertEqual(run["duration_s"], RUN_TODAY - (NOW - 600))
+        self.assertEqual(run["duration_s"], RUN_LAST_TS - (NOW - 600))
 
     def test_direct_launch_keeps_its_job_string_and_active_state(self) -> None:
         run = self.runs["none"]
@@ -431,17 +432,17 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(kpis["cap_deepseek"], 64)
         self.assertEqual(kpis["cap_kimi"], 2)
 
-    def test_runs_seen_today_are_distinct_jobs_with_activity_today(self) -> None:
+    def test_runs_seen_in_range_are_distinct_jobs_with_activity_in_range(self) -> None:
         kpis = self.summary["run_kpis"]
-        self.assertEqual(kpis["seen_today"], 4)
-        self.assertEqual(kpis["tokens_today"], 4500 + 5200 + 150 + 400)
+        self.assertEqual(kpis["seen_in_range"], 4)
+        self.assertEqual(kpis["tokens_in_range"], 4500 + 5200 + 150 + 400)
         self.assertEqual(kpis["median_tokens_per_run"], (400 + 4500) / 2)
         self.assertEqual(kpis["median_requests_per_run"], 3.0)
 
-    def test_finished_today_counts_queue_verdicts_on_the_local_day(self) -> None:
-        self.assertEqual(self.summary["run_kpis"]["finished_today"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
+    def test_finished_counts_queue_verdicts_in_the_selected_range(self) -> None:
+        self.assertEqual(self.summary["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
 
-    def test_top_consumers_rank_today_runs_with_share_of_today(self) -> None:
+    def test_top_consumers_rank_range_runs_with_share_of_range(self) -> None:
         top = self.summary["top_consumers"]
         self.assertEqual([row["job"] for row in top], ["b" * 12, "a" * 12, "none", "c" * 12])
         self.assertAlmostEqual(top[0]["share"], 5200 / (4500 + 5200 + 150 + 400))
@@ -502,8 +503,8 @@ class MissingRunsTableTest(unittest.TestCase):
             self.assertNotIn("jobs", summary["errors"])
             self.assertEqual(summary["runs"], [])
             self.assertEqual(summary["top_consumers"], [])
-            self.assertEqual(summary["run_kpis"]["seen_today"], 0)
-            self.assertEqual(summary["run_kpis"]["finished_today"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
+            self.assertEqual(summary["run_kpis"]["seen_in_range"], 0)
+            self.assertEqual(summary["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
             self.assertIsNone(summary["perf_kpis"]["upstream_median_ms"])
             self.assertEqual(summary["jobs"]["by_state"], {"queued": 1, "running": 1, "done": 3})
             self.assertTrue(summary["minutes"])
@@ -1508,17 +1509,20 @@ class RunsAxisTest(unittest.TestCase):
 class SmallChartRowTest(unittest.TestCase):
     SMALL = ("c-kimi", "c-dsu", "c-429", "c-wait")
 
-    def test_small_charts_read_the_last_hour_not_the_selected_range(self) -> None:
+    def test_small_charts_read_the_selected_range_not_a_fixed_hour(self) -> None:
         html = dash.PAGE_HTML
-        self.assertIn("var recent = d.recent", html)
-        self.assertIn("recentMinutes", html)
+        self.assertNotIn("var recent = d.recent", html)
+        self.assertNotIn("recentMinutes", html)
         for chart_id in self.SMALL:
             with self.subTest(chart=chart_id):
                 start = html.index(f'registerChart("{chart_id}"')
                 end = html.index("var upPoints", start) if chart_id == "c-wait" else html.index("registerChart(", start + 1)
                 block = html[start:end]
                 self.assertIn("smallChart(", block)
-                self.assertNotIn("minutes", block.replace("recentMinutes", ""))
+                self.assertIn("var smallChart = function", html)
+                self.assertIn("points: minutes", html)
+                self.assertIn("bucket_s: bucket", html)
+                self.assertIn("x0: win.start", html)
 
     def test_small_charts_share_one_plot_layout_and_three_ticks(self) -> None:
         html = dash.PAGE_HTML
@@ -1531,7 +1535,7 @@ class SmallChartRowTest(unittest.TestCase):
         html = dash.PAGE_HTML
         grid = html[html.index('<section class="grid3">'):html.index('aria-labelledby="h-upstream"')]
         self.assertNotIn('class="legend"', grid)
-        self.assertIn("Morph rejections on this limit, last 60 min: ", html)
+        self.assertIn("Morph rejections on this limit, ", html)
 
 
 class CapacityPairTest(unittest.TestCase):
@@ -1561,7 +1565,7 @@ class CapacityPairTest(unittest.TestCase):
         self.assertLess(html.index('id="c-kimi"'), html.index('id="c-dsu"'))
         self.assertIn('id="dsu-sub"', html)
         self.assertIn("rejections not recorded", html)
-        self.assertIn("Morph rejections on this limit, last 60 min: ", html)
+        self.assertIn("Morph rejections on this limit, ", html)
 
     def test_response_time_chart_sits_below_the_small_charts_and_above_runs(self) -> None:
         html = dash.PAGE_HTML
@@ -1653,3 +1657,184 @@ class FillerHeadlineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fill = dash.read_fill(Path(tmp))
         self.assertEqual(fill, {"enabled": False, "target_billed_per_min": 8_000_000.0, "low_frac": 0.9})
+RANGE_AGES = (30 * 60, 2 * 3600, 10 * 3600, 3 * 24 * 3600)
+
+
+def range_fixture(tmp: Path) -> Path:
+    """Proxy minutes and queue verdicts at four ages, so each range step adds new minutes and new verdicts."""
+    home = tmp / "agentq"
+    home.mkdir()
+    conn = sqlite3.connect(home / "agentq.db")
+    conn.execute(PROXY_MINUTES_DDL)
+    conn.executemany(f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+        (minute_at(age), "morph-dsv41flash-1017", 1, 1, index + 1, 2_000_000 * (index + 1), 0, 0, 0, 100 * (index + 1), 1000 * (index + 1), 0.9)
+        for index, age in enumerate(RANGE_AGES)
+    ])
+    conn.execute(JOB_DDL)
+    jobs = []
+    for index, age in enumerate(RANGE_AGES):
+        for verdict in VERDICTS:
+            jobs.append((f"{index}{verdict}".ljust(12, "x")[:12], "done", "normal", "pi-deepseek-flash", "read", verdict,
+                         NOW - age - 60, NOW - age - 50, NOW - age - 10, verdict.lower()))
+    conn.executemany(
+        "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)", jobs,
+    )
+    conn.commit()
+    conn.close()
+    return home
+
+
+VERDICTS = ("PASS", "PARTIAL", "FAIL")
+
+
+class RangeConsistencyTest(unittest.TestCase):
+    """Every field the page labels with the selected range must move when the range moves, and the Now fields must not."""
+
+    RANGE_FIELDS = {
+        "tokens_total": lambda s: s["range_totals"]["tokens"]["total"],
+        "r429": lambda s: s["range_totals"]["r429"],
+        "requests": lambda s: s["range_totals"]["requests"],
+        "finished_pass": lambda s: s["range_totals"]["finished"]["PASS"],
+        "finished_fail": lambda s: s["range_totals"]["finished"]["FAIL"],
+        "finished_partial": lambda s: s["range_totals"]["finished"]["PARTIAL"],
+        "total_pool_range_avg": lambda s: s["limits"]["total"]["range_avg_frac"],
+        "ds_uncached_range_avg": lambda s: s["limits"]["uncached_ds"]["range_avg_frac"],
+        "morph_wait_p95": lambda s: s["perf_kpis"]["wait_p95_ms"],
+        "morph_wait_p50": lambda s: s["perf_kpis"]["wait_p50_ms"],
+        "minute_rows": lambda s: len(s["minutes"]),
+    }
+    NOW_FIELDS = {
+        "tokens_5m": lambda s: s["activity"]["tokens_5m"]["tokens"],
+        "tokens_15m": lambda s: s["activity"]["tokens_15m"]["tokens"],
+        "verdict": lambda s: s["verdict"]["key"],
+        "waiting_now": lambda s: s["capacity"]["waiting_now"],
+    }
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = range_fixture(Path(self.tmp.name))
+        self.summaries = {
+            hours: dash.build_summary(self.home, hours, now=NOW, fetch_live=proxy_status, laptop=CALM)
+            for hours in dash.RANGE_HOURS
+        }
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_every_range_bound_field_changes_with_the_range(self) -> None:
+        for name, field in self.RANGE_FIELDS.items():
+            values = [field(self.summaries[hours]) for hours in dash.RANGE_HOURS]
+            with self.subTest(field=name):
+                self.assertGreater(len(set(map(repr, values))), 1, values)
+                self.assertNotEqual(values[0], values[-1], values)
+
+    def test_now_fields_do_not_follow_the_range(self) -> None:
+        for name, field in self.NOW_FIELDS.items():
+            values = {repr(field(self.summaries[hours])) for hours in dash.RANGE_HOURS}
+            with self.subTest(field=name):
+                self.assertEqual(len(values), 1, values)
+
+    def test_one_hour_range_counts_only_the_last_hour(self) -> None:
+        one = self.summaries[1]
+        self.assertEqual(one["range_totals"]["tokens"]["total"], 2_000_000)
+        self.assertEqual(one["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 1, "FAIL": 1})
+        self.assertEqual(one["bucket_s"], dash.BUCKET_S[1])
+        self.assertEqual(self.summaries[168]["range_totals"]["tokens"]["total"], 2_000_000 * (1 + 2 + 3 + 4))
+        self.assertEqual(self.summaries[168]["range_totals"]["finished"], {verdict: 4 for verdict in VERDICTS})
+
+    def test_range_average_counts_from_the_first_recorded_minute(self) -> None:
+        one = self.summaries[1]
+        self.assertEqual(one["limits"]["total"]["range_avg_frac"], round(2_000_000 / 30 / dash.LIMITS["total"], 4))
+        self.assertEqual(one["limits"]["total"]["avg_5m_frac"], 0.0)
+
+
+class SummaryCacheTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        self.now = 1000.0
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: self.now)
+
+    def tearDown(self) -> None:
+        self.cache.stop()
+        self.tmp.cleanup()
+
+    def counting_build(self):
+        return mock.patch.object(dash, "build_summary", wraps=dash.build_summary)
+
+    def test_first_request_computes_and_later_requests_serve_the_stored_bytes(self) -> None:
+        with self.counting_build() as build:
+            first, generated = self.cache.get(1)
+            second, generated_again = self.cache.get(1)
+        self.assertEqual(build.call_count, 1)
+        self.assertIs(first, second)
+        self.assertEqual(generated, generated_again)
+        self.assertEqual(json.loads(first)["generated_at"], generated)
+        self.assertEqual(json.loads(first)["source_age_s"], {"live": None, "laptop": None})
+
+    def test_worker_recomputes_each_range_on_its_cadence_while_active(self) -> None:
+        with self.counting_build() as build:
+            self.cache.touch()
+            self.cache.tick()
+            self.assertEqual(build.call_count, 4)
+            self.now += 4
+            self.cache.tick()
+            self.assertEqual(build.call_count, 4)
+            self.now += 1
+            self.cache.tick()
+            self.assertEqual(build.call_count, 6)
+            self.now += 10
+            self.cache.touch()
+            self.cache.tick()
+            self.assertEqual(build.call_count, 9)
+
+    def test_worker_is_idle_once_nobody_has_asked_for_IDLE_AFTER_S(self) -> None:
+        with self.counting_build() as build:
+            self.cache.touch()
+            self.cache.tick()
+            before = build.call_count
+            self.now += dash.IDLE_AFTER_S + 1
+            self.cache.tick()
+            self.cache.tick()
+            self.assertEqual(build.call_count, before)
+            self.assertFalse(self.cache.active())
+
+    def test_a_request_after_idle_serves_the_stored_bytes_at_once(self) -> None:
+        with self.counting_build() as build:
+            self.cache.touch()
+            self.cache.tick()
+            self.now += 10 * 3600
+            body, generated = self.cache.get(1)
+        self.assertEqual(build.call_count, 4)
+        self.assertLess(generated, self.now)
+        self.assertIsNotNone(body)
+
+    def test_a_slow_reader_serves_its_last_value_with_its_age(self) -> None:
+        reader = dash.BackgroundReader("probe", lambda: {"ok": True}, lambda: True, clock=lambda: self.now)
+        self.assertIsNone(reader.latest())
+        reader.refresh()
+        self.now += 7
+        self.assertEqual(reader.latest(), {"ok": True})
+        self.assertEqual(reader.age(self.now), 7.0)
+
+
+class ClientGoneTest(unittest.TestCase):
+    def test_hang_ups_are_logged_at_most_once_a_minute(self) -> None:
+        class Server:
+            gone_logged_at = float("-inf")
+
+        server = Server()
+        with mock.patch.object(dash.time, "time", return_value=1000.0), \
+                mock.patch.object(dash.sys, "stderr", new=io.StringIO()) as err:
+            dash.note_client_gone(server)
+            dash.note_client_gone(server)
+        self.assertEqual(err.getvalue().count("client closed the connection early"), 1)
+
+    def test_broken_pipe_during_a_request_does_not_escape_the_handler(self) -> None:
+        handler = dash.Handler.__new__(dash.Handler)
+        handler.server = mock.Mock(gone_logged_at=float("-inf"))
+        with mock.patch.object(dash.BaseHTTPRequestHandler, "handle_one_request", side_effect=BrokenPipeError), \
+                mock.patch.object(dash.sys, "stderr", new=io.StringIO()):
+            handler.handle_one_request()
+        self.assertTrue(handler.close_connection)
