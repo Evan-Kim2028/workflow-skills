@@ -639,13 +639,19 @@ class InflightLimiter:
     def measuring(self) -> bool:
         return self.mode != "off"
 
-    @property
-    def armed(self) -> bool:
-        return self.measuring and self.baseline_s is not None
+    def fresh(self, now: float) -> bool:
+        """True when the short window holds enough recent first-byte samples to trust the limit."""
+        return self.short_run_s(now) is not None
 
-    def current_limit(self) -> int | None:
-        """The limit the proxy computes and reports (shadow included), or None before the first measurement."""
-        return round(self.limit) if self.armed else None
+    def active(self, now: float) -> bool:
+        """A measured limit that still has fresh samples behind it. Without them the limit is suspended, and the
+        baseline is kept so the limit re-arms as soon as samples return."""
+        return self.measuring and self.baseline_s is not None and self.fresh(now)
+
+    def current_limit(self, now: float) -> int | None:
+        """The limit the proxy computes and reports (shadow included); None before the first measurement,
+        while the mode is off, and while the short window has no fresh samples."""
+        return round(self.limit) if self.active(now) else None
 
     def arm_at(self, wall: float) -> str:
         """Which arm the wall-clock time falls in: shadow, off, enforce, or off for a disabled limiter."""
@@ -655,9 +661,9 @@ class InflightLimiter:
             return "enforce"
         return "enforce" if int(wall // self.ab_period_s) % 2 == 0 else "off"
 
-    def enforcing(self, wall: float) -> bool:
-        """True when a request above the limit must wait at this wall-clock time."""
-        return self.armed and self.arm_at(wall) == "enforce"
+    def enforcing(self, wall: float, now: float) -> bool:
+        """True when a request above the limit must wait at this wall-clock time (and the limit is active)."""
+        return self.active(now) and self.arm_at(wall) == "enforce"
 
     def observe(self, ttfb_s: float, now: float) -> None:
         self.samples.append((now, ttfb_s))
@@ -683,7 +689,7 @@ class InflightLimiter:
         short = self.short_run_s(now)
         if short is None or short <= 0:
             return False
-        before = self.current_limit()
+        before = self.current_limit(now)
         if self.baseline_s is None:
             self.baseline_s = short
         else:
@@ -692,7 +698,7 @@ class InflightLimiter:
         gradient = min(1.0, max(self.min_gradient, self.baseline_s / short))
         raw = self.limit * gradient + math.sqrt(self.limit)
         self.limit = min(float(self.max_limit), max(float(self.min_limit), self.limit + self.smoothing * (raw - self.limit)))
-        return self.current_limit() != before
+        return self.current_limit(now) != before
 
 
 @dataclass(eq=False)
@@ -1104,7 +1110,7 @@ class Governor:
                     if not head.over_counted:
                         head.over_counted = True
                         self.row(head.model)["inflight_over"] += 1
-                    if self.inflight.enforcing(self.wall()):
+                    if self.inflight.enforcing(self.wall(), self.clock()):
                         head.blocked_by = None
                         head.last_refusal = INFLIGHT
                         index += 1
@@ -1150,8 +1156,8 @@ class Governor:
         return None
 
     def inflight_limit(self) -> int | None:
-        """The DeepSeek in-flight cap in force, or None when the limiter does not enforce one."""
-        return self.inflight.current_limit()
+        """The DeepSeek in-flight limit now (shadow included), or None when no fresh measurement backs one."""
+        return self.inflight.current_limit(self.clock())
 
     def inflight_above(self, ticket: Ticket) -> bool | None:
         """Whether a DeepSeek request sent now is above the cap (its own flight counted), or None when no cap is computed."""
@@ -1690,7 +1696,7 @@ class Governor:
             "inflight_max": self.inflight.max_limit if self.inflight.measuring else None,
             "inflight_mode": self.inflight.mode,
             "inflight_arm": self.inflight.arm_at(self.wall()),
-            "inflight_enforcing": self.inflight.enforcing(self.wall()),
+            "inflight_enforcing": self.inflight.enforcing(self.wall(), now),
             "inflight_in_flight": self.ds_flight,
             "inflight_queued": inflight_queued,
             "ttfb_baseline_ms": ms_or_none(self.inflight.baseline_s),
