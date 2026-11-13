@@ -108,6 +108,7 @@ RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IG
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
 CONTROLLER_STATE_KEY = "fill_controller"
+INDEX_RETRY_S = 60.0
 MEASURE_REFRESH_S = 600.0
 PROCESS_REFRESH_S = 30.0
 OPEN = db.OPEN_STATES
@@ -736,7 +737,7 @@ class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
     def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
-                 labeler=None):
+                 labeler=None, work_synchronous=False):
         self.home = Path(home)
         self.launcher = launcher or run_worker_launcher
         self.labeler = labeler or label_for
@@ -756,8 +757,9 @@ class Broker:
         self._fill_key: str | None = None
         self._ps: tuple[float, str | None] | None = None
         self._measured: tuple[float, int | None] | None = None
-        self._filler_cache: tuple[float, tuple] | None = None
+        self._work = filler_lib.WorkCache(self.home, now=self.now, synchronous=work_synchronous, log=self.log)
         self._filler_retry = 0.0
+        self._index_retry_at = 0.0
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -773,6 +775,7 @@ class Broker:
             launched = self.launch_ready(conn, now, status=status)
             self.submit_backlog(conn, now, status)
             self.submit_filler(conn, now, status)
+            self._retry_indexing(conn, now)
         finally:
             conn.close()
         write_heartbeat(self.home)
@@ -1024,25 +1027,9 @@ class Broker:
             self._ps = (now, fill_lib.process_table())
         return self._ps[1]
 
-    def _filler_targets(self) -> tuple[list, float]:
-        """Filler targets and max runtime from backlog-seed.json, re-read when the file changes.
-        A malformed section logs once and yields no targets."""
-        path = self.home / filler_lib.CONFIG_NAME
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = None
-        if self._filler_cache is not None and self._filler_cache[0] == mtime:
-            return self._filler_cache[1]
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if mtime is not None else {}
-            targets, max_runtime = filler_lib.load_targets(data)
-            result = (targets, max_runtime)
-        except (OSError, ValueError) as exc:
-            self.log(f"filler config refused: {exc}")
-            result = ([], filler_lib.DEFAULT_MAX_RUNTIME_S)
-        self._filler_cache = (mtime, result)
-        return result
+    def _filler_settings(self) -> filler_lib.Settings:
+        """The filler's settings from the background work cache. Never blocks the tick."""
+        return self._work.snapshot()[0]
 
     def _log_fill(self, plan: fill_lib.FillPlan) -> None:
         """Log the controller's reason once per change of reason, not once per tick."""
@@ -1085,40 +1072,43 @@ class Broker:
             self._saved_controller = state
         if decision.plan.submit <= 0 or now < self._filler_retry:
             return []
-        targets, max_runtime = self._filler_targets()
         submitted = []
         for _ in range(decision.plan.submit):
-            job_id = self._filler_job(conn, now, targets, max_runtime)
+            job_id = self._filler_job(conn, now)
             if job_id is None:
                 break
             submitted.append(job_id)
         return submitted
 
-    def _filler_job(self, conn, now: float, targets: list, max_runtime: float) -> str | None:
-        """Queue one audit for the next due target. Returns the job id, or None when nothing is due or the label is refused."""
-        found = filler_lib.next_target(conn, targets, head_of=filler_lib.module_head)
-        if found is None:
+    def _filler_job(self, conn, now: float) -> str | None:
+        """Queue the next filler job: an unreviewed merged PR, else a due target and kind. Returns the job id, or
+        None when nothing is due or the label is refused."""
+        settings, prs = self._work.snapshot()
+        work = filler_lib.next_work(
+            conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head, prs=prs,
+        )
+        if work is None:
             return None
-        target, commit = found
-        label = self.labeler("read", filler_lib.label_slug(target))
+        label = self.labeler("read", work.slug)
         if label is None:
             self._filler_retry = now + BACKLOG_RETRY_S
-            self.log(f"filler {target.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
+            self.log(f"filler {work.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
             return None
         job_id = db.new_job_id()
         prompt = db.job_dir(self.home, job_id) / "prompt.md"
         prompt.parent.mkdir(parents=True, exist_ok=True)
-        prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_body(target, commit)), encoding="utf-8")
+        prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_for(work)), encoding="utf-8")
         job = {
             "id": job_id, "lane": "backlog", "kind": "read", "res": "light",
-            "tier": db.default_tier("read"), "label": label, "workspace": target.workspace,
+            "tier": db.default_tier("read"), "label": label, "workspace": work.workspace,
             "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
-            "max_runtime_s": max_runtime,
+            "max_runtime_s": settings.max_runtime,
         }  # fmt: skip
         with db.tx(conn):
             db.insert_job(conn, job, now)
-            filler_lib.record_submission(conn, target, commit, job_id, now)
-        self.log(f"filler {target.key} submitted {job_id} ({label}) at {commit[:12]}")
+            filler_lib.record_work(conn, work, job_id, now)
+            filler_lib.record_filler_job(conn, job_id, work)
+        self.log(f"filler {work.key} submitted {job_id} ({label})")
         return job_id
 
     def _proxy_status(self) -> dict | None:
@@ -1250,6 +1240,8 @@ class Broker:
         dest = db.job_dir(self.home, job["id"]) / "report.md"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
+        if is_filler(job):
+            filler_lib.index_job(conn, job["id"], now, text=text)
         verdict = verdict_of(text)
         note = "; ".join(part for part in (note, worktree_note(job)) if part)
         self._move(
@@ -1257,6 +1249,14 @@ class Broker:
             state="done", verdict=verdict, report_path=str(dest), finished_at=now,
             pi_session=pi_session_of(job["run_dir"], job["label"]) or job["pi_session"],
         )  # fmt: skip
+
+    def _retry_indexing(self, conn, now: float) -> None:
+        """Index finished filler jobs whose findings failed to index earlier. Tried at most once a minute."""
+        if now < self._index_retry_at:
+            return
+        self._index_retry_at = now + INDEX_RETRY_S
+        for job_id in filler_lib.pending_index(conn):
+            filler_lib.index_job(conn, job_id, now)
 
     def _fail(self, conn, job: dict, now: float, reason: str, attempt: int | None = None) -> None:
         self._move(
