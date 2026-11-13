@@ -413,6 +413,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <div class="kpis">
         <div class="kpi head"><div class="label">Total pool, avg <span class="rng">last 6 h</span></div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
         <div class="kpi"><div class="label">DeepSeek uncached, avg <span class="rng">last 6 h</span></div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
+        <div class="kpi"><div class="label">DeepSeek output burst reserve</div><div class="value sm" id="cap-res-out">—</div><div class="note">spent only after the per-minute limit, refills over 30 min</div></div>
+        <div class="kpi"><div class="label">DeepSeek uncached burst reserve</div><div class="value sm" id="cap-res-unc">—</div><div class="note">spent only after the per-minute limit, refills over 30 min</div></div>
         <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note"><span class="rng">last 6 h</span>, per request; p95 is the worst minute</div></div>
       </div>
     </section>
@@ -1171,6 +1173,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setTile("a-ds", dso === null || dso === undefined ? null : Math.round(dso));
   }
 
+  function setReserve(id, reserve) {
+    setText(id, reserve ? "reserve " + compact(reserve.level) + " of " + compact(reserve.capacity) : "—");
+  }
+
   function renderCapacity(d) {
     var cap = d.capacity || {};
     var limits = d.limits || {};
@@ -1180,6 +1186,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("cap-binding", "of the " + compact(total.limit) + " per minute limit");
     setText("cap-ds-unc", pct(dsu.range_avg_frac));
     setText("cap-ds-unc-note", "of " + compact(dsu.limit) + " per minute");
+    var reserves = cap.reserves || {};
+    setReserve("cap-res-out", reserves.ds_output);
+    setReserve("cap-res-unc", reserves.ds_uncached);
     setTile("k-waiting", cap.waiting_now);
     var lanes = cap.waiting_by_lane || {};
     setText("k-waiting-note", Object.keys(lanes).length
@@ -2134,8 +2143,25 @@ def median_or_none(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+RESERVE_TILES = (("ds_output", "output"), ("ds_uncached", "uncached_ds"))
+
+
+def live_reserves(live: dict | None) -> dict:
+    """The live burst reserve level and capacity of the DeepSeek output and uncached budgets, keyed by tile name."""
+    budgets = (live or {}).get("budgets") if isinstance(live, dict) else None
+    if not isinstance(budgets, dict):
+        return {}
+    found = {}
+    for tile, name in RESERVE_TILES:
+        reserve = (budgets.get(name) or {}).get("reserve")
+        if isinstance(reserve, dict) and isinstance(reserve.get("level"), (int, float)):
+            found[tile] = {"level": int(reserve["level"]), "capacity": int(reserve.get("capacity") or 0)}
+    return found
+
+
 def capacity_headline(limits: dict, live: dict | None) -> dict:
-    """The limit with the highest 5-minute billed fraction (the binding one), and requests waiting at the proxy."""
+    """The limit with the highest 5-minute billed fraction (the binding one), requests waiting at the proxy,
+    and the live burst reserves of the DeepSeek output and uncached budgets."""
     present = [name for name in LIMIT_KEYS if name in limits]
     binding = max(present, key=lambda name: limits[name]["avg_5m_frac"]) if present else None
     queued = (live or {}).get("queued") if isinstance(live, dict) else None
@@ -2150,6 +2176,7 @@ def capacity_headline(limits: dict, live: dict | None) -> dict:
         "binding_label": LIMIT_LABELS[binding] if binding else None,
         "waiting_now": waiting,
         "waiting_by_lane": by_lane,
+        "reserves": live_reserves(live),
     }
 
 

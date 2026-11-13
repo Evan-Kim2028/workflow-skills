@@ -52,12 +52,18 @@ RESTORED_LANE = "restored"
 CAPACITY = "capacity"
 RESERVE = "reserve"
 GUARD = "guard"
+EMPTY = "empty"
 INFLIGHT = "inflight"
 INFLIGHT_MODES = ("shadow", "enforce", "off")
 UNARMED = "unarmed"
 ARMED = "armed"
 SUSPENDED = "suspended"
 FAST_LIMIT_QUIET_S = 30 * 60.0
+RESERVE_REFILL_S = 30 * 60.0
+UNCACHED_RATIO_FLOOR = 0.25
+UNCACHED_RATIO_CEIL = 1.25
+UNCACHED_RATIO_ALPHA = 0.05
+UNCACHED_LOG_EVERY = 50
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
 KEYCHAIN_SERVICE = "morph-api-key"
@@ -110,11 +116,26 @@ DEFAULT_CONFIG = {
     "log_path": LOG_PATH,
     "log_max_bytes": LOG_MAX_BYTES,
     "log_backups": LOG_BACKUPS,
+    "reserve_refill_s": RESERVE_REFILL_S,
     "budgets": {
         "total": {"limit_type": "total", "limit": 10_000_000},
-        "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
-        "uncached": {"limit_type": "uncached", "limit": 24_290, "model": "morph-kimik31"},
-        "uncached_ds": {"limit_type": "uncached", "limit": 400_000, "model_prefix": "morph-dsv41flash"},
+        "output": {
+            "limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash",
+            "window_mode": "calendar", "reserve": 210_000,
+        },
+        "kimi_output": {
+            "limit_type": "output", "limit": 6_162, "model_prefix": "morph-kimik",
+            "window_mode": "calendar", "reserve": 18_486,
+        },
+        "uncached": {
+            "limit_type": "uncached", "limit": 24_290, "model_prefix": "morph-kimik",
+            "window_mode": "calendar", "reserve": 72_870,
+        },
+        "uncached_ds": {
+            "limit_type": "uncached", "limit": 400_000, "model_prefix": "morph-dsv41flash",
+            "window_mode": "calendar", "reserve": 1_200_000,
+        },
+        "requests": {"limit_type": "requests", "limit": 1_000, "window_mode": "calendar"},
     },
     "inflight": {
         "mode": "shadow",
@@ -179,7 +200,7 @@ LIMIT_PATTERNS = (
     ("uncached", re.compile(r"Limit:\s*(\d+)\s+uncached input tokens/minute")),
     ("total", re.compile(r"Limit:\s*(\d+)\s+tokens/minute")),
 )
-LIMIT_TYPES = tuple(name for name, _ in LIMIT_PATTERNS)
+LIMIT_TYPES = (*(name for name, _ in LIMIT_PATTERNS), "requests")
 
 PROXY_JOBS_DDL = """
 CREATE TABLE IF NOT EXISTS proxy_jobs (
@@ -560,6 +581,8 @@ def estimate_for(limit_type: str, prompt: int, output: int, uncached: int) -> in
         return output
     if limit_type == "uncached":
         return uncached
+    if limit_type == "requests":
+        return 1
     return prompt + output
 
 
@@ -569,7 +592,14 @@ def reserved_for(limit_type: str, prompt: int, requested: int, uncached: int) ->
         return requested
     if limit_type == "uncached":
         return uncached
+    if limit_type == "requests":
+        return 1
     return prompt + requested
+
+
+def clamp_ratio(value: float) -> float:
+    """A learned uncached correction, kept between UNCACHED_RATIO_FLOOR and UNCACHED_RATIO_CEIL."""
+    return min(UNCACHED_RATIO_CEIL, max(UNCACHED_RATIO_FLOOR, value))
 
 
 def model_family(model: str) -> str:
@@ -913,6 +943,93 @@ class InflightLimiter:
         self.limit = min(float(self.max_limit), max(float(self.min_limit), self.limit + self.smoothing * (raw - self.limit)))
         return self.current_limit() != before
 
+
+class Reserve:
+    """The burst reserve of one budget: its level, capacity, and the overflow drained this minute."""
+
+    def __init__(
+        self,
+        capacity: float,
+        *,
+        refill_s: float = RESERVE_REFILL_S,
+        wall: float = 0.0,
+        level: float | None = None,
+    ) -> None:
+        if capacity < 0:
+            raise ValueError(f"reserve capacity must be >= 0, not {capacity!r}")
+        if refill_s <= 0:
+            raise ValueError(f"reserve refill_s must be > 0, not {refill_s!r}")
+        self.capacity = float(capacity)
+        self.refill_s = float(refill_s)
+        self.level = self.capacity if level is None else min(self.capacity, max(0.0, float(level)))
+        self.wall = float(wall)
+        self.minute: str | None = None
+        self.drained = 0.0
+
+    @property
+    def refill_per_s(self) -> float:
+        return self.capacity / self.refill_s
+
+    def refill(self, wall: float) -> None:
+        """Add the refill earned since the last call, capped at capacity. Earlier times are ignored."""
+        if wall > self.wall:
+            self.level = min(self.capacity, self.level + (wall - self.wall) * self.refill_per_s)
+            self.wall = wall
+
+    def sync(self, wall: float, minute: str, used: float, free: float) -> None:
+        """Bring the reserve to this minute's usage: refill to ``wall``, then drain or refund the overflow.
+
+        ``used`` is the minute's total charged so far (in-flight estimates included) and ``free`` the
+        free allowance. The overflow is ``used - free`` when positive. A new minute starts with nothing drained.
+        """
+        self.refill(wall)
+        if minute != self.minute:
+            self.minute = minute
+            self.drained = 0.0
+        owed = max(0.0, used - free)
+        self.level = min(self.capacity, max(0.0, self.level - (owed - self.drained)))
+        self.drained = owed
+
+    def admission_overflow(self, used: float, estimate: float, free: float) -> float:
+        """Reserve tokens one more charge of ``estimate`` would drain now. Call sync() first."""
+        return max(0.0, used + estimate - free) - self.drained
+
+    def covers(self, overflow: float) -> bool:
+        """True when the reserve can pay this overflow. An overflow larger than the whole reserve is
+        covered by a full reserve, so one oversized request cannot wait forever."""
+        return overflow <= 0 or self.level >= min(overflow, self.capacity)
+
+    def seconds_until_covered(self, overflow: float) -> float:
+        """Seconds of refill until ``covers(overflow)`` holds."""
+        needed = min(overflow, self.capacity) - self.level
+        if needed <= 0 or self.refill_per_s <= 0:
+            return 0.0
+        return needed / self.refill_per_s
+
+    def empty(self) -> None:
+        """A real 429 named this budget: its reserve is gone, not merely low."""
+        self.level = 0.0
+
+    def snapshot(self) -> dict:
+        return {
+            "level": round(self.level, 3),
+            "wall": round(self.wall, 3),
+            "minute": self.minute,
+            "drained": round(self.drained, 3),
+        }
+
+    def restore(self, data: dict, now: float, minute: str) -> None:
+        """Load a saved snapshot taken at data["wall"]. The level refills for the time since, and the
+        minute's drain is kept only when the minute is still the same one."""
+        saved_wall = float(data.get("wall", now))
+        self.level = min(self.capacity, max(0.0, float(data.get("level", self.capacity))))
+        self.wall = min(saved_wall, now)
+        self.refill(now)
+        if data.get("minute") == minute:
+            self.minute = minute
+            self.drained = max(0.0, float(data.get("drained", 0.0)))
+
+
 @dataclass(eq=False)
 class Entry:
     """One budget charge. In-flight charges hold the estimate; done ones hold real usage."""
@@ -941,6 +1058,7 @@ class Budget:
     hold_s: float = 600.0
     window_mode: str = ROLLING
     charge_basis: str = BILLED
+    reserve: Reserve | None = None
     entries: list[Entry] = field(default_factory=list)
     last_429: float = float("-inf")
     last_cut: float = float("-inf")
@@ -1057,6 +1175,15 @@ class Governor:
             limit_type = spec.get("limit_type", name)
             if limit_type not in LIMIT_TYPES:
                 raise ValueError(f"budget {name}: limit_type must be one of {LIMIT_TYPES}, not {limit_type!r}")
+            reserve = None
+            if spec.get("reserve") is not None:
+                if window_mode != CALENDAR:
+                    raise ValueError(f"budget {name}: a burst reserve needs window_mode {CALENDAR!r}")
+                reserve = Reserve(
+                    float(spec["reserve"]),
+                    refill_s=float(config.get("reserve_refill_s", RESERVE_REFILL_S)),
+                    wall=self.wall(),
+                )
             self.budgets[name] = Budget(
                 name=name,
                 limit=int(spec["limit"]),
@@ -1067,8 +1194,10 @@ class Governor:
                 hold_s=hold_s,
                 window_mode=window_mode,
                 charge_basis=charge_basis,
+                reserve=reserve,
                 last_grow=start,
             )
+        self.uncached_ratio: dict[str, dict] = {}
         self.calib: dict[str, dict] = {}
         self.calib_dirty: set[str] = set()
         self.queues: dict[str, deque[Ticket]] = {lane: deque() for lane in LANES}
@@ -1141,21 +1270,31 @@ class Governor:
                         wall_at=self.wall() - age,
                     )
                 )
+            if budget.reserve is not None:
+                saved_reserve = spec.get("reserve")
+                if isinstance(saved_reserve, dict):
+                    budget.reserve.restore(saved_reserve, self.wall(), minute_stamp(self.wall()))
+                else:
+                    budget.reserve.empty()
+        for family, spec in (data.get("uncached_ratio") or {}).items():
+            if isinstance(spec, dict) and isinstance(spec.get("ratio"), (int, float)):
+                samples = _as_int(spec.get("samples"))
+                self.uncached_ratio[family] = {"ratio": clamp_ratio(float(spec["ratio"])), "samples": samples}
 
     def snapshot_state(self) -> dict:
-        now = self.clock()
-        return {
-            "saved_at": self.wall(),
-            "budgets": {
-                name: {
-                    "limit": b.limit,
-                    "target_frac": round(b.target, 6),
-                    "fast_limit": None if b.fast_limit is None else round(b.fast_limit, 6),
-                    "window_used": self._used(b),
-                }
-                for name, b in self.budgets.items()
-            },
-        }
+        budgets = {}
+        for name, b in self.budgets.items():
+            entry = {
+                "limit": b.limit,
+                "target_frac": round(b.target, 6),
+                "fast_limit": None if b.fast_limit is None else round(b.fast_limit, 6),
+                "window_used": self._used(b),
+            }
+            if b.reserve is not None:
+                self.sync_reserve(b)
+                entry["reserve"] = b.reserve.snapshot()
+            budgets[name] = entry
+        return {"saved_at": self.wall(), "budgets": budgets, "uncached_ratio": self.uncached_ratio}
 
     def save_state(self) -> None:
         """Write the state now, on the calling thread. The proxy uses the dirty flag instead."""
@@ -1261,12 +1400,13 @@ class Governor:
         uncached = 0
         if any(b.limit_type == "uncached" for b in applicable):
             uncached = self.uncached_estimate(job, length, blocks)
+        admitted_uncached = round(uncached * self.uncached_factor(model))
         estimates: dict[str, int] = {}
         for b in applicable:
             if b.charge_basis == PROMPT_PLUS_MAX:
-                estimates[b.name] = reserved_for(b.limit_type, prompt, requested, uncached)
+                estimates[b.name] = reserved_for(b.limit_type, prompt, requested, admitted_uncached)
             else:
-                estimates[b.name] = estimate_for(b.limit_type, prompt, output, uncached)
+                estimates[b.name] = estimate_for(b.limit_type, prompt, output, admitted_uncached)
         return Ticket(
             job=job,
             lane=lane,
@@ -1279,6 +1419,31 @@ class Governor:
             prompt_est=prompt,
             requested=requested,
         )
+
+    def uncached_factor(self, model: str) -> float:
+        """The learned ratio of actual to estimated uncached input for this model's family, 1.0 until measured."""
+        learned = self.uncached_ratio.get(family_of(model))
+        return learned["ratio"] if learned else 1.0
+
+    def learn_uncached(self, model: str, estimated: int, actual: int) -> None:
+        """Fold one request's actual uncached input into its family's ratio. Logged every UNCACHED_LOG_EVERY samples."""
+        if estimated <= 0:
+            return
+        family = family_of(model)
+        learned = self.uncached_ratio.setdefault(family, {"ratio": 1.0, "samples": 0})
+        sample = min(max(actual / estimated, 0.0), 2.0)
+        learned["ratio"] = clamp_ratio((1.0 - UNCACHED_RATIO_ALPHA) * learned["ratio"] + UNCACHED_RATIO_ALPHA * sample)
+        learned["samples"] += 1
+        self.state_dirty = True
+        if learned["samples"] % UNCACHED_LOG_EVERY == 0:
+            self.log("uncached_estimate", family=family, ratio=round(learned["ratio"], 4), samples=learned["samples"])
+
+    def sync_reserve(self, budget: Budget) -> None:
+        """Bring a budget's burst reserve to the current minute's usage. A budget without a reserve is left alone."""
+        if budget.reserve is None:
+            return
+        wall = self.wall()
+        budget.reserve.sync(wall, minute_stamp(wall), self._used(budget), budget.cap())
 
     def enqueue(self, ticket: Ticket) -> None:
         self.queues[ticket.lane].append(ticket)
@@ -1363,7 +1528,7 @@ class Governor:
                 blocker, refusal = found
                 head.blocked_by = blocker.name
                 head.last_refusal = refusal
-                if refusal == RESERVE:
+                if refusal in (RESERVE, EMPTY):
                     head.reserve_seen = True
                 if refusal == CAPACITY:
                     blocker.saturated = True
@@ -1385,14 +1550,33 @@ class Governor:
             budget = self.budgets[name]
             cap = budget.cap()
             used = self._used(budget)
-            if used > 0 and used + estimate > cap:
-                return budget, CAPACITY
-            if ticket.lane == "backlog" and used > 0 and used + estimate > self.backlog_max_frac * cap:
-                return budget, RESERVE
+            if budget.reserve is not None:
+                self.sync_reserve(budget)
+                refusal = self._reserve_refusal(budget, ticket.lane, estimate, used)
+                if refusal is not None:
+                    return budget, refusal
+            else:
+                if used > 0 and used + estimate > cap:
+                    return budget, CAPACITY
+                if ticket.lane == "backlog" and used > 0 and used + estimate > self.backlog_max_frac * cap:
+                    return budget, RESERVE
             if ticket.lane == "urgent" and lower_waiting:
                 urgent_used = self._used(budget, lane="urgent")
                 if urgent_used > 0 and urgent_used + estimate > 0.5 * cap:
                     return budget, GUARD
+        return None
+
+    def _reserve_refusal(self, budget: Budget, lane: str, estimate: int, used: float) -> str | None:
+        """Why a charge on a budget with a burst reserve must wait, or None. The free allowance is the cap;
+        only the overflow past it touches the reserve. Backlog never spends the reserve, so it waits at the
+        cap (RESERVE). Normal and urgent work waits only when the reserve cannot pay the overflow (EMPTY)."""
+        overflow = budget.reserve.admission_overflow(used, estimate, budget.cap())
+        if overflow <= 0:
+            return None
+        if lane == "backlog":
+            return RESERVE
+        if not budget.reserve.covers(overflow):
+            return EMPTY
         return None
 
     def inflight_limit(self) -> int | None:
@@ -1444,6 +1628,7 @@ class Governor:
             entry = Entry(at=now, amount=estimate, lane=ticket.lane, wall_at=wall)
             budget.entries.append(entry)
             ticket.holds.append((budget, entry))
+            self.sync_reserve(budget)
         self.note_calib_admitted(ticket)
         wait = now - ticket.queued_at
         if not ticket.reserve_seen:
@@ -1474,13 +1659,16 @@ class Governor:
         real: dict[str, int] = {}
         if usage:
             prompt, output, cached = usage_fields(usage)
-            real = {"total": prompt + output, "output": output, "uncached": prompt - cached}
+            real = {"total": prompt + output, "output": output, "uncached": prompt - cached, "requests": 1}
         for budget, entry in ticket.holds:
             if budget.charge_basis == BILLED:
                 entry.amount = real.get(budget.limit_type, entry.amount)
             entry.done = True
             entry.at = now
+            self.sync_reserve(budget)
         ticket.holds = []
+        if usage and ticket.uncached_est > 0:
+            self.learn_uncached(ticket.model, ticket.uncached_est, prompt - cached)
         self.note_calib_billed(ticket, prompt + output)
         if output > 0:
             self.output_history.setdefault(ticket.model, deque(maxlen=20)).append(output)
@@ -1538,10 +1726,11 @@ class Governor:
     def release(self, ticket: Ticket) -> None:
         """Drop a charge that upstream did not bill: a 429, an error, a truncated stream, or a client that left."""
         now = self.clock()
-        for _, entry in ticket.holds:
+        for budget, entry in ticket.holds:
             entry.amount = 0
             entry.done = True
             entry.at = now
+            self.sync_reserve(budget)
         ticket.holds = []
 
     def budgets_for_limit(self, limit_type: str, model: str) -> list[Budget]:
@@ -1574,6 +1763,9 @@ class Governor:
             targets = [self.budgets["total"]] if "total" in self.budgets else []
         else:
             targets = [self.budgets[name] for name in ticket.estimates]
+        for budget in named:
+            if budget.reserve is not None:
+                budget.reserve.empty()
         if named:
             ticket.backoff_by = named[0].name
         elif "service_overloaded" in body_text and "total" in self.budgets:
@@ -1602,6 +1794,16 @@ class Governor:
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
             used = self._used(budget)
+            if budget.reserve is not None:
+                self.sync_reserve(budget)
+                overflow = budget.reserve.admission_overflow(used, estimate, budget.cap())
+                if overflow > 0:
+                    if ticket.lane == "backlog":
+                        wait = max(wait, seconds_to_next_minute(self.wall()))
+                        jitter = float(self.config["calendar_jitter_s"])
+                    else:
+                        wait = max(wait, budget.reserve.seconds_until_covered(overflow))
+                continue
             if budget.window_mode == CALENDAR:
                 if used + estimate > budget.cap():
                     wait = max(wait, seconds_to_next_minute(self.wall()))
@@ -1631,6 +1833,7 @@ class Governor:
         for budget in self.budgets.values():
             demanded = budget.saturated or budget.saturated_since_tick
             budget.saturated_since_tick = False
+            budget_ceiling = min(ceiling, 1.0) if budget.reserve is not None else ceiling
             if budget.fast_limit is not None and now - budget.last_429 >= FAST_LIMIT_QUIET_S:
                 self.log("fast_limit_cleared", budget=budget.name, fast_limit=round(budget.fast_limit, 4))
                 budget.fast_limit = None
@@ -1638,6 +1841,7 @@ class Governor:
             if not demanded:
                 continue
             fast_cap = fast_until if budget.fast_limit is None else min(fast_until, budget.fast_limit)
+            fast_cap = min(fast_cap, budget_ceiling)
             if budget.target < fast_cap:
                 if now - budget.last_429 >= fast_interval and now - budget.last_grow >= fast_interval:
                     budget.target = min(fast_cap, budget.target + fast_step)
@@ -1646,8 +1850,8 @@ class Governor:
                     self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
                 continue
             quiet = now - budget.last_429 >= window and now - budget.last_grow >= window
-            if budget.target < ceiling and quiet:
-                budget.target = min(ceiling, budget.target + step)
+            if budget.target < budget_ceiling and quiet:
+                budget.target = min(budget_ceiling, budget.target + step)
                 budget.last_grow = now
                 self.state_dirty = True
                 self.log("target_raised", budget=budget.name, target=round(budget.target, 4))
@@ -1927,6 +2131,7 @@ class Governor:
         )
         budgets = {}
         for name, budget in self.budgets.items():
+            self.sync_reserve(budget)
             per_lane = {lane: sum(1 for t in self.queues[lane] if name in t.estimates) for lane in LANES}
             queued_by_family = dict.fromkeys(FAMILY_KEYS, 0)
             blocked_by_family = dict.fromkeys(FAMILY_KEYS, 0)
@@ -1942,6 +2147,7 @@ class Governor:
                 "limit": budget.limit,
                 "target_frac": round(budget.target, 4),
                 "used_60s": self._used(budget),
+                "free": round(budget.cap()),
                 "queued": per_lane,
                 "queued_by_family": queued_by_family,
                 "blocked_by_family": blocked_by_family,
@@ -1952,6 +2158,13 @@ class Governor:
             }
             if budget.window_mode == CALENDAR:
                 budgets[name]["seconds_to_reset"] = round(seconds_to_next_minute(self.wall()), 2)
+            if budget.reserve is not None:
+                budgets[name]["reserve"] = {
+                    "level": round(budget.reserve.level),
+                    "capacity": round(budget.reserve.capacity),
+                    "refill_per_min": round(budget.reserve.refill_per_s * MINUTE_S),
+                    "drained_60s": round(budget.reserve.drained),
+                }
         inflight_queued = sum(
             1
             for lane in LANES
@@ -1965,6 +2178,10 @@ class Governor:
             "queued": {lane: len(self.queues[lane]) for lane in LANES},
             "errors": dict(self.errors),
             "budgets": budgets,
+            "uncached_estimate": {
+                family: {"ratio": round(learned["ratio"], 4), "samples": learned["samples"]}
+                for family, learned in self.uncached_ratio.items()
+            },
             "upstream": self.upstream_status(now),
             "loop_lag_ms": self.loop_lag_status(),
             "inflight_limit": self.inflight_limit(),

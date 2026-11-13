@@ -141,8 +141,9 @@ instead of letting it swing between idle and burst.
   - DeepSeek requests are blocked at the proxy;
   - a DeepSeek 429 came in the last `gate_429_window_s` (120 s); output 429s are included,
     since the proxy records 429s per budget in its log, not in its status;
-  - the DeepSeek output budget's current-minute use is at or above `output_hold_frac`
-    (0.85) of its target (its 70k limit times `target_frac`); the reason names the output budget;
+  - a DeepSeek per-minute budget (output, or uncached input) has used its free allowance
+    this calendar minute (its Morph limit times `target_frac`). Usage past the allowance
+    drains the burst reserve, which only real work may spend; the reason names the budget;
   - the in-flight limit is binding ("Morph slow: in-flight limit N reached"; the
     shadow mode says so). A limit at its maximum never holds filler here;
   - the laptop is past the filler bars: CPU busy over `fill_max_cpu_busy`, memory free
@@ -228,9 +229,16 @@ instead of letting it swing between idle and burst.
   (75th) of single-request DeepSeek jobs in `proxy_jobs`, once `min_measured_jobs` (20)
   are seen; otherwise `first_request_uncached` (40k). One urgent DeepSeek job per tick
   launches even when the allowance is spent.
-- Proxy reserve (`proxy.json` `backlog_max_frac`, 0.9): a backlog request waits once
-  its budget passes that fraction of the target, so normal and urgent work keep the
-  rest. The reserve does not raise the 429 controller's target.
+- Burst reserve (Morph's published limits, per budget in the proxy's `DEFAULT_CONFIG`): each
+  DeepSeek and Kimi per-minute budget (output, uncached input) has a free allowance of its
+  per-minute limit times the target, and a burst reserve (DeepSeek output 210k, DeepSeek
+  uncached 1.2M, Kimi output 18,486, Kimi uncached 72,870) that refills linearly over 30 minutes.
+  Usage past the allowance in a calendar minute drains the reserve. Backlog waits at the
+  allowance and never spends the reserve; normal and urgent work spends it and waits only when
+  it cannot pay. A 429 naming a budget empties that reserve. The reserve level is saved in
+  `proxy_state.json` and decays by the time away on restart. The reserve never raises the
+  429 controller's target above the Morph limit. The account-wide requests budget (1,000 a minute)
+  has no reserve. `backlog_max_frac` still applies to the rolling budgets (total).
 - Commands: `python3 -m agentq.fill --home <dir>` prints one reading (what fill and
   pacing would do now, and why) and never writes; run it on a copy of the store.
   `agentq status` shows `filler: on|off|paused` and the filler jobs running. The

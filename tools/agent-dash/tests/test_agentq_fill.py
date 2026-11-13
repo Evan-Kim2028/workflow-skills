@@ -67,41 +67,50 @@ def tick(ctl, now, billed, active, *, fill=FILL, filler=None, ready_real=0, queu
                     queued_filler=queued_filler, gate=gate)
 
 
-class OutputGateTests(unittest.TestCase):
-    """Filler waits while the DeepSeek output budget's current-minute use is near its target."""
+class MinuteGateTests(unittest.TestCase):
+    """Filler waits while a DeepSeek per-minute budget has used its free allowance this calendar minute."""
 
-    def status(self, used, limit=70_000, frac=0.98):
-        return {"budgets": {
-            "total": {"queued": {}, "blocked_by_family": {}},
-            "output": {"used_60s": used, "limit": limit, "target_frac": frac, "window_mode": "calendar"},
-        }}
+    def status(self, output=None, uncached=None):
+        budgets = {"total": {"queued": {}, "blocked_by_family": {}}}
+        if output is not None:
+            budgets["output"] = {"used_60s": output, "free": 68_600, "limit": 70_000, "target_frac": 0.98}
+        if uncached is not None:
+            budgets["uncached_ds"] = {"used_60s": uncached, "free": 392_000, "limit": 400_000, "target_frac": 0.98}
+        return {"budgets": budgets}
 
-    def test_the_output_budget_at_the_hold_fraction_holds_filler_and_names_it(self):
-        reason = F.output_gate(self.status(used=58_310), FILL)
+    def test_output_at_the_free_allowance_holds_and_names_the_budget(self):
+        reason = F.minute_gate(self.status(output=68_600))
         self.assertIsNotNone(reason)
         self.assertIn("output budget", reason)
-        self.assertIn("85% of its 68,600 target", reason)
+        self.assertIn("68,600 free allowance", reason)
 
-    def test_just_below_the_hold_fraction_does_not_hold(self):
-        self.assertIsNone(F.output_gate(self.status(used=58_309), FILL))
+    def test_output_just_below_the_free_allowance_does_not_hold(self):
+        self.assertIsNone(F.minute_gate(self.status(output=68_599)))
 
-    def test_the_hold_fraction_is_configurable(self):
-        self.assertIsNotNone(F.output_gate(self.status(used=50_000), dict(FILL, output_hold_frac=0.5)))
-        self.assertEqual(F.DEFAULT_FILL["output_hold_frac"], 0.85)
+    def test_uncached_input_at_its_free_allowance_holds(self):
+        self.assertIn("uncached_ds", F.minute_gate(self.status(uncached=392_000)))
 
-    def test_an_absent_or_unreadable_output_budget_does_not_hold(self):
-        self.assertIsNone(F.output_gate({"budgets": {"total": {}}}, FILL))
-        self.assertIsNone(F.output_gate(self.status(used=None), FILL))
-        self.assertIsNone(F.output_gate(None, FILL))
+    def test_a_proxy_without_free_falls_back_to_limit_times_target(self):
+        status = {"budgets": {"output": {"used_60s": 68_600, "limit": 70_000, "target_frac": 0.98}}}
+        self.assertIsNotNone(F.minute_gate(status))
+
+    def test_the_old_85_percent_hold_fraction_is_gone(self):
+        self.assertNotIn("output_hold_frac", F.DEFAULT_FILL)
+        self.assertIsNone(F.minute_gate(self.status(output=60_000)))
+
+    def test_an_absent_or_unreadable_budget_does_not_hold(self):
+        self.assertIsNone(F.minute_gate({"budgets": {"total": {}}}))
+        self.assertIsNone(F.minute_gate(self.status(output=None)))
+        self.assertIsNone(F.minute_gate(None))
 
     def test_the_gate_reaches_the_controller_through_gate_reason(self):
-        reason = F.gate_reason(self.status(used=65_000), 0, None, LAPTOP, FILL)
+        reason = F.gate_reason(self.status(output=69_000), 0, None, LAPTOP, FILL)
         self.assertIn("output budget", reason)
         plan = tick(F.FillController(), NOW, 1e6, 10, gate=reason)
         self.assertEqual((plan.submit, plan.key), (0, "gate"))
 
     def test_a_deepseek_429_still_holds_when_the_output_budget_is_clear(self):
-        self.assertIn("429", F.gate_reason(self.status(used=1_000), 1, None, LAPTOP, FILL))
+        self.assertIn("429", F.gate_reason(self.status(output=1_000), 1, None, LAPTOP, FILL))
 
 
 class LaptopGateTests(unittest.TestCase):
