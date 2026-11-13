@@ -52,39 +52,64 @@ class HysteresisTests(unittest.TestCase):
         self.assertFalse(F.filling_state(False, 7_500_000, target, low, high))
 
 
-def tick(ctl, now, billed, active, *, fill=FILL, ready_real=0, queued_filler=0, gate=None, paused=False):
-    return ctl.tick(now, fill=fill, paused=paused, billed_avg=billed, active=active,
+def tick(ctl, now, billed, active, *, fill=FILL, real=0, ready_real=0, queued_filler=0, gate=None, paused=False):
+    return ctl.tick(now, fill=fill, paused=paused, billed_avg=billed, active=active, real_running=real,
                     ready_real=ready_real, queued_filler=queued_filler, gate=gate)
+
+
+def seeded(per_worker=175_000.0, active=8, ceiling=None, now=NOW):
+    """A controller whose long-run rate is known: three earlier samples at ``per_worker`` billed per busy worker."""
+    ctl = F.FillController(ceiling=ceiling)
+    for k in range(1, 4):
+        ctl.samples.append((now - 60 * k, per_worker * active, active))
+    return ctl
 
 
 class ControllerTests(unittest.TestCase):
     def test_disabled_and_paused_never_step(self):
-        ctl = F.FillController()
+        ctl = seeded()
         self.assertEqual(tick(ctl, NOW, 1e6, 10, fill=dict(FILL, enabled=False)).key, "disabled")
         self.assertEqual(tick(ctl, NOW, 1e6, 10, paused=True).key, "paused")
         self.assertIsNone(ctl.step)
 
-    def test_a_low_average_starts_one_step_of_step_workers(self):
+    def test_an_unknown_rate_holds_everything(self):
         ctl = F.FillController()
-        plan = tick(ctl, NOW, 4_700_000, 47)
+        plan = tick(ctl, NOW, 1_000_000, 8)
+        self.assertEqual((plan.submit, plan.key), (0, "rate-unknown"))
+        self.assertIsNone(ctl.step)
+
+    def test_zero_billed_ticks_with_four_busy_workers_never_grow_or_clear_a_ceiling(self):
+        ctl = F.FillController(ceiling=(47, NOW))
+        now = NOW
+        for _ in range(int(1200 / 2)):
+            plan = tick(ctl, now, 0.0, 4)
+            self.assertEqual((plan.submit, plan.key), (0, "rate-unknown"))
+            now += 2
+        self.assertEqual(ctl.last_ceiling, 47)
+        self.assertEqual(ctl.ceiling, (47, NOW))
+        self.assertIsNone(ctl.step)
+        self.assertIsNone(ctl.judgement)
+
+    def test_a_low_average_starts_one_probe_of_step_workers(self):
+        ctl = seeded()
+        plan = tick(ctl, NOW, 1_400_000, 8)
         self.assertEqual((plan.submit, plan.key), (4, "stepping"))
-        self.assertEqual(tick(ctl, NOW + 2, 4_700_000, 47).key, "step-wait")
-        self.assertEqual(tick(ctl, NOW + 2, 4_700_000, 47).submit, 0)
+        self.assertEqual(tick(ctl, NOW + 2, 1_400_000, 8).key, "step-wait")
+        self.assertEqual(tick(ctl, NOW + 2, 1_400_000, 8).submit, 0)
 
     def test_real_work_and_gates_hold_before_a_step_starts(self):
-        self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, ready_real=2).key, "real-ready")
-        self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, gate="Morph gate: x").key, "gate")
+        self.assertEqual(tick(seeded(), NOW, 1e6, 10, ready_real=2).key, "real-ready")
+        self.assertEqual(tick(seeded(), NOW, 1e6, 10, gate="Morph gate: x").key, "gate")
 
     def test_above_the_high_mark_it_stops_and_does_not_kill(self):
-        ctl = F.FillController()
-        plan = tick(ctl, NOW, 8_000_000, 60)
+        plan = tick(seeded(), NOW, 8_000_000, 60)
         self.assertEqual((plan.filling, plan.submit, plan.key), (False, 0, "high-mark"))
 
-    def test_the_worker_cap_stops_a_step(self):
-        self.assertEqual(tick(F.FillController(), NOW, 1e6, 64).key, "at-limit")
+    def test_the_worker_cap_stops_a_probe(self):
+        self.assertEqual(tick(seeded(active=64), NOW, 1e6, 64).key, "at-limit")
 
-    def test_a_step_that_starts_no_worker_is_void_and_records_nothing(self):
-        ctl = F.FillController()
+    def test_a_probe_that_starts_no_worker_is_void_and_records_nothing(self):
+        ctl = seeded(active=47, per_worker=100_000.0)
         tick(ctl, NOW, 4_700_000, 47)
         plan = tick(ctl, NOW + 301, 4_700_000, 47)
         self.assertIsNone(ctl.new_ceiling)
@@ -92,7 +117,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(plan.key, "stepping")
 
     def test_the_47_worker_scenario_does_not_walk_to_64(self):
-        ctl = F.FillController()
+        ctl = seeded(active=47, per_worker=100_000.0)
         active, now, peak = 47, NOW, 47
         for _ in range(int(3 * 3600 / 2)):
             billed = 4_700_000 + 25_000 * (active - 47)
@@ -104,9 +129,35 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(ctl.last_ceiling, 47)
         self.assertIn("poor", ctl.judgement)
 
-    def test_good_gain_per_step_reaches_the_target_band(self):
-        ctl = F.FillController()
-        active, now, billed = 0, NOW, 0.0
+    def test_one_worker_completions_and_poor_refills_keep_the_ceiling_at_47(self):
+        ctl = seeded(active=47, per_worker=100_000.0, ceiling=(47, NOW))
+        active, now = 47, NOW
+        for cycle in range(int(1200 / 2)):
+            if cycle % 10 == 9 and active > 0:
+                active -= 1
+            plan = tick(ctl, now, 4_700_000, active)
+            self.assertIn(plan.key, ("refill", "at-limit"))
+            active += plan.submit
+            now += 2
+        self.assertEqual(ctl.ceiling, (47, NOW))
+        self.assertEqual(ctl.last_ceiling, 47)
+        self.assertIsNone(ctl.judgement)
+        self.assertEqual(active, 47)
+
+    def test_a_real_job_count_is_a_floor_under_the_ceiling(self):
+        ctl = seeded(active=50, per_worker=94_000.0, ceiling=(47, NOW))
+        self.assertEqual(ctl.worker_limit(NOW, FILL, real_running=50), (50, "learned ceiling"))
+        self.assertEqual(tick(ctl, NOW, 4_700_000, 50, real=50).key, "at-limit")
+
+    def test_a_poor_probe_never_records_below_the_real_count(self):
+        ctl = seeded(active=47, per_worker=100_000.0)
+        tick(ctl, NOW, 4_700_000, 47, real=49)
+        tick(ctl, NOW + 301, 4_700_000, 51, real=49)
+        self.assertEqual(ctl.last_ceiling, 49)
+
+    def test_good_gain_per_probe_reaches_the_target_band(self):
+        ctl = seeded(active=8)
+        active, now, billed = 8, NOW, 0.0
         for _ in range(int(2 * 3600 / 2)):
             billed = 175_000.0 * active
             plan = tick(ctl, now, billed, active)
@@ -117,16 +168,20 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(ctl.last_ceiling)
 
     def test_an_expired_ceiling_allows_one_probe_past_it_and_no_more(self):
-        ctl = F.FillController(ceiling=(47, NOW))
-        self.assertEqual(tick(ctl, NOW + 10, 4_700_000, 47).key, "at-limit")
-        probe = tick(ctl, NOW + 1801, 4_700_000, 47)
-        self.assertEqual((probe.key, probe.submit), ("stepping", 4))
-        tick(ctl, NOW + 1801 + 301, 4_700_000, 51)
+        ctl = seeded(active=47, per_worker=100_000.0, ceiling=(47, NOW))
+        plans = []
+        now = NOW + 2
+        while now < NOW + 1800 + 1200:
+            plans.append(tick(ctl, now, 4_700_000, 47 + sum(p.submit for p in plans if p.key == "stepping")))
+            now += 2
+        probes = [p for p in plans if p.key == "stepping"]
+        self.assertEqual([p.submit for p in probes], [4])
         self.assertEqual(ctl.new_ceiling[0], 47)
-        self.assertEqual(tick(ctl, NOW + 1801 + 302, 4_700_000, 51).key, "at-limit")
+        self.assertEqual(ctl.last_ceiling, 47)
+        self.assertEqual(plans[-1].key, "at-limit")
 
     def test_a_saved_ceiling_survives_a_restart(self):
-        ctl = F.FillController(ceiling=(47, NOW - 60))
+        ctl = seeded(active=47, per_worker=100_000.0, ceiling=(47, NOW - 60))
         self.assertEqual(tick(ctl, NOW, 4_700_000, 47).key, "at-limit")
 
     def test_the_rate_judging_a_step_ignores_samples_from_the_step_itself(self):
@@ -134,7 +189,13 @@ class ControllerTests(unittest.TestCase):
         for k in range(10):
             ctl.samples.append((NOW - 600 + k * 30, 4_700_000.0, 47))
         ctl.samples.append((NOW + 100, 9_000_000.0, 50))
-        self.assertEqual(ctl.long_run_rate(NOW + 400, NOW, FILL), 100_000)
+        self.assertEqual(ctl.measured_rate(NOW + 400, NOW, FILL), 100_000)
+
+    def test_a_rate_below_the_floor_counts_as_unknown(self):
+        ctl = F.FillController()
+        for k in range(1, 4):
+            ctl.samples.append((NOW - 60 * k, 0.0, 4))
+        self.assertIsNone(ctl.measured_rate(NOW, NOW, FILL))
 
 
 class PacingTests(unittest.TestCase):
@@ -254,7 +315,7 @@ class StoreTest(unittest.TestCase):
             self.conn, NOW, controller=F.FillController(), fill=FILL, pacing=PACING, status=status, ps_text="",
             laptop=(90.0, 0.2), paused=False, measured=None,
         )
-        self.assertEqual((decision.plan.submit, decision.plan.key), (4, "stepping"))
+        self.assertEqual((decision.plan.submit, decision.plan.key), (0, "rate-unknown"))
         self.assertEqual(decision.billed_avg, 20_000)
         self.assertEqual(decision.direct_ds, 0)
         self.assertEqual(decision.pacing_current, 100_000)
@@ -385,8 +446,12 @@ class BrokerWiringTest(unittest.TestCase):
 
     def broker(self):
         gauges = mock.Mock(read=lambda ttl: (90.0, 0.1))
-        return B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: self.status,
-                        gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: self.status,
+                          gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler)
+        broker._controller = F.FillController()
+        for k in range(1, 4):
+            broker._controller.samples.append((NOW - 60 * k, 175_000.0 * 4, 4))
+        return broker
 
     def tick(self, broker):
         with mock.patch.object(F, "process_table", return_value=self.ps), \

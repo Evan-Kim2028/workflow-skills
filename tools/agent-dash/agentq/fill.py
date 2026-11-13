@@ -60,7 +60,7 @@ DEFAULT_FILL = {
     "ceiling_ttl_s": 1800.0,
     "rate_window_s": 1800.0,
     "rate_min_samples": 3,
-    "default_rate": 175_000.0,
+    "rate_min": 10_000.0,
     "gate_429_window_s": 120.0,
     "laptop_min_free_pct": 20.0,
     "laptop_max_load_per_cpu": 1.0,
@@ -159,16 +159,18 @@ class FillPlan:
 
 
 class FillController:
-    """Stepwise filler controller. It runs one step at a time and judges it by the workers it actually added.
+    """Stepwise filler controller that judges only probes.
 
-    A step adds up to ``step_workers`` filler workers and is judged ``step_interval_s`` later. The gain per
-    added worker is the change in the DeepSeek billed 5-minute average divided by the workers that started.
-    If that is below ``min_marginal_frac`` of the long-run per-worker rate, the step's starting count becomes
-    a ceiling for ``ceiling_ttl_s``. The long-run rate uses only samples taken before the step began, so the
-    concurrency a step just added never counts as evidence for more.
+    A probe is a submission that takes busy DeepSeek workers above the highest count reached since the
+    ceiling was set (or above the ceiling itself). A probe is a step: it is judged ``step_interval_s``
+    later by the billed gain per worker it actually started, against the long-run per-worker rate measured
+    before the step. A gain counts as good only if it is positive and at least ``min_marginal_frac`` of
+    that rate. A poor probe records a ceiling of max(the count before the probe, the current ceiling),
+    never below the real (non-filler) DeepSeek count, for ``ceiling_ttl_s``.
 
-    When a ceiling expires the controller may probe one step past it, and no further. A poor probe keeps the
-    old ceiling rather than recording the probe's own starting count, so the ceiling cannot walk upward.
+    Refills at or below the peak are plain launches. They are not judged and never change the ceiling.
+    After a ceiling expires, one probe past it is allowed and no further. While the long-run rate is
+    unknown or below ``rate_min``, the controller takes no steps and judges nothing.
     """
 
     def __init__(self, ceiling: tuple[int, float] | None = None):
@@ -176,6 +178,7 @@ class FillController:
         self.step: dict | None = None
         self.ceiling = ceiling
         self.last_ceiling = ceiling[0] if ceiling else None
+        self.peak = 0
         self.samples: deque = deque()
         self.new_ceiling: tuple[int, float] | None = None
         self.judgement: str | None = None
@@ -190,48 +193,55 @@ class FillController:
             return None
         return workers
 
-    def worker_limit(self, now: float, fill: dict) -> tuple[int, str]:
-        """The busy-worker limit now, and what sets it."""
+    def worker_limit(self, now: float, fill: dict, real_running: int) -> tuple[int, str]:
+        """The busy-worker limit now, and what sets it. A learned ceiling never sits below the real DeepSeek count."""
         cap = int(fill["max_workers"])
         ceiling = self.active_ceiling(now, fill)
         if ceiling is not None:
-            return min(cap, ceiling), "learned ceiling"
+            return min(cap, max(ceiling, real_running)), "learned ceiling"
         if self.last_ceiling is not None:
-            return min(cap, self.last_ceiling + int(fill["step_workers"])), "probe past expired ceiling"
+            probe_limit = self.last_ceiling + int(fill["step_workers"])
+            return min(cap, max(probe_limit, real_running)), "probe past expired ceiling"
         return cap, "max_workers"
 
-    def long_run_rate(self, now: float, before: float, fill: dict) -> float:
-        """Median billed-per-busy-worker over the rate window, using only samples taken before ``before``."""
+    def measured_rate(self, now: float, before: float, fill: dict) -> float | None:
+        """Median billed-per-busy-worker over the rate window, from samples taken before ``before``.
+
+        None when there are too few samples or the median is below ``rate_min``: the rate is unknown.
+        """
         window = fill["rate_window_s"]
         rates = [billed / active for ts, billed, active in self.samples if now - window <= ts < before and active > 0]
         if len(rates) < fill["rate_min_samples"]:
-            return float(fill["default_rate"])
-        return statistics.median(rates)
+            return None
+        rate = statistics.median(rates)
+        return rate if rate >= fill["rate_min"] else None
 
-    def _judge(self, now: float, billed_avg: float, active: int, fill: dict) -> None:
+    def _judge(self, now: float, billed_avg: float, active: int, real_running: int, fill: dict) -> None:
         step, self.step = self.step, None
         added = active - step["workers_before"]
         if added <= 0:
             self.judgement = "step void: no filler worker started, nothing to judge"
             return
+        rate = self.measured_rate(now, step["start"], fill)
+        if rate is None:
+            self.judgement = "step not judged: per-worker rate unknown"
+            return
         gain = (billed_avg - step["avg_before"]) / added
-        rate = self.long_run_rate(now, step["start"], fill)
-        if gain < fill["min_marginal_frac"] * rate:
-            workers = step["workers_before"]
-            if self.last_ceiling is not None:
-                workers = min(workers, self.last_ceiling)
-            self.ceiling = (workers, now)
-            self.last_ceiling = workers
-            self.new_ceiling = self.ceiling
-            self.judgement = (f"step of {added} judged poor: {gain:,.0f} per added worker against "
-                              f"{rate:,.0f} per worker; ceiling {workers} workers")
-        else:
+        if gain > 0 and gain >= fill["min_marginal_frac"] * rate:
             self.last_ceiling = None
             self.judgement = f"step of {added} judged good: {gain:,.0f} per added worker against {rate:,.0f}"
+            return
+        workers = max(step["workers_before"], self.last_ceiling or 0, real_running)
+        self.ceiling = (workers, now)
+        self.last_ceiling = workers
+        self.peak = active
+        self.new_ceiling = self.ceiling
+        self.judgement = (f"step of {added} judged poor: {gain:,.0f} per added worker against "
+                          f"{rate:,.0f} per worker; ceiling {workers} workers")
 
     def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int,
-             ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
-        """One decision. ``active`` counts busy DeepSeek workers, filler included."""
+             real_running: int, ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
+        """One decision. ``active`` counts busy DeepSeek workers, filler included; ``real_running`` counts the rest."""
         if not fill["enabled"]:
             self.filling, self.step = False, None
             return FillPlan(False, 0, "fill disabled", "disabled")
@@ -241,11 +251,12 @@ class FillController:
         self.samples.append((now, billed_avg, active))
         while self.samples and self.samples[0][0] < now - fill["rate_window_s"]:
             self.samples.popleft()
+        self.peak = max(self.peak, active)
         target = float(fill["target_billed_per_min"])
         low, high = fill["low_frac"] * target, fill["high_frac"] * target
         self.filling = filling_state(self.filling, billed_avg, target, fill["low_frac"], fill["high_frac"])
         if self.step is not None and now - self.step["start"] >= fill["step_interval_s"]:
-            self._judge(now, billed_avg, active, fill)
+            self._judge(now, billed_avg, active, real_running, fill)
         average = f"5-min average {billed_avg / 1e6:.2f}M/min"
         if not self.filling:
             return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; no filler", "high-mark")
@@ -256,13 +267,19 @@ class FillController:
         if self.step is not None:
             left = max(0.0, fill["step_interval_s"] - (now - self.step["start"]))
             return FillPlan(True, 0, f"step of {self.step['added']} in progress; judged in {left:.0f} s", "step-wait")
-        limit, cause = self.worker_limit(now, fill)
+        if self.measured_rate(now, now, fill) is None:
+            return FillPlan(True, 0, "per-worker rate unknown or below rate_min; holding, no steps", "rate-unknown")
+        limit, cause = self.worker_limit(now, fill, real_running)
         room = limit - active - queued_filler
         if room <= 0:
             return FillPlan(True, 0, f"{average}; {active} busy at the {cause} of {limit}", "at-limit")
         to_add = min(int(fill["step_workers"]), room)
+        top = max(self.peak, self.last_ceiling or 0)
+        if active + to_add <= top:
+            return FillPlan(True, to_add, f"{average}; refilling {to_add} to {active + to_add} busy (at or below "
+                            f"the peak {top}; not a probe)", "refill")
         self.step = {"start": now, "workers_before": active, "avg_before": billed_avg, "added": to_add}
-        return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; stepping {to_add} "
+        return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; probing {to_add} "
                         f"filler workers from {active} busy (limit {limit})", "stepping")
 
 
@@ -314,6 +331,7 @@ def decide(
         gate = "worker count unknown (ps failed); filler waits"
     plan = controller.tick(
         now, fill=fill, paused=paused, billed_avg=billed_avg, active=active,
+        real_running=counts["running_ds"] - counts["running_filler"],
         ready_real=counts["ready_real"], queued_filler=counts["queued_filler"], gate=gate,
     )
     current, source = current_uncached(status, conn, now)
@@ -358,6 +376,10 @@ def current_uncached(status: dict | None, conn, now: float) -> tuple[int, str]:
 
     The proxy's live ``uncached_ds`` budget is the source, since it counts in-flight charges. Without a
     proxy reading, the store's current-minute row stands in (the proxy flushes it every few seconds).
+
+    Window mode: ``used_60s`` is the calendar minute only when the budget's window_mode is ``calendar``.
+    A rolling budget also holds the previous minute's charges, so just after a minute boundary it
+    overcounts. That is conservative, so pacing is left as it is; the live proxy sets uncached_ds to calendar.
     """
     budget = ((status or {}).get("budgets") or {}).get(UNCACHED_BUDGET) if isinstance(status, dict) else None
     if isinstance(budget, dict) and isinstance(budget.get("used_60s"), int):

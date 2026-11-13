@@ -93,19 +93,23 @@ Two controls in the broker keep the DeepSeek pool near Morph's total-token limit
 instead of letting it swing between idle and burst.
 
 - Fill (`broker.json` `fill`, off by default; `"enabled": true` turns it on). The
-  controller adds filler workers in steps: at most `step_workers` (4) every
-  `step_interval_s` (300 s), while the DeepSeek billed 5-minute average
-  (`input + cache_read + output` of DeepSeek rows in `proxy_minutes`) is below
-  `low_frac` (0.9) of `target_billed_per_min` (8M). It stops above `high_frac` (0.97),
-  and never kills a running worker. Each step is judged `step_interval_s` later by the
-  billed gain per worker it actually started, against the long-run per-worker rate
-  (median over `rate_window_s`, 1800 s, of samples taken before the step; `default_rate`
-  175k with too few samples). A gain below `min_marginal_frac` (0.5) of that rate
-  records a ceiling at the step's starting count for `ceiling_ttl_s` (1800 s). The
-  ceiling survives a broker restart. After it expires the controller may probe one
-  step past it, and a poor probe keeps the old ceiling. `max_workers` (64) caps
-  everything. Filler waits while real DeepSeek work is ready, while the proxy holds a
-  DeepSeek request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and
+  controller judges only probes. A probe is a submission that takes busy DeepSeek
+  workers above the highest count reached since the ceiling was set, or above the
+  ceiling. Each probe is judged `step_interval_s` (300 s) later, by the billed gain per
+  worker it actually started, against the long-run per-worker rate (median over
+  `rate_window_s`, 1800 s, of samples taken before the probe). A gain counts as good
+  only if it is positive and at least `min_marginal_frac` (0.5) of that rate. A poor
+  probe records a ceiling of max(the count before the probe, the current ceiling),
+  never below the real (non-filler) DeepSeek count, for `ceiling_ttl_s` (1800 s). The
+  ceiling survives a broker restart. Refills at or below the peak are plain launches:
+  they are not judged and never change the ceiling. After a ceiling expires the
+  controller may probe one step past it, and no further. While the long-run rate is
+  unknown (fewer than `rate_min_samples` samples, so no busy workers yet) or below
+  `rate_min` (10k), the controller holds: no probes, no refills, no judgements. It
+  adds at most `step_workers` (4) per probe, and `max_workers` (64) caps everything.
+  Above `high_frac` (0.97) of `target_billed_per_min` (8M) it stops, and it never kills
+  a running worker. Filler waits while real DeepSeek work is ready, while the proxy holds
+  a DeepSeek request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and
   while the laptop is short of memory (`laptop_min_free_pct`, 20) or load
   (`laptop_max_load_per_cpu`, 1.0).
 - Filler jobs are read-only audits (kind `read`, resource `light`, lane `backlog`).
