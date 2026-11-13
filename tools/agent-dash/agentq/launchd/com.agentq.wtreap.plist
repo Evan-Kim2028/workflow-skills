@@ -1,22 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Worktree disk janitor, every 2 hours. After the worktree sweep it runs `scratch gc --older-than-days 0.21 --apply`, which removes worker scratch folders whose runs finished and whose newest file is over 5 hours old (live, running, in-use and unowned folders are kept).
+  Worktree disk janitor, every 2 hours. After the worktree sweep it runs `scratch gc ‑‑older-than-days 0.21 ‑‑apply`, which removes worker scratch folders whose runs finished and whose newest file is over 5 hours old (live, running, in-use and unowned folders are kept). Then it runs `janitor postgres ‑‑min-age 1h ‑‑apply`, which stops local Postgres servers orphaned by finished runs or killed pytest sessions (guards in dash/pgjanitor.py).
 
   Template: __HOME__, __PYTHON__ and __REPOS__ are replaced at install
   time (the live copy is ~/Library/LaunchAgents/com.agentq.wtreap.plist;
   __REPOS__ is the space-separated list of repo checkouts to sweep). It runs
-  `worktrees janitor --apply` for each repo, which reaps merged lanes and
+  `worktrees janitor ‑‑apply` for each repo, which reaps merged lanes and
   deletes stale regenerable artifact folders (.venv, node_modules, tool
-  caches) from the worktrees that remain. --daily-maintenance adds
+  caches) from the worktrees that remain. ‑‑daily-maintenance adds
   `uv cache prune` and, when the installed agentq supports it,
-  `agentq gc --apply --runs-older-than 7d`, at most once per 24h.
+  `agentq gc ‑‑apply ‑‑runs-older-than 7d`, at most once per 24h.
 
-  --apply-cooldown 1h makes the scheduled run a dry run when the previous
-  --apply run on that repo is under an hour old. RunAtLoad stays on so the
+  ‑‑apply-cooldown 1h makes the scheduled run a dry run when the previous
+  ‑‑apply run on that repo is under an hour old. RunAtLoad stays on so the
   janitor reports at login, but a run right after load cannot delete again
   on top of a run that just happened: it reports instead. A fresh install
-  (no stamp yet) still runs --apply, which is the desired first sweep.
+  (no stamp yet) still runs ‑‑apply, which is the desired first sweep.
 
   Install (do not run from a worker):
     launchctl bootout gui/$(id -u)/com.agentq.wtreap 2>/dev/null
@@ -42,7 +42,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --daily-maintenance; done; echo "== $(date -u +%FT%TZ) scratch gc"; __PYTHON__ agent_dash.py scratch gc --older-than-days 0.21 --apply</string>
+		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --daily-maintenance; done; echo "== $(date -u +%FT%TZ) scratch gc"; __PYTHON__ agent_dash.py scratch gc --older-than-days 0.21 --apply; echo "== $(date -u +%FT%TZ) postgres janitor"; __PYTHON__ agent_dash.py janitor postgres --min-age 1h --apply</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
