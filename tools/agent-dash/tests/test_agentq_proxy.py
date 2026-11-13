@@ -2873,6 +2873,10 @@ class UpstreamPoolTest(unittest.IsolatedAsyncioTestCase):
         port = server.sockets[0].getsockname()[1]
         opened = [await asyncio.open_connection("127.0.0.1", port) for _ in range(count)]
         self.addCleanup(server.close)
+        for _ in range(200):
+            if len(server_side) >= count:
+                break
+            await asyncio.sleep(0.01)
         self.server_side = server_side
         return opened
 
