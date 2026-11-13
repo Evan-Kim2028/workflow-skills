@@ -17,6 +17,8 @@ import argparse
 import asyncio
 import calendar
 import contextlib
+import faulthandler
+import functools
 import getpass
 import hashlib
 import json
@@ -38,6 +40,8 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from agentq import watchdog as watchdog_lib
 
 LANES = ("urgent", "normal", "backlog")
 MORPH_FAMILIES = ("morph-dsv41flash", "morph-kimik31")
@@ -100,6 +104,9 @@ DEFAULT_CONFIG = {
     "charge_basis": "billed",
     "calendar_jitter_s": 1.5,
     "backlog_max_frac": 0.9,
+    "stall_dump_s": 2.0,
+    "upstream_pool_max": 64,
+    "upstream_pool_idle_s": 30.0,
     "log_path": LOG_PATH,
     "log_max_bytes": LOG_MAX_BYTES,
     "log_backups": LOG_BACKUPS,
@@ -584,10 +591,16 @@ def seconds_to_next_minute(wall: float) -> float:
     return (-wall) % MINUTE_S
 
 
+@functools.lru_cache(maxsize=16)
+def read_only_uri(db_path: Path) -> str:
+    """The sqlite URI for read-only access to a store, resolved once per path (resolve() lstats every component)."""
+    return f"{Path(db_path).resolve().as_uri()}?mode=ro"
+
+
 def read_calib_counts(db_path: Path, minute: str) -> dict | None:
     """The stored proxy_calib row for one UTC minute as a seed, or None. Read-only."""
     try:
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+        connection = sqlite3.connect(read_only_uri(db_path), uri=True, timeout=1.0)
         try:
             found = connection.execute(
                 "SELECT req, prompt_est, max_tokens, billed, first_429_s, r429 FROM proxy_calib WHERE minute = ?",
@@ -629,7 +642,7 @@ def read_lane(db_path: Path, job: str) -> str:
     if not db_path.exists():
         return "normal"
     try:
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
+        connection = sqlite3.connect(read_only_uri(db_path), uri=True, timeout=5.0)
         try:
             row = connection.execute("SELECT lane FROM jobs WHERE id = ?", (job,)).fetchone()
         finally:
@@ -648,6 +661,28 @@ def empty_minute_row() -> dict:
     }
 
 
+def merge_row_seed(row: dict, seed: dict | None) -> None:
+    """Add a stored minute's counters to an in-memory row. The in-flight peak keeps the larger value."""
+    if not seed:
+        return
+    for name in MINUTE_SEED_COLUMNS:
+        if name == "in_flight_max":
+            row[name] = max(row[name], seed.get(name, 0))
+        else:
+            row[name] += seed.get(name, 0)
+
+
+def merge_calib_seed(record: dict, seed: dict | None) -> None:
+    """Add a stored calibration minute to an in-memory record: overall counters and 429s add, the first 429 keeps the earlier time."""
+    if not seed:
+        return
+    for name in CALIB_FIELDS:
+        record["overall"][name] += seed["overall"].get(name, 0)
+    record["r429"] += seed.get("r429", 0)
+    firsts = [value for value in (record["first_429_s"], seed.get("first_429_s")) if value is not None]
+    record["first_429_s"] = min(firsts) if firsts else None
+
+
 def ensure_minutes_schema(connection: sqlite3.Connection) -> None:
     """Create proxy_minutes, then add each latency column an older table lacks. Safe to run every time."""
     connection.execute(PROXY_MINUTES_DDL)
@@ -661,7 +696,7 @@ def read_minute_counts(db_path: Path, minute: str, model: str) -> dict | None:
     """The counters already stored for one model and minute, or None. Waits and latency samples start
     empty; the latency sums and counts carry over. Columns an older table lacks read as zero. Read-only."""
     try:
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+        connection = sqlite3.connect(read_only_uri(db_path), uri=True, timeout=1.0)
         try:
             present = {row[1] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
             selected = [name for name in MINUTE_SEED_COLUMNS if name in present]
@@ -1037,6 +1072,8 @@ class Governor:
         self.output_history: dict[str, deque[int]] = {}
         self.prefixes: OrderedDict[str, tuple[int, tuple[bytes, ...]]] = OrderedDict()
         self.lane_cache: dict[str, tuple[str, float]] = {}
+        self.seeder = None
+        self.pending_seeds: set[tuple[str, object]] = set()
         self.minute_rows: dict[tuple[str, str], dict] = {}
         self.in_flight: dict[str, int] = {}
         self.upstream_recent: deque[tuple[float, str, float]] = deque()
@@ -1614,15 +1651,38 @@ class Governor:
 
     def row(self, model: str) -> dict:
         """The in-memory counters for this model's current minute. The first use of a minute in this
-        process seeds them from the stored row, because the flush REPLACEs that row."""
+        process seeds them from the stored row, because the flush REPLACEs that row.
+
+        With a seeder (the proxy), the seed is read off the event loop: counting starts at once, the
+        seed is merged when it lands, and the minute is not flushed until then."""
         key = (minute_stamp(self.wall()), model)
         row = self.minute_rows.get(key)
         if row is None:
-            row = read_minute_counts(self.db_path, key[0], model) or empty_minute_row()
-            row["in_flight_max"] = max(row["in_flight_max"], self.in_flight.get(model, 0))
+            row = empty_minute_row()
+            row["in_flight_max"] = self.in_flight.get(model, 0)
             self.minute_rows[key] = row
+            if self.seeder is None:
+                merge_row_seed(row, read_minute_counts(self.db_path, key[0], model))
+            else:
+                self.request_seed(("row", key))
         self.dirty.add(key)
         return row
+
+    def request_seed(self, pending: tuple[str, object]) -> None:
+        self.pending_seeds.add(pending)
+        self.seeder(*pending)
+
+    def apply_row_seed(self, key: tuple[str, str], seed: dict | None) -> None:
+        self.pending_seeds.discard(("row", key))
+        row = self.minute_rows.get(key)
+        if row is not None:
+            merge_row_seed(row, seed)
+
+    def apply_calib_seed(self, minute: str, seed: dict | None) -> None:
+        self.pending_seeds.discard(("calib", minute))
+        record = self.calib.get(minute)
+        if record is not None:
+            merge_calib_seed(record, seed)
 
     def job_counters(self, ticket: Ticket) -> dict:
         """The per-run counters for one (job, model), created on first use. Anonymous requests count
@@ -1685,7 +1745,7 @@ class Governor:
         rows = []
         for key in self.dirty:
             row = self.minute_rows.get(key)
-            if row is None:
+            if row is None or ("row", key) in self.pending_seeds:
                 continue
             minute, model = key
             waits = sorted(row["waits"])
@@ -1718,9 +1778,9 @@ class Governor:
                     sample_percentile_ms(row["ttfb_gt_samples"], 0.5),
                 )
             )
-        self.dirty.clear()
+        self.dirty = {key for key in self.dirty if ("row", key) in self.pending_seeds}
         cutoff = minute_stamp(self.wall() - 120)
-        for key in [k for k in self.minute_rows if k[0] < cutoff]:
+        for key in [k for k in self.minute_rows if k[0] < cutoff and ("row", k) not in self.pending_seeds]:
             del self.minute_rows[key]
         return rows
 
@@ -1742,16 +1802,16 @@ class Governor:
         return (self.inflight_limit(), self.inflight.mode, self.inflight.arm_at(minute_epoch(minute)))
 
     def calib_record(self, minute: str) -> dict:
-        """The calibration counters for one UTC minute, seeded from proxy_calib on first use in this process."""
+        """The calibration counters for one UTC minute, seeded from proxy_calib on first use in this process.
+        With a seeder the seed is merged when it lands, as row() does."""
         record = self.calib.get(minute)
         if record is None:
-            record = read_calib_counts(self.db_path, minute) or {
-                "overall": {name: 0 for name in CALIB_FIELDS},
-                "families": {},
-                "first_429_s": None,
-                "r429": 0,
-            }
+            record = {"overall": {name: 0 for name in CALIB_FIELDS}, "families": {}, "first_429_s": None, "r429": 0}
             self.calib[minute] = record
+            if self.seeder is None:
+                merge_calib_seed(record, read_calib_counts(self.db_path, minute))
+            else:
+                self.request_seed(("calib", minute))
         self.calib_dirty.add(minute)
         return record
 
@@ -1811,7 +1871,7 @@ class Governor:
         rows = []
         for minute in self.calib_dirty:
             record = self.calib.get(minute)
-            if record is None:
+            if record is None or ("calib", minute) in self.pending_seeds:
                 continue
             overall = record["overall"]
             rows.append(
@@ -1825,9 +1885,9 @@ class Governor:
                     record["r429"],
                 )
             )
-        self.calib_dirty.clear()
+        self.calib_dirty = {minute for minute in self.calib_dirty if ("calib", minute) in self.pending_seeds}
         cutoff = minute_stamp(self.wall() - CALIB_KEEP_S)
-        for minute in [m for m in self.calib if m < cutoff]:
+        for minute in [m for m in self.calib if m < cutoff and ("calib", m) not in self.pending_seeds]:
             del self.calib[minute]
         return rows
 
@@ -1923,15 +1983,92 @@ class Client:
     aborted: bool = False
 
 
+class StaleConnection(Exception):
+    """A reused keep-alive connection was closed by the server before it answered. Nothing was received, so
+    the request can be sent again on a new connection."""
+
+
+class UpstreamPool:
+    """Idle keep-alive connections to the upstream: bounded, expiring, never shared while in use.
+
+    A connection goes back only after a complete 200 response with length or chunked framing, and only
+    when its body was read to the end. Anything else is closed by the caller.
+    """
+
+    def __init__(self, max_idle: int, idle_s: float, clock=time.monotonic) -> None:
+        self.max_idle = int(max_idle)
+        self.idle_s = float(idle_s)
+        self.clock = clock
+        self.idle: deque[tuple[float, str, asyncio.StreamReader, asyncio.StreamWriter]] = deque()
+
+    @staticmethod
+    def usable(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
+        return not writer.is_closing() and not reader.at_eof()
+
+    def prune(self) -> None:
+        now = self.clock()
+        while self.idle and (now - self.idle[0][0] > self.idle_s or not self.usable(self.idle[0][2], self.idle[0][3])):
+            _, _, _, writer = self.idle.popleft()
+            writer.close()
+
+    def take(self, key: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+        """An idle connection to this upstream, most recently used first, or None. Never waits."""
+        self.prune()
+        for index in range(len(self.idle) - 1, -1, -1):
+            _, host, reader, writer = self.idle[index]
+            if host == key and self.usable(reader, writer):
+                del self.idle[index]
+                return reader, writer
+        return None
+
+    def give(self, key: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.max_idle <= 0 or not self.usable(reader, writer):
+            writer.close()
+            return
+        self.prune()
+        while len(self.idle) >= self.max_idle:
+            _, _, _, old = self.idle.popleft()
+            old.close()
+        self.idle.append((self.clock(), key, reader, writer))
+
+    def close_all(self) -> None:
+        while self.idle:
+            _, _, _, writer = self.idle.popleft()
+            writer.close()
+
+
+def keep_alive_framed(status: int, status_line: bytes, headers: dict[str, str]) -> bool:
+    """Whether a response leaves its connection usable: a 200 over HTTP/1.1 with a declared end and no close."""
+    if status != 200 or not status_line.startswith(b"HTTP/1.1"):
+        return False
+    if "close" in headers.get("connection", "").lower():
+        return False
+    return "chunked" in headers.get("transfer-encoding", "").lower() or "content-length" in headers
+
+
 @dataclass(eq=False)
 class Upstream:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     status: int
     headers: dict[str, str]
+    key: str = ""
+    reusable: bool = False
+    pool: UpstreamPool | None = None
+    released: bool = False
+
+    def release(self) -> None:
+        """Hand the connection back to the pool after its body was read to the end, or close it."""
+        if self.reusable and self.pool is not None and not self.released:
+            self.released = True
+            self.pool.give(self.key, self.reader, self.writer)
+        else:
+            self.close()
 
     def close(self) -> None:
-        self.writer.close()
+        if not self.released:
+            self.released = True
+            self.writer.close()
 
 
 class UsageScanner:
@@ -2218,12 +2355,38 @@ class Proxy:
         self.active: set[asyncio.Task] = set()
         self.flush_task: asyncio.Task | None = None
         self.flush_lock = asyncio.Lock()
+        self.watchdog: watchdog_lib.StallWatchdog | None = None
+        self.seed_tasks: set[asyncio.Task] = set()
+        self.pool = UpstreamPool(governor.config["upstream_pool_max"], governor.config["upstream_pool_idle_s"])
+        governor.seeder = self._start_seed
         self.db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="agentq-db")
 
     async def run_db(self, fn, *args):
         """Run one store or state write on the dedicated writer threads, never on the default executor the
         request path uses for lane lookups and body parsing."""
         return await asyncio.get_running_loop().run_in_executor(self.db_executor, fn, *args)
+
+    def _start_seed(self, kind: str, key: object) -> None:
+        """Governor hook: read a stored minute off the loop, on the writer threads."""
+        task = asyncio.get_running_loop().create_task(self._seed(kind, key))
+        self.seed_tasks.add(task)
+        task.add_done_callback(self.seed_tasks.discard)
+
+    async def _seed(self, kind: str, key: object) -> None:
+        try:
+            if kind == "row":
+                minute, model = key
+                seed = await self.run_db(read_minute_counts, self.gov.db_path, minute, model)
+                self.gov.apply_row_seed(key, seed)
+            else:
+                seed = await self.run_db(read_calib_counts, self.gov.db_path, key)
+                self.gov.apply_calib_seed(key, seed)
+        except Exception as exc:
+            self.gov.log("seed_error", kind=type(exc).__name__)
+            if kind == "row":
+                self.gov.apply_row_seed(key, None)
+            else:
+                self.gov.apply_calib_seed(key, None)
 
     def schedule_flush(self) -> None:
         """Start a flush in the background unless one is already running, so no write can hold up admission."""
@@ -2240,6 +2403,13 @@ class Proxy:
         await self.flush_state()
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> asyncio.Server:
+        self.watchdog = watchdog_lib.StallWatchdog(
+            loop_thread_id=threading.get_ident(),
+            dump_s=float(self.gov.config["stall_dump_s"]),
+            log=self.gov.log,
+            clock=time.monotonic,
+        )
+        self.watchdog.start()
         self.maintenance = asyncio.create_task(self.maintain())
         return await asyncio.start_server(self.handle, host, port)
 
@@ -2255,6 +2425,11 @@ class Proxy:
             await asyncio.gather(*remaining, return_exceptions=True)
 
     async def close(self) -> None:
+        if self.watchdog is not None:
+            self.watchdog.stop()
+        for task in list(self.seed_tasks):
+            task.cancel()
+        self.pool.close_all()
         if self.maintenance is not None:
             self.maintenance.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2275,6 +2450,8 @@ class Proxy:
             now = loop.time()
             self.gov.note_loop_lag(now - last_tick - MAINTAIN_S)
             last_tick = now
+            if self.watchdog is not None:
+                self.watchdog.beat()
             try:
                 self.gov.pump()
                 self.gov.tick()
@@ -2374,6 +2551,13 @@ class Proxy:
         port = url.port or (443 if secure else 80)
         connect_s = float(self.gov.config["connect_timeout_s"])
         idle_s = float(self.gov.config["upstream_idle_s"])
+        key = self.upstream_url
+        pooled = self.pool.take(key)
+        if pooled is not None:
+            try:
+                return await self._send(pooled[0], pooled[1], key, method, path, headers, body, url, idle_s, True)
+            except StaleConnection:
+                pass
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
                 url.hostname,
@@ -2383,6 +2567,21 @@ class Proxy:
             ),
             connect_s,
         )
+        return await self._send(reader, writer, key, method, path, headers, body, url, idle_s, False)
+
+    async def _send(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        key: str,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+        url,
+        idle_s: float,
+        reused: bool,
+    ) -> Upstream:
         try:
             target = url.path.rstrip("/") + path[len(UPSTREAM_PREFIX) :]
             lines = [
@@ -2391,19 +2590,32 @@ class Proxy:
                 f"Authorization: Bearer {self.key}",
                 f"Content-Length: {len(body)}",
                 "Accept-Encoding: identity",
-                "Connection: close",
             ]
             for name, value in headers.items():
                 if name not in REQUEST_DROP:
                     lines.append(f"{name.title()}: {value}")
             writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
             await bounded(writer.drain(), idle_s)
-            status = parse_status_line(await bounded(reader.readline(), idle_s))
+            status_line = await bounded(reader.readline(), idle_s)
+        except (ConnectionError, EOFError) as exc:
+            writer.close()
+            if reused:
+                raise StaleConnection() from exc
+            raise
+        except BaseException:
+            writer.close()
+            raise
+        if reused and not status_line:
+            writer.close()
+            raise StaleConnection()
+        try:
+            status = parse_status_line(status_line)
             response_headers = await read_headers(reader, idle_s)
         except BaseException:
             writer.close()
             raise
-        return Upstream(reader, writer, status, response_headers)
+        reusable = keep_alive_framed(status, status_line, response_headers)
+        return Upstream(reader, writer, status, response_headers, key=key, reusable=reusable, pool=self.pool)
 
     async def wait_turn(self, ticket: Ticket, reader: asyncio.StreamReader) -> str:
         """Block until the ticket is admitted. Returns admitted, gone (client closed) or expired (held too long).
@@ -2549,6 +2761,7 @@ class Proxy:
                     await send_chunk(client, chunk)
                 await end_chunks(client)
                 scanner.finish()
+                upstream.release()
                 upstream_s = gov.clock() - sent_at
                 gov.note_upstream(ticket, upstream_s)
                 if upstream.status == 200:
@@ -2594,6 +2807,7 @@ async def run(governor: Governor, upstream_url: str, key: str, port: int) -> Non
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, stop.set)
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     governor.log("started", port=port, upstream=urlsplit(upstream_url).netloc)
     await stop.wait()
     server.close()
