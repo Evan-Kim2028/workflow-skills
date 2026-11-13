@@ -1,20 +1,21 @@
 """DeepSeek fill controller and launch pacing.
 
-The fill controller holds the DeepSeek pool near ``fill.target_billed_per_min`` by adding filler
-workers in steps (``fill.step_workers`` at a time, each step judged after ``fill.step_interval_s``).
-A step is judged by the billed gain per worker it actually added, against the long-run per-worker
-rate measured before the step. Poor gain records a learned ceiling that expires after
-``fill.ceiling_ttl_s``.
+The fill controller adds filler workers while the DeepSeek 5-minute billed average is below the low mark:
+at most ``step_workers`` every ``step_interval_s``, and only while every gate is open (proxy status
+available, no DeepSeek request blocked at the proxy, no DeepSeek 429 recently, the in-flight limit not
+binding, and the laptop within the filler bars). It stops at the high mark and never takes busy DeepSeek
+workers above ``max_workers``. Nothing is judged and nothing is killed.
 
-Pacing caps how fast DeepSeek jobs may start. It counts the current Morph minute's uncached input
-(the proxy's live ``uncached_ds`` budget, in-flight charges included) plus an estimate for each
-launch whose first request the proxy has not yet seen. Pending launches come from ``jobs.started_at``
-in agentq.db, so a broker restart keeps the history.
+Pacing caps how fast DeepSeek jobs may start. It counts the current Morph minute's uncached input (the
+proxy's live ``uncached_ds`` budget, in-flight charges included) plus an estimate for each launch whose
+first request the proxy has not yet recorded. Pending launches come from ``jobs.started_at`` in agentq.db,
+so a broker restart keeps the history. The live proxy's rolling window can overcount just after a minute
+boundary; that is conservative, and the live proxy is set to calendar windows for ``uncached_ds``.
 
 Everything here is a pure function of values the caller reads, except the readers (``minute_rows``,
 ``recent_429``, ``job_counts``, ``pending_launches``, ``current_uncached``, ``measured_first_request``),
-which read agentq.db and never write. The broker calls ``decide`` each tick and ``pacing_allowance``
-at launch time; ``main`` prints one reading for a copy of the store.
+which read agentq.db and never write. The broker calls ``decide`` each tick and ``pacing_allowance`` at
+launch time; ``main`` prints one reading for a copy of the store.
 """
 
 from __future__ import annotations
@@ -56,13 +57,7 @@ DEFAULT_FILL = {
     "low_frac": 0.9,
     "high_frac": 0.97,
     "step_workers": 4,
-    "step_interval_s": 300.0,
-    "min_marginal_frac": 0.5,
-    "ceiling_ttl_s": 1800.0,
-    "rate_window_s": 1800.0,
-    "rate_min_samples": 3,
-    "rate_min": 10_000.0,
-    "bootstrap_rate": 150_000.0,
+    "step_interval_s": 120.0,
     "gate_429_window_s": 120.0,
 }
 DEFAULT_PACING = {
@@ -192,157 +187,31 @@ class FillPlan:
 
 
 class FillController:
-    """Stepwise filler controller that judges only probes.
+    """Gate-driven filler controller: fill while the DeepSeek billed average is below the low mark.
 
-    A probe is a submission that takes busy DeepSeek workers above the highest count reached since the
-    ceiling was set (or above the ceiling itself). A probe is a step: it is judged ``step_interval_s``
-    later by the billed gain per worker it actually started, against the long-run per-worker rate measured
-    before the step. A gain counts as good only if it is positive and at least ``min_marginal_frac`` of
-    that rate. A poor probe records a ceiling of max(the count before the probe, the current ceiling),
-    never below the real (non-filler) DeepSeek count, for ``ceiling_ttl_s``.
-
-    Refills at or below the peak are plain launches. They are not judged and never change the ceiling.
-    After a ceiling expires, one probe past it is allowed and no further. While the long-run rate is
-    unknown or below ``rate_min``, the controller takes no steps and judges nothing.
+    While the average is below ``low_frac`` of the target, the controller adds up to ``step_workers`` filler
+    workers every ``step_interval_s``, but only when every gate is open (``gate`` is None), no real DeepSeek
+    job is ready, and no earlier step is still waiting to launch. It stops adding once the average reaches
+    ``high_frac`` of the target (hysteresis between the marks), and never takes busy DeepSeek workers above
+    ``max_workers``. Nothing is judged and nothing is killed: the gates are what keep the pool safe.
     """
 
-    def __init__(self, ceiling: tuple[int, float] | None = None):
+    def __init__(self):
         self.filling = False
-        self.step: dict | None = None
-        self.ceiling = ceiling
-        self.last_ceiling = ceiling[0] if ceiling else None
-        self.peak = 0
-        self.samples: deque = deque()
-        self.new_ceiling: tuple[int, float] | None = None
-        self.judgement: str | None = None
-
-    def active_ceiling(self, now: float, fill: dict) -> int | None:
-        """The learned ceiling while it is fresh, else None. An expired ceiling is dropped but remembered."""
-        if self.ceiling is None:
-            return None
-        workers, at = self.ceiling
-        if now - at >= fill["ceiling_ttl_s"]:
-            self.ceiling = None
-            return None
-        return workers
-
-    def worker_limit(self, now: float, fill: dict, real_running: int) -> tuple[int, str]:
-        """The busy-worker limit now, and what sets it. A learned ceiling never sits below the real DeepSeek count."""
-        cap = int(fill["max_workers"])
-        ceiling = self.active_ceiling(now, fill)
-        if ceiling is not None:
-            return min(cap, max(ceiling, real_running)), "learned ceiling"
-        if self.last_ceiling is not None:
-            probe_limit = self.last_ceiling + int(fill["step_workers"])
-            return min(cap, max(probe_limit, real_running)), "probe past expired ceiling"
-        return cap, "max_workers"
-
-    def measured_rate(self, now: float, before: float, fill: dict) -> float | None:
-        """Median billed-per-busy-worker over the rate window, from samples taken before ``before``.
-
-        None when there are too few samples or the median is below ``rate_min``: the rate is unknown.
-        """
-        window = fill["rate_window_s"]
-        rates = [billed / active for ts, billed, active in self.samples if now - window <= ts < before and active > 0]
-        if len(rates) < fill["rate_min_samples"]:
-            return None
-        rate = statistics.median(rates)
-        return rate if rate >= fill["rate_min"] else None
-
-    def _start_step(self, now: float, fill: dict, active: int, real_running: int, billed_avg: float,
-                    added: int, bootstrap: bool = False) -> None:
-        """Begin a probe or bootstrap step. Its judgement comes ``step_interval_s`` later, from the filler it started."""
-        self.step = {
-            "start": now, "judge_at": now + fill["step_interval_s"], "added": added,
-            "workers_before": active, "filler_before": active - real_running, "real_before": real_running,
-            "avg_before": billed_avg, "bootstrap": bootstrap, "real_changed": False, "extended": False,
-        }
-
-    def _judge(self, now: float, billed_avg: float, active: int, real_running: int, fill: dict) -> None:
-        """Judge the step by the filler it started, never by total busy workers.
-
-        ``added`` is this step's filler still running, capped at what it submitted. Any change in real DeepSeek
-        work during the step makes it unclean, and real work bills too, so an unclean step is never judged good.
-        The first unclean judgement extends the window once; an unclean judgement after that is poor.
-        """
-        step = self.step
-        filler_now = active - real_running
-        added = min(step["added"], max(0, filler_now - step["filler_before"]))
-        if added == 0 and not step["real_changed"]:
-            self.step = None
-            self.judgement = "step void: no filler worker started, nothing to judge"
-            return
-        unclean = step["real_changed"] or added < step["added"]
-        if unclean and not step["extended"]:
-            step["extended"] = True
-            step["judge_at"] = now + fill["step_interval_s"]
-            self.judgement = "step window extended once: real work changed or filler fell short of the step"
-            return
-        self.step = None
-        bootstrap = step["bootstrap"]
-        rate = fill["bootstrap_rate"] if bootstrap else self.measured_rate(now, step["start"], fill)
-        if unclean:
-            poor = True
-            evidence = "real work changed during the probe"
-        else:
-            if rate is None:
-                self.judgement = "step not judged: per-worker rate unknown"
-                return
-            gain = (billed_avg - step["avg_before"]) / added
-            poor = not (gain > 0 and gain >= fill["min_marginal_frac"] * rate)
-            evidence = f"{gain:,.0f} per added worker against {rate:,.0f} per worker"
-        kind = "bootstrap step" if bootstrap else "step"
-        if not poor:
-            self.last_ceiling = None
-            self.judgement = f"{kind} of {added} judged good: {evidence}"
-            return
-        if bootstrap:
-            workers = real_running
-        else:
-            workers = max(step["workers_before"], self.last_ceiling or 0, real_running)
-        self.ceiling = (workers, now)
-        self.last_ceiling = workers
-        self.new_ceiling = self.ceiling
-        self.judgement = f"{kind} of {added} judged poor: {evidence}; ceiling {workers} workers"
-
-    def _bootstrap(self, now: float, fill: dict, active: int, real_running: int, billed_avg: float,
-                   queued_filler: int, average: str) -> FillPlan:
-        """With no measured per-worker rate and no busy DeepSeek worker, take one bootstrap step judged against the
-        prior rate.
-
-        It waits while any worker is busy (so poor bootstraps cannot pile up idle filler), while a ceiling is
-        fresh, while filler is still queued, and at the worker cap. A poor bootstrap sets a ceiling at the real
-        count, so the next one comes only after the ceiling expires and the pool has drained.
-        """
-        to_add = min(int(fill["step_workers"]), int(fill["max_workers"]) - active - queued_filler)
-        if active > 0 or self.active_ceiling(now, fill) is not None or queued_filler > 0 or to_add <= 0:
-            return FillPlan(True, 0, "per-worker rate unknown; bootstrap waits on a ceiling, queued filler or the cap",
-                            "rate-unknown")
-        self._start_step(now, fill, active, real_running, billed_avg, to_add, bootstrap=True)
-        return FillPlan(True, to_add, f"{average}; no measured per-worker rate, so one bootstrap step of {to_add} "
-                        f"filler workers judged at the prior {fill['bootstrap_rate']:,.0f} per worker", "bootstrap")
+        self.last_step_at: float | None = None
 
     def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int,
-             real_running: int, ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
-        """One decision. ``active`` counts busy DeepSeek workers, filler included; ``real_running`` counts the rest."""
+             ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
+        """One decision. ``active`` counts busy DeepSeek workers, filler included."""
         if not fill["enabled"]:
-            self.filling, self.step = False, None
+            self.filling = False
             return FillPlan(False, 0, "fill disabled", "disabled")
         if paused:
-            self.filling, self.step = False, None
+            self.filling = False
             return FillPlan(False, 0, "filler paused", "paused")
-        self.samples.append((now, billed_avg, active))
-        while self.samples and self.samples[0][0] < now - fill["rate_window_s"]:
-            self.samples.popleft()
-        self.peak = max(self.peak, active)
         target = float(fill["target_billed_per_min"])
         low, high = fill["low_frac"] * target, fill["high_frac"] * target
         self.filling = filling_state(self.filling, billed_avg, target, fill["low_frac"], fill["high_frac"])
-        if self.step is not None:
-            if real_running != self.step["real_before"]:
-                self.step["real_changed"] = True
-            if now >= self.step["judge_at"]:
-                self._judge(now, billed_avg, active, real_running, fill)
         average = f"5-min average {billed_avg / 1e6:.2f}M/min"
         if not self.filling:
             return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; no filler", "high-mark")
@@ -350,23 +219,21 @@ class FillController:
             return FillPlan(True, 0, f"{ready_real} real DeepSeek jobs ready; they launch before filler", "real-ready")
         if gate is not None:
             return FillPlan(True, 0, gate, "gate")
-        if self.step is not None:
-            left = max(0.0, self.step["judge_at"] - now)
-            return FillPlan(True, 0, f"step of {self.step['added']} in progress; judged in {left:.0f} s", "step-wait")
-        if self.measured_rate(now, now, fill) is None:
-            return self._bootstrap(now, fill, active, real_running, billed_avg, queued_filler, average)
-        limit, cause = self.worker_limit(now, fill, real_running)
-        room = limit - active - queued_filler
+        room = int(fill["max_workers"]) - active - queued_filler
         if room <= 0:
-            return FillPlan(True, 0, f"{average}; {active} busy at the {cause} of {limit}", "at-limit")
+            return FillPlan(True, 0, f"{average}; {active} busy DeepSeek workers at max_workers "
+                            f"{fill['max_workers']}", "at-max")
+        if queued_filler > 0:
+            return FillPlan(True, 0, f"{average}; {queued_filler} filler job(s) from the last step still waiting "
+                            "to launch", "step-wait")
+        interval = float(fill["step_interval_s"])
+        if self.last_step_at is not None and now - self.last_step_at < interval:
+            return FillPlan(True, 0, f"{average}; next step in {self.last_step_at + interval - now:.0f} s",
+                            "step-wait")
         to_add = min(int(fill["step_workers"]), room)
-        top = self.last_ceiling if self.last_ceiling is not None else self.peak
-        if active + to_add <= top:
-            return FillPlan(True, to_add, f"{average}; refilling {to_add} to {active + to_add} busy (at or below "
-                            f"the peak {top}; not a probe)", "refill")
-        self._start_step(now, fill, active, real_running, billed_avg, to_add)
-        return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; probing {to_add} "
-                        f"filler workers from {active} busy (limit {limit})", "stepping")
+        self.last_step_at = now
+        return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; adding {to_add} filler "
+                        f"workers to {active + to_add} busy", "stepping")
 
 
 def pacing_allowance(current: int, pending: int, pacing: dict, measured: int | None) -> tuple[int, int]:
@@ -418,7 +285,6 @@ def decide(
         gate = "worker count unknown (ps failed); filler waits"
     plan = controller.tick(
         now, fill=fill, paused=paused, billed_avg=billed_avg, active=active,
-        real_running=counts["running_ds"] - counts["running_filler"],
         ready_real=counts["ready_real"], queued_filler=counts["queued_filler"], gate=gate,
     )
     current, source, pending = pacing_inputs(conn, now, status, pacing)

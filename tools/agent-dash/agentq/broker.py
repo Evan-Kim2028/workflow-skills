@@ -1048,15 +1048,6 @@ class Broker:
             self._fill_key = plan.key
             self.log(f"fill: {plan.reason}")
 
-    def _load_ceiling(self, conn) -> tuple[int, float] | None:
-        """The learned ceiling saved by an earlier broker, or None. Survives restarts; expiry is checked by the controller."""
-        raw = filler_lib.state_get(conn, "ceiling")
-        try:
-            data = json.loads(raw) if raw else None
-            return (int(data["workers"]), float(data["at"])) if data else None
-        except (ValueError, KeyError, TypeError):
-            return None
-
     def submit_filler(self, conn, now: float, status: dict | None) -> list[str]:
         """Run the fill controller for this tick and submit the filler jobs it asks for. Returns the new job ids.
 
@@ -1065,7 +1056,7 @@ class Broker:
         cfg = load_config(self.home)
         fill_cfg, pacing = cfg["fill"], cfg["pacing"]
         if self._controller is None:
-            self._controller = fill_lib.FillController(ceiling=self._load_ceiling(conn))
+            self._controller = fill_lib.FillController()
         enabled = fill_cfg["enabled"]
         ps_text = self._process_table(now) if enabled else None
         laptop = self.gauges.read() if enabled else None
@@ -1074,14 +1065,6 @@ class Broker:
             ps_text=ps_text, laptop=laptop, laptop_cfg=cfg["laptop"],
             paused=filler_lib.paused(conn), measured=self._measured_cost(conn, now, pacing),
         )
-        controller = self._controller
-        if controller.new_ceiling is not None:
-            workers, at = controller.new_ceiling
-            filler_lib.state_set(conn, "ceiling", json.dumps({"workers": workers, "at": at}))
-            controller.new_ceiling = None
-        if controller.judgement is not None:
-            self.log(f"fill: {controller.judgement}")
-            controller.judgement = None
         self._log_fill(decision.plan)
         if decision.plan.submit <= 0 or now < self._filler_retry:
             return []
