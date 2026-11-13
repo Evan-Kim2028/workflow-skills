@@ -72,7 +72,8 @@ _REVIEW_TAIL_RE = re.compile(r"-(?:rev|fix|check)(?:\d+$|-|$)")
 #: downgrade a refusal to a stderr warning when this is ``1``.
 LEGACY_ENV = "AGENT_DASH_ALLOW_LEGACY_LABELS"
 
-_MAX_LABEL = 200
+from agentq.db import LAUNCH_LABEL_MAX as _MAX_LABEL  # noqa: E402
+from agentq.db import LAUNCH_LABEL_RE  # noqa: E402
 
 
 def legacy_allowed() -> bool:
@@ -312,7 +313,8 @@ def check(
             "build one with: python3 agent_dash.py label make "
             "--scope <wsN|hub> --mark <plan|exec|review|coord> --slug <slug>",
         )
-    if len(text) > _MAX_LABEL or "/" in text or "\\" in text or text.startswith(".") or "\n" in text:
+    if (len(text) > _MAX_LABEL or "/" in text or "\\" in text or text.startswith(".") or "\n" in text
+            or not LAUNCH_LABEL_RE.fullmatch(text)):
         return refuse(
             f"bad label {text!r}: no /, \\, leading dot, or newline; max {_MAX_LABEL} chars.",
             _suggest_fix(None, "", None),

@@ -546,7 +546,7 @@ class FillerTargetTests(unittest.TestCase):
         target = Fl.load_targets(self.config(modules=["pkg/a"]))[0][0]
         self.assertEqual(target.report_path("bugs"), str(
             self.tmp.resolve() / "reports" / "filler" / "alpha" / "bugs" / f"{Fl.module_slug('pkg/a')}.md"))
-        self.assertEqual(Fl.label_slug(target), f"backlog-filler-bugs-{Fl.module_slug('alpha')}-{Fl.module_slug('pkg/a')}")
+        self.assertEqual(Fl.label_slug(target), "backlog-filler-bugs-alpha-pkg-a-" + Fl._digest("pkg/a"))
         self.assertTrue(Fl.is_filler_label("hub-exec-" + Fl.label_slug(target)))
         self.assertFalse(Fl.is_filler_label("hub-exec-backlog-nightly"))
 

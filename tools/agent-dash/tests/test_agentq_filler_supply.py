@@ -176,7 +176,8 @@ class KindDueTests(Temp):
         work = F.audit_work(self.target, "docs", "h1")
         self.assertEqual(work.report_path,
                          str(self.tmp / "rep" / "filler" / "r" / "docs" / f"{F.module_slug('pkg')}.md"))
-        self.assertEqual(work.slug, f"backlog-filler-docs-{F.module_slug('r')}-{F.module_slug('pkg')}")
+        self.assertEqual(work.slug, F.label_slug(self.target, "docs"))
+        self.assertTrue(work.slug.startswith("backlog-filler-docs-r-pkg-"))
         self.assertTrue(F.is_filler_label("hub-exec-" + work.slug))
 
     def test_the_prompt_for_each_kind_is_its_own_brief(self):
