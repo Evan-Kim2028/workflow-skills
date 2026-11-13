@@ -449,7 +449,7 @@ class WsGcTest(unittest.TestCase):
         ws = "WS103"
         repo, path, branch = self._finished_lane(ws)
         pid = 123456
-        with mock.patch.object(worktrees, "_proc_pids", return_value=[pid]), \
+        with mock.patch.object(worktrees, "_proc_scan", return_value=([pid], False)), \
                 mock.patch.object(worktrees, "_cwd_table", return_value=None), \
                 mock.patch.object(worktrees, "_command_table", return_value={pid: "sleep 60"}):
             self.assertEqual(cmd_ws(["gc", ws]), 0)
@@ -465,7 +465,7 @@ class WsGcTest(unittest.TestCase):
         ws = "WS104"
         repo, path, branch = self._finished_lane(ws)
         pid = 123456
-        with mock.patch.object(worktrees, "_proc_pids", return_value=[pid]), \
+        with mock.patch.object(worktrees, "_proc_scan", return_value=([pid], False)), \
                 mock.patch.object(worktrees, "_cwd_table", return_value={pid: str(path)}), \
                 mock.patch.object(worktrees, "_command_table", return_value=None):
             self.assertEqual(cmd_ws(["gc", ws]), 0)
@@ -480,7 +480,7 @@ class WsGcTest(unittest.TestCase):
         """Successful empty cwd and command scans allow normal gc decisions."""
         ws = "WS105"
         _repo, path, _branch = self._finished_lane(ws)
-        with mock.patch.object(worktrees, "_proc_pids", return_value=[123456]), \
+        with mock.patch.object(worktrees, "_proc_scan", return_value=([123456], False)), \
                 mock.patch.object(worktrees, "_cwd_table", return_value={}), \
                 mock.patch.object(worktrees, "_command_table", return_value={}):
             self.assertEqual(cmd_ws(["gc", ws]), 0)

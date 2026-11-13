@@ -306,6 +306,42 @@ class ReapDecisionsTest(unittest.TestCase):
         self.assertEqual(cmd_worktrees(["reap"]), 2)
 
 
+class ProcScanCapTest(unittest.TestCase):
+    def test_capped_scan_keeps_every_candidate(self):
+        """Hitting MAX_PIDS marks the scan partial, so no worktree is reaped."""
+        path = "/tmp/agent-dash-capped-worktree"
+        with mock.patch.object(worktrees, "MAX_PIDS", 1):
+            pids, partial = worktrees._proc_scan()
+            self.assertEqual(len(pids), 1)
+            self.assertTrue(partial)
+            busy = worktrees.busy_map([path])
+        self.assertEqual(set(busy), {path})
+        self.assertIn("incomplete", busy[path])
+
+    def test_failed_pid_listing_keeps_every_candidate(self):
+        """A ps failure or timeout with no /proc is an unknown scan, never an empty one."""
+        path = "/tmp/agent-dash-unscanned-worktree"
+        failures = [OSError("ps missing"), subprocess.TimeoutExpired("ps", 1)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(worktrees.os, "listdir", side_effect=OSError("no /proc")), \
+                    mock.patch.object(worktrees.subprocess, "run", side_effect=failure):
+                pids, partial = worktrees._proc_scan()
+                self.assertEqual(pids, [])
+                self.assertTrue(partial)
+                busy = worktrees.busy_map([path])
+            self.assertEqual(set(busy), {path})
+        nonzero = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(worktrees.os, "listdir", side_effect=OSError("no /proc")), \
+                mock.patch.object(worktrees.subprocess, "run", return_value=nonzero):
+            self.assertEqual(worktrees._proc_scan(), ([], True))
+
+    def test_uncapped_scan_is_not_partial(self):
+        """A normal scan reports itself complete."""
+        _pids, partial = worktrees._proc_scan()
+        self.assertFalse(partial)
+
+
 class MergedPrLookupTest(unittest.TestCase):
     def setUp(self):
         worktrees._MERGED_HEADS.clear()

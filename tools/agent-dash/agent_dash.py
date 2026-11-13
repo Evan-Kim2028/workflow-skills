@@ -118,6 +118,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py project remove <id> [--json]
   python3 agent_dash.py lead-profile <session-id|--ws ID> [--json]
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
+  python3 agent_dash.py worktrees janitor --repo <path> [--apply] [--artifact-age 24h] [--pressure-pct 12] [--daily-maintenance] [--json]
   python3 agent_dash.py lanes live [--json]
   python3 agent_dash.py logs archive [--root P]... [--ws ID] [--exclude GLOB]... [--min-idle-hours 3] [--keep remove|stub|stripped] (default: per tool) [--apply]
   python3 agent_dash.py logs sessions [--apply] [--no-reclaim] [--scheduled] [--tool NAME]... [--limit N] [--max-minutes M] [--url URL] [--dest DIR]
