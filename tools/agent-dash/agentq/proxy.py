@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import contextlib
 import getpass
 import hashlib
 import json
+import math
 import os
 import random
 import re
 import signal
 import sqlite3
 import ssl
+import statistics
 import subprocess
 import sys
 import time
@@ -36,12 +39,15 @@ from urllib.parse import urlsplit
 
 LANES = ("urgent", "normal", "backlog")
 MORPH_FAMILIES = ("morph-dsv41flash", "morph-kimik31")
+DS_FAMILY = MORPH_FAMILIES[0]
 OTHER_FAMILY = "other"
 FAMILY_KEYS = (*MORPH_FAMILIES, OTHER_FAMILY)
 RESTORED_LANE = "restored"
 CAPACITY = "capacity"
 RESERVE = "reserve"
 GUARD = "guard"
+INFLIGHT = "inflight"
+INFLIGHT_MODES = ("shadow", "enforce", "off")
 FAST_LIMIT_QUIET_S = 30 * 60.0
 DEFAULT_HOME = "~/.local/state/agentq"
 DEFAULT_UPSTREAM = "https://api.morphllm.com/v1"
@@ -88,6 +94,18 @@ DEFAULT_CONFIG = {
         "output": {"limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash"},
         "uncached": {"limit_type": "uncached", "limit": 24_290, "model": "morph-kimik31"},
         "uncached_ds": {"limit_type": "uncached", "limit": 400_000, "model_prefix": "morph-dsv41flash"},
+    },
+    "inflight": {
+        "mode": "shadow",
+        "ab_period_s": 0,
+        "min_limit": 16,
+        "max_limit": 96,
+        "interval_s": 10.0,
+        "short_window_s": 30.0,
+        "baseline_tau_s": 1800.0,
+        "min_samples": 3,
+        "min_gradient": 0.5,
+        "smoothing": 0.5,
     },
 }
 
@@ -175,6 +193,8 @@ CREATE TABLE IF NOT EXISTS proxy_minutes (
     target REAL,
     upstream_ms_sum INT, upstream_n INT, upstream_p50_ms INT, upstream_p95_ms INT,
     ttfb_p50_ms INT, in_flight_max INT,
+    inflight_limit INT, inflight_mode TEXT, inflight_arm TEXT, inflight_over INT,
+    ttfb_le_p50_ms INT, ttfb_gt_p50_ms INT,
     PRIMARY KEY (minute, model)
 )
 """
@@ -185,10 +205,16 @@ PROXY_MINUTES_ADDED_COLUMNS = (
     ("upstream_p95_ms", "INT"),
     ("ttfb_p50_ms", "INT"),
     ("in_flight_max", "INT"),
+    ("inflight_limit", "INT"),
+    ("inflight_mode", "TEXT"),
+    ("inflight_arm", "TEXT"),
+    ("inflight_over", "INT"),
+    ("ttfb_le_p50_ms", "INT"),
+    ("ttfb_gt_p50_ms", "INT"),
 )
 MINUTE_SEED_COLUMNS = (
     "req", "ok", "r429", "input", "cache_read", "output", "uncached_est",
-    "upstream_ms_sum", "upstream_n", "in_flight_max",
+    "upstream_ms_sum", "upstream_n", "in_flight_max", "inflight_over",
 )
 
 
@@ -344,6 +370,11 @@ def minute_stamp(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M", time.gmtime(ts))
 
 
+def minute_epoch(stamp: str) -> float:
+    """The epoch second at the start of a proxy_minutes stamp."""
+    return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M")))
+
+
 def parse_stated_limit(text: str) -> tuple[str, int] | None:
     """Return the budget name and limit a 429 body states, if it states one."""
     for name, pattern in LIMIT_PATTERNS:
@@ -468,8 +499,8 @@ def read_lane(db_path: Path, job: str) -> str:
 def empty_minute_row() -> dict:
     return {
         "req": 0, "ok": 0, "r429": 0, "input": 0, "cache_read": 0, "output": 0, "uncached_est": 0,
-        "upstream_ms_sum": 0, "upstream_n": 0, "in_flight_max": 0,
-        "waits": [], "upstream_samples": [], "ttfb_samples": [],
+        "upstream_ms_sum": 0, "upstream_n": 0, "in_flight_max": 0, "inflight_over": 0,
+        "waits": [], "upstream_samples": [], "ttfb_samples": [], "ttfb_le_samples": [], "ttfb_gt_samples": [],
     }
 
 
@@ -506,11 +537,23 @@ def read_minute_counts(db_path: Path, minute: str, model: str) -> dict | None:
     return row
 
 
+def ms_or_none(seconds: float | None) -> int | None:
+    return None if seconds is None else round(seconds * 1000)
+
+
 def sample_percentile_ms(samples: list[int], fraction: float) -> int | None:
     """The fraction-th percentile of recorded millisecond samples, or None when there are none."""
     if not samples:
         return None
     return round(percentile(sorted(samples), fraction))
+
+
+MINUTE_ROW_COLUMNS = (
+    "minute", "model", "req", "ok", "r429", "input", "cache_read", "output", "uncached_est",
+    "wait_p50_ms", "wait_p95_ms", "target", "upstream_ms_sum", "upstream_n", "upstream_p50_ms",
+    "upstream_p95_ms", "ttfb_p50_ms", "in_flight_max", "inflight_limit", "inflight_mode", "inflight_arm",
+    "inflight_over", "ttfb_le_p50_ms", "ttfb_gt_p50_ms",
+)
 
 
 def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
@@ -521,7 +564,9 @@ def write_minute_rows(db_path: Path, rows: list[tuple]) -> None:
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")
         ensure_minutes_schema(connection)
-        connection.executemany("INSERT OR REPLACE INTO proxy_minutes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        marks = ",".join("?" * len(MINUTE_ROW_COLUMNS))
+        columns = ",".join(MINUTE_ROW_COLUMNS)
+        connection.executemany(f"INSERT OR REPLACE INTO proxy_minutes ({columns}) VALUES ({marks})", rows)
         connection.commit()
     finally:
         connection.close()
@@ -548,6 +593,106 @@ def write_state_file(path: Path, data: dict) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(data, indent=2) + "\n")
     os.replace(temporary, path)
+
+
+class InflightLimiter:
+    """Adaptive cap on DeepSeek requests in flight at Morph: a gradient controller on first-byte time.
+
+    Every interval the short-run median first-byte time (the last short_window_s of successful
+    DeepSeek responses) is compared with a long-run EWMA baseline (time constant baseline_tau_s).
+    gradient = clamp(baseline / short, min_gradient, 1.0). The raw limit is limit * gradient + sqrt(limit),
+    the queue allowance, and the limit moves smoothing of the way toward it, clamped to [min, max].
+
+    mode decides what the limit does. "shadow" computes and records the limit but never holds a request.
+    "enforce" holds DeepSeek requests above the limit in the pump. "off" computes nothing. With
+    ab_period_s > 0 and mode "enforce", calendar periods alternate between an enforce arm (even periods
+    since the epoch) and an off arm (odd periods), so the two can be compared on the same traffic.
+
+    The limit is reported only after the first measurement (armed). Until then, and whenever the short
+    run has too few samples, the limit does not move, so the limiter never blocks without data.
+    """
+
+    def __init__(self, settings: dict | None, now: float) -> None:
+        values = DEFAULT_CONFIG["inflight"] | (settings or {})
+        self.mode = str(values["mode"])
+        if self.mode not in INFLIGHT_MODES:
+            raise ValueError(f"inflight: mode must be one of {INFLIGHT_MODES}, not {self.mode!r}")
+        self.ab_period_s = float(values["ab_period_s"])
+        if self.ab_period_s < 0 or (self.ab_period_s and self.ab_period_s % MINUTE_S):
+            raise ValueError(f"inflight: ab_period_s must be 0 or a whole number of minutes, not {self.ab_period_s}")
+        self.min_limit = int(values["min_limit"])
+        self.max_limit = int(values["max_limit"])
+        if not 1 <= self.min_limit <= self.max_limit:
+            raise ValueError(f"inflight: need 1 <= min_limit <= max_limit, got {self.min_limit}..{self.max_limit}")
+        self.interval_s = float(values["interval_s"])
+        self.short_window_s = float(values["short_window_s"])
+        self.baseline_tau_s = float(values["baseline_tau_s"])
+        self.min_samples = int(values["min_samples"])
+        self.min_gradient = float(values["min_gradient"])
+        self.smoothing = float(values["smoothing"])
+        self.limit = float(self.max_limit)
+        self.baseline_s: float | None = None
+        self.samples: deque[tuple[float, float]] = deque()
+        self.last_adjust = now
+
+    @property
+    def measuring(self) -> bool:
+        return self.mode != "off"
+
+    @property
+    def armed(self) -> bool:
+        return self.measuring and self.baseline_s is not None
+
+    def current_limit(self) -> int | None:
+        """The limit the proxy computes and reports (shadow included), or None before the first measurement."""
+        return round(self.limit) if self.armed else None
+
+    def arm_at(self, wall: float) -> str:
+        """Which arm the wall-clock time falls in: shadow, off, enforce, or off for a disabled limiter."""
+        if self.mode != "enforce":
+            return self.mode
+        if not self.ab_period_s:
+            return "enforce"
+        return "enforce" if int(wall // self.ab_period_s) % 2 == 0 else "off"
+
+    def enforcing(self, wall: float) -> bool:
+        """True when a request above the limit must wait at this wall-clock time."""
+        return self.armed and self.arm_at(wall) == "enforce"
+
+    def observe(self, ttfb_s: float, now: float) -> None:
+        self.samples.append((now, ttfb_s))
+        self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.short_window_s
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+
+    def short_run_s(self, now: float) -> float | None:
+        """Median first-byte time over the short window, or None with fewer than min_samples."""
+        self._prune(now)
+        if len(self.samples) < self.min_samples:
+            return None
+        return statistics.median(value for _, value in self.samples)
+
+    def adjust(self, now: float) -> bool:
+        """Re-measure when an interval has passed. Returns True when the reported limit changed."""
+        if not self.measuring or now - self.last_adjust < self.interval_s:
+            return False
+        self.last_adjust = now
+        short = self.short_run_s(now)
+        if short is None or short <= 0:
+            return False
+        before = self.current_limit()
+        if self.baseline_s is None:
+            self.baseline_s = short
+        else:
+            weight = 1.0 - math.exp(-self.interval_s / self.baseline_tau_s)
+            self.baseline_s += weight * (short - self.baseline_s)
+        gradient = min(1.0, max(self.min_gradient, self.baseline_s / short))
+        raw = self.limit * gradient + math.sqrt(self.limit)
+        self.limit = min(float(self.max_limit), max(float(self.min_limit), self.limit + self.smoothing * (raw - self.limit)))
+        return self.current_limit() != before
 
 
 @dataclass(eq=False)
@@ -650,6 +795,9 @@ class Ticket:
     backoff_by: str | None = None
     last_refusal: str | None = None
     reserve_seen: bool = False
+    flight: bool = False
+    over_counted: bool = False
+    started_above: bool | None = None
 
     def blocking_budget(self, now: float) -> str | None:
         """The budget holding this waiting ticket now: the budget its 429 named while it backs off,
@@ -712,6 +860,8 @@ class Governor:
         self.minute_rows: dict[tuple[str, str], dict] = {}
         self.in_flight: dict[str, int] = {}
         self.upstream_recent: deque[tuple[float, str, float]] = deque()
+        self.inflight = InflightLimiter(config.get("inflight"), start)
+        self.ds_flight = 0
         self.dirty: set[tuple[str, str]] = set()
         self.job_rows: dict[tuple[str, str], dict] = {}
         self.waits: deque[tuple[float, float]] = deque()
@@ -950,6 +1100,15 @@ class Governor:
                     head.last_refusal = None
                     index += 1
                     continue
+                if self.inflight_full(head):
+                    if not head.over_counted:
+                        head.over_counted = True
+                        self.row(head.model)["inflight_over"] += 1
+                    if self.inflight.enforcing(self.wall()):
+                        head.blocked_by = None
+                        head.last_refusal = INFLIGHT
+                        index += 1
+                        continue
                 found = self._blocker(head, now, lower_waiting)
                 if found is None:
                     del queue[index]
@@ -990,9 +1149,48 @@ class Governor:
                     return budget, GUARD
         return None
 
+    def inflight_limit(self) -> int | None:
+        """The DeepSeek in-flight cap in force, or None when the limiter does not enforce one."""
+        return self.inflight.current_limit()
+
+    def inflight_above(self, ticket: Ticket) -> bool | None:
+        """Whether a DeepSeek request sent now is above the cap (its own flight counted), or None when no cap is computed."""
+        if family_of(ticket.model) != DS_FAMILY:
+            return None
+        limit = self.inflight_limit()
+        return None if limit is None else self.ds_flight > limit
+
+    def inflight_full(self, ticket: Ticket) -> bool:
+        """True when this ticket is DeepSeek and admitting it would exceed the in-flight cap."""
+        if family_of(ticket.model) != DS_FAMILY:
+            return False
+        limit = self.inflight_limit()
+        return limit is not None and self.ds_flight >= limit
+
+    def enter_flight(self, ticket: Ticket) -> None:
+        if family_of(ticket.model) == DS_FAMILY and not ticket.flight:
+            ticket.flight = True
+            self.ds_flight += 1
+
+    def leave_flight(self, ticket: Ticket) -> None:
+        """End one DeepSeek admission. Safe to call more than once for the same ticket."""
+        if ticket.flight:
+            ticket.flight = False
+            self.ds_flight -= 1
+
+    def adjust_inflight(self) -> None:
+        if self.inflight.adjust(self.clock()):
+            self.log(
+                "inflight_limit",
+                limit=self.inflight_limit(),
+                short_ms=ms_or_none(self.inflight.short_run_s(self.clock())),
+                baseline_ms=ms_or_none(self.inflight.baseline_s),
+            )
+
     def _admit(self, ticket: Ticket, now: float) -> None:
         ticket.holds = []
         ticket.blocked_by = None
+        self.enter_flight(ticket)
         wall = self.wall()
         ticket.admitted_minute = minute_stamp(wall)
         for name, estimate in ticket.estimates.items():
@@ -1053,6 +1251,8 @@ class Governor:
         counters["output"] += output
         if upstream_s is not None and ttfb_s is not None:
             self.note_latency(ticket, upstream_s, ttfb_s)
+            if family_of(ticket.model) == DS_FAMILY:
+                self.inflight.observe(ttfb_s, self.clock())
 
     def note_latency(self, ticket: Ticket, upstream_s: float, ttfb_s: float) -> None:
         """Record one successful request's upstream time and time to first byte in the minute it completes."""
@@ -1064,6 +1264,10 @@ class Governor:
             row["upstream_samples"].append(upstream_ms)
         if len(row["ttfb_samples"]) < ROW_WAIT_SAMPLES:
             row["ttfb_samples"].append(round(ttfb_s * 1000))
+        if ticket.started_above is not None:
+            split = "ttfb_gt_samples" if ticket.started_above else "ttfb_le_samples"
+            if len(row[split]) < ROW_WAIT_SAMPLES:
+                row[split].append(round(ttfb_s * 1000))
         now = self.clock()
         self.upstream_recent.append((now, ticket.model, upstream_s))
         while self.upstream_recent and self.upstream_recent[0][0] < now - UPSTREAM_RECENT_S:
@@ -1078,6 +1282,7 @@ class Governor:
 
     def upstream_finished(self, ticket: Ticket) -> None:
         """Count one upstream request that has ended, whatever its outcome."""
+        self.leave_flight(ticket)
         remaining = self.in_flight.get(ticket.model, 0) - 1
         if remaining > 0:
             self.in_flight[ticket.model] = remaining
@@ -1301,6 +1506,10 @@ class Governor:
                     sample_percentile_ms(upstream, 0.95),
                     sample_percentile_ms(ttfb, 0.5),
                     row["in_flight_max"],
+                    *self.inflight_columns(model, minute),
+                    row["inflight_over"],
+                    sample_percentile_ms(row["ttfb_le_samples"], 0.5),
+                    sample_percentile_ms(row["ttfb_gt_samples"], 0.5),
                 )
             )
         self.dirty.clear()
@@ -1308,6 +1517,12 @@ class Governor:
         for key in [k for k in self.minute_rows if k[0] < cutoff]:
             del self.minute_rows[key]
         return rows
+
+    def inflight_columns(self, model: str, minute: str) -> tuple:
+        """The limit, mode and arm recorded on a row. DeepSeek rows only; other models record nothing."""
+        if family_of(model) != DS_FAMILY:
+            return (None, None, None)
+        return (self.inflight_limit(), self.inflight.mode, self.inflight.arm_at(minute_epoch(minute)))
 
     def calib_record(self, minute: str) -> dict:
         """The calibration counters for one UTC minute, seeded from proxy_calib on first use in this process."""
@@ -1457,6 +1672,12 @@ class Governor:
             }
             if budget.window_mode == CALENDAR:
                 budgets[name]["seconds_to_reset"] = round(seconds_to_next_minute(self.wall()), 2)
+        inflight_queued = sum(
+            1
+            for lane in LANES
+            for t in self.queues[lane]
+            if t.last_refusal == INFLIGHT
+        )
         return {
             "ok": True,
             "window_s": window,
@@ -1465,6 +1686,15 @@ class Governor:
             "errors": dict(self.errors),
             "budgets": budgets,
             "upstream": self.upstream_status(now),
+            "inflight_limit": self.inflight_limit(),
+            "inflight_max": self.inflight.max_limit if self.inflight.measuring else None,
+            "inflight_mode": self.inflight.mode,
+            "inflight_arm": self.inflight.arm_at(self.wall()),
+            "inflight_enforcing": self.inflight.enforcing(self.wall()),
+            "inflight_in_flight": self.ds_flight,
+            "inflight_queued": inflight_queued,
+            "ttfb_baseline_ms": ms_or_none(self.inflight.baseline_s),
+            "ttfb_short_ms": ms_or_none(self.inflight.short_run_s(now)),
         }
 
 
@@ -1799,6 +2029,7 @@ class Proxy:
             try:
                 self.gov.pump()
                 self.gov.tick()
+                self.gov.adjust_inflight()
                 if self.gov.clock() - last_flush >= FLUSH_S:
                     last_flush = self.gov.clock()
                     self.gov.state_dirty = True
@@ -1982,6 +2213,7 @@ class Proxy:
         finally:
             if ticket.holds:
                 gov.release(ticket)
+            gov.leave_flight(ticket)
 
     async def _serve(
         self,
@@ -2017,6 +2249,7 @@ class Proxy:
             upstream = None
             sent_at = gov.clock()
             gov.upstream_started(ticket)
+            ticket.started_above = gov.inflight_above(ticket)
             try:
                 upstream = await self.open_upstream(method, path, headers, body)
                 ttfb_s = gov.clock() - sent_at

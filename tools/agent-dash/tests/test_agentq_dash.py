@@ -1134,11 +1134,17 @@ def five_minutes(**fields) -> dict:
 
 
 def verdict_for(raw, *, live=IDLE_LIVE, laptop=CALM, kimi_jobs_waiting=0, budget_429s=None,
-                ds_jobs_ready=0, ds_p50_5m_ms=None, ds_p50_base_ms=None):
+                ds_jobs_ready=0, slow=None):
     return dash.verdict(
         raw, UNTIL, LIMITS_NOW, live, kimi_jobs_waiting=kimi_jobs_waiting, budget_429s=budget_429s or {},
-        laptop=laptop, ds_jobs_ready=ds_jobs_ready, ds_p50_5m_ms=ds_p50_5m_ms, ds_p50_base_ms=ds_p50_base_ms,
+        laptop=laptop, ds_jobs_ready=ds_jobs_ready, slow=slow,
     )
+
+
+def slow_ttfb(limit=28):
+    """A ttfb_slow result: five-minute median 11.2 s against a 5.0 s baseline."""
+    return {"ttfb_ms": 11200, "baseline_ms": 5000, "slow_minutes": 4, "minutes": 5, "limit": limit}
+
 
 
 class LimitedByTest(unittest.TestCase):
@@ -1202,20 +1208,37 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["secondary"], "Kimi reviews waiting: 1 (Kimi's own 24,290/min uncached limit).")
         self.assertIsNone(verdict_for(five_minutes(total=5_000_000))["secondary"])
 
-    def test_morph_slow_when_deepseek_p50_doubles_and_proxy_queue_is_empty(self) -> None:
-        result = verdict_for(five_minutes(total=1_000_000), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+    def test_morph_slow_when_first_byte_is_slow_and_the_proxy_holds_nothing_for_a_budget(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), slow=slow_ttfb())
         self.assertEqual(result["key"], "morph_slow")
         self.assertEqual(result["chip"], "Morph slow")
+        self.assertEqual(
+            result["text"],
+            "Morph is slow: first byte 11.2 s vs 5.0 s usual; extra workers would only queue at Morph (limit 28 in flight).",
+        )
 
-    def test_morph_slow_needs_an_empty_proxy_queue(self) -> None:
-        result = verdict_for(five_minutes(total=1_000_000), live=live_queued(output=3), ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+    def test_morph_slow_names_the_would_be_limit_in_shadow(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), live=dict(IDLE_LIVE, inflight_mode="shadow"), slow=slow_ttfb())
+        self.assertIn("(shadow: would limit to 28 in flight)", result["text"])
+
+    def test_morph_slow_needs_an_empty_budget_queue(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), live=live_queued(output=3), slow=slow_ttfb())
         self.assertNotEqual(result["key"], "morph_slow")
 
     def test_a_waiting_kimi_request_does_not_block_morph_slow(self) -> None:
         live = live_queued(uncached=1)
-        result = verdict_for(five_minutes(total=1_000_000), live=live, kimi_jobs_waiting=1,
-                             ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
+        result = verdict_for(five_minutes(total=1_000_000), live=live, kimi_jobs_waiting=1, slow=slow_ttfb())
         self.assertEqual(result["key"], "morph_slow")
+
+    def test_ttfb_slow_needs_three_of_five_minutes_at_1_8_times_the_baseline(self) -> None:
+        raw = {UNTIL - 60 * k: {"ds_ttfb_p50_ms": 10_000 if k <= 3 else 4_000} for k in range(1, 6)}
+        self.assertEqual(dash.ttfb_slow(raw, UNTIL, 5_000, 28)["slow_minutes"], 3)
+        raw[UNTIL - 60 * 3] = {"ds_ttfb_p50_ms": 4_000}
+        self.assertIsNone(dash.ttfb_slow(raw, UNTIL, 5_000, 28))
+
+    def test_a_429_minute_stops_morph_slow(self) -> None:
+        result = verdict_for(five_minutes(total=1_000_000), slow=slow_ttfb(), budget_429s={"total": {UNTIL - 60}})
+        self.assertNotEqual(result["key"], "morph_slow")
 
     def test_laptop_pressure_without_a_broker_hold_is_context_not_the_headline(self) -> None:
         busy = dict(CALM, cpu_busy=0.95)
@@ -1229,7 +1252,7 @@ class LimitedByTest(unittest.TestCase):
     def test_the_laptop_verdict_needs_a_broker_hold_on_a_ready_deepseek_job(self) -> None:
         result = dash.verdict(
             five_minutes(total=1_000_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            laptop=CALM, ds_jobs_ready=1, slow=None,
             ds_holds=["hold light: cpu 95% busy >= 92%"],
         )
         self.assertEqual(result["key"], "held_laptop")
@@ -1242,7 +1265,7 @@ class LimitedByTest(unittest.TestCase):
     def test_a_ready_job_held_on_a_proxy_budget_is_not_a_laptop_verdict_even_under_pressure(self) -> None:
         result = dash.verdict(
             five_minutes(total=1_000_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=dict(CALM, cpu_busy=0.99), ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            laptop=dict(CALM, cpu_busy=0.99), ds_jobs_ready=1, slow=None,
             ds_holds=["hold pi-deepseek-flash: proxy total waiting 9 > 8"],
         )
         self.assertNotEqual(result["key"], "held_laptop")
@@ -1318,7 +1341,7 @@ class LimitedByTest(unittest.TestCase):
     def test_launching_when_the_queued_details_are_empty(self) -> None:
         result = dash.verdict(
             five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=2, ds_p50_5m_ms=None, ds_p50_base_ms=None, ds_holds=["", None],
+            laptop=CALM, ds_jobs_ready=2, slow=None, ds_holds=["", None],
         )
         self.assertEqual(result["key"], "launching")
         self.assertEqual(result["chip"], "Launching")
@@ -1328,7 +1351,7 @@ class LimitedByTest(unittest.TestCase):
         details = ["hold tests: cpu 90% busy >= 80%"] * 4 + ["hold ssh: slots full"] * 2
         result = dash.verdict(
             five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=6, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            laptop=CALM, ds_jobs_ready=6, slow=None,
             ds_holds=details, ssh_in_use=8,
         )
         self.assertEqual(result["key"], "held_laptop")
@@ -1342,7 +1365,7 @@ class LimitedByTest(unittest.TestCase):
     def test_all_jobs_held_on_ssh_slots_name_the_ssh_chip(self) -> None:
         result = dash.verdict(
             five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=2, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            laptop=CALM, ds_jobs_ready=2, slow=None,
             ds_holds=["hold ssh: slots full", "hold ssh: slots full"], ssh_in_use=8,
         )
         self.assertEqual(result["key"], "held_ssh")
@@ -1352,14 +1375,14 @@ class LimitedByTest(unittest.TestCase):
     def test_held_jobs_waiting_on_a_workspace_or_the_proxy_name_their_chip(self) -> None:
         workspace = dash.verdict(
             five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            laptop=CALM, ds_jobs_ready=1, slow=None,
             ds_holds=["hold pi-deepseek-flash: workspace busy"],
         )
         self.assertEqual(workspace["chip"], "Workspace")
         self.assertEqual(workspace["text"], "1 write job waiting for its workspace.")
         held_proxy = dash.verdict(
             five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            laptop=CALM, ds_jobs_ready=1, slow=None,
             ds_holds=["hold pi-deepseek-flash: proxy total waiting 3 > 0"],
         )
         self.assertEqual(held_proxy["key"], "held_proxy")
@@ -1674,7 +1697,7 @@ class FillerHeadlineTest(unittest.TestCase):
         return dash.verdict(
             five_minutes(total=ds_total + kimi_total, ds_total=ds_total), UNTIL, LIMITS_NOW, live,
             kimi_jobs_waiting=0, budget_429s={}, laptop=CALM, ds_jobs_ready=ds_jobs_ready,
-            ds_p50_5m_ms=None, ds_p50_base_ms=None, filler_running=filler_running, fill=fill,
+            slow=None, filler_running=filler_running, fill=fill,
         )
 
     def test_near_target_with_filler_running_says_holding_near_target(self) -> None:
