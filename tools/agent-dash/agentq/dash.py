@@ -610,7 +610,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   var RANGE_NAME = { 1: "1h", 6: "6h", 24: "24h", 168: "7d" };
   var RANGE_LABEL = { 1: "last 1 h", 6: "last 6 h", 24: "last 24 h", 168: "last 7 d" };
   var NAME_RANGE = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
-  var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)", muted: "var(--ink-3)" };
+  var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)", muted: "var(--ink-3)", kimiQueue: "#8a6cc0" };
   var state = { hours: 6, data: null, seq: 0, lastFetch: 0, stale: null, timer: null };
   var log = { source: "proxy", page: 1, q: "", seq: 0, data: null, qTimer: null, fetchedAt: 0 };
   var charts = [];
@@ -919,7 +919,26 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         below = above;
       });
     } else {
-      cfg.series.forEach(function (s) {
+      cfg.series.filter(function (s) { return s.area; }).forEach(function (s) {
+        var base = Yc(cfg.y.min).toFixed(1);
+        var segments = [];
+        var current = null;
+        points.forEach(function (p) {
+          var v = p[s.key];
+          if (v === null || v === undefined) { current = null; return; }
+          if (!current) { current = []; segments.push(current); }
+          current.push({ x: X(p.t).toFixed(1), y: Yc(v).toFixed(1) });
+        });
+        segments.forEach(function (seg) {
+          var d = "M" + seg[0].x + "," + base + seg.map(function (q) { return " L" + q.x + "," + q.y; }).join("") +
+            " L" + seg[seg.length - 1].x + "," + base + " Z";
+          svgEl("path", {
+            d: d, fill: s.color, "fill-opacity": s.fillOpacity || 0.3, stroke: s.color, "stroke-opacity": 0.55,
+            "stroke-width": 1, "stroke-linejoin": "round"
+          }, svg);
+        });
+      });
+      cfg.series.filter(function (s) { return !s.area; }).forEach(function (s) {
         var d = "";
         var lastPoint = null;
         points.forEach(function (p) {
@@ -1265,8 +1284,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       series: [
         { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
-        { key: "dsq", name: "DeepSeek queued", color: COLORS.s1, dash: "4 3" },
-        { key: "kimiq", name: "Kimi queued", color: COLORS.s2, dash: "4 3" },
+        { key: "dsq", name: "DeepSeek queued", color: COLORS.s3, area: true, fillOpacity: 0.32 },
+        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 },
         { key: "unsplit", name: unsplitName, color: COLORS.muted, dash: "2 3", width: 1.25, opacity: 0.6 }
       ],
       y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
@@ -1295,8 +1314,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
       { name: "Kimi runs", color: COLORS.s2 },
-      { name: "DeepSeek queued", color: COLORS.s1, dashed: true },
-      { name: "Kimi queued", color: COLORS.s2, dashed: true },
+      { name: "DeepSeek queued", color: COLORS.s3, block: true },
+      { name: "Kimi queued", color: COLORS.kimiQueue, block: true },
       { name: unsplitName, color: COLORS.muted, dashed: true }
     ]);
     legendFor($("lg-tokens"), [

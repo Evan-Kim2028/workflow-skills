@@ -1856,16 +1856,20 @@ VERDICTS = ("PASS", "PARTIAL", "FAIL")
 
 
 class QueuedSplitChartTest(unittest.TestCase):
-    def test_worker_chart_plots_queued_per_tier_dashed_in_the_tier_hue(self) -> None:
+    def test_worker_chart_draws_queued_as_areas_behind_the_solid_run_lines(self) -> None:
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-workers"')
         block = html[start:html.index("var mix = d.token_mix", start)]
-        self.assertIn('{ key: "dsq", name: "DeepSeek queued", color: COLORS.s1, dash: "4 3" }', block)
-        self.assertIn('{ key: "kimiq", name: "Kimi queued", color: COLORS.s2, dash: "4 3" }', block)
-        self.assertIn('key: "unsplit"', block)
-        self.assertIn("dsq: w.ds_queued", html)
+        self.assertIn('{ key: "dsq", name: "DeepSeek queued", color: COLORS.s3, area: true, fillOpacity: 0.32 }', block)
+        self.assertIn('{ key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 }', block)
+        self.assertIn('kimiQueue: "#8a6cc0"', html)
+        self.assertIn('cfg.series.filter(function (s) { return s.area; })', html)
+        self.assertIn('cfg.series.filter(function (s) { return !s.area; })', html)
         self.assertIn('{ key: "ds", name: "DeepSeek runs", color: COLORS.s1 }', block)
         self.assertIn('{ key: "kimi", name: "Kimi runs", color: COLORS.s2 }', block)
+        self.assertNotIn('dash: "4 3"', block)
+        self.assertIn('key: "unsplit"', block)
+        self.assertIn("dsq: w.ds_queued", html)
         self.assertNotIn("Queued jobs", block)
         self.assertIn("stroke-dasharray", html)
 
