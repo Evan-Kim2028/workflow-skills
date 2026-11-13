@@ -498,9 +498,10 @@ class FillerTargetTests(unittest.TestCase):
 
     def test_report_path_and_labels_follow_the_spec(self):
         target = Fl.load_targets(self.config(modules=["pkg/a"]))[0][0]
-        self.assertEqual(target.report_path, str(self.tmp.resolve() / "reports" / "filler" / "alpha" / "pkg-a.md"))
-        self.assertEqual(Fl.label_slug(target), "backlog-filler-alpha-pkg-a")
-        self.assertTrue(Fl.is_filler_label("hub-exec-backlog-filler-alpha-pkg-a"))
+        self.assertEqual(target.report_path("bugs"),
+                         str(self.tmp.resolve() / "reports" / "filler" / "alpha" / "bugs" / "pkg-a.md"))
+        self.assertEqual(Fl.label_slug(target), "backlog-filler-bugs-alpha-pkg-a")
+        self.assertTrue(Fl.is_filler_label("hub-exec-backlog-filler-bugs-alpha-pkg-a"))
         self.assertFalse(Fl.is_filler_label("hub-exec-backlog-nightly"))
 
     def test_rotation_skips_unchanged_modules_and_open_jobs(self):
@@ -608,10 +609,13 @@ class BrokerWiringTest(unittest.TestCase):
         self.set_billed(1_000_000)
         self.tick(self.broker())
         labels = sorted(job["label"] for job in self.filler_jobs())
-        self.assertEqual(labels, ["hub-exec-backlog-filler-alpha-pkg-a", "hub-exec-backlog-filler-alpha-pkg-b"])
+        self.assertEqual(labels, [
+            "hub-exec-backlog-filler-bugs-alpha-pkg-a", "hub-exec-backlog-filler-bugs-alpha-pkg-b",
+            "hub-exec-backlog-filler-tests-alpha-pkg-a", "hub-exec-backlog-filler-tests-alpha-pkg-b",
+        ])
         job = self.filler_jobs()[0]
         self.assertEqual((job["lane"], job["kind"], job["res"], job["session"]), ("backlog", "read", "light", "backlog"))
-        self.assertIn("filler alpha/pkg/a submitted", self.log_text())
+        self.assertIn("filler alpha/pkg/a#bugs submitted", self.log_text())
 
     def test_the_controller_state_is_saved_and_a_restarted_broker_loads_it(self):
         self.set_billed(1_000_000)

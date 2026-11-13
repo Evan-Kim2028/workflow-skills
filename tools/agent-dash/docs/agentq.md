@@ -146,15 +146,39 @@ instead of letting it swing between idle and burst.
     under `fill_min_free_pct`, or swap used over `fill_max_swap_frac` (`broker.json`
     `laptop`).
   Real DeepSeek work that is ready always goes first.
-- Filler jobs are read-only audits (kind `read`, resource `light`, lane `backlog`).
-  The targets come from the `"filler"` key of `$AGENTQ_HOME/backlog-seed.json`:
-  `report_dir`, an optional `max_runtime` (default `15m`), and `repos`, each with a
-  `workspace` and either `modules` (paths) or `roots` (the folders directly under each
-  root). Each audit writes `<report_dir>/filler/<repo>/<module-slug>.md`. A cursor
-  rotates the targets, and a module unchanged since its last audit is skipped; the
-  audited commit is recorded when the job is submitted, so a failed audit is not
-  retried until the module changes. Labels come from `label make` as
-  `hub-exec-backlog-filler-<repo>-<module>`.
+- Filler jobs are read-only (kind `read`, resource `light`, lane `backlog`). The work
+  comes from the `"filler"` key of `$AGENTQ_HOME/backlog-seed.json`: `report_dir`, an
+  optional `max_runtime` (default `15m`), `max_target_lines` (4000) and
+  `min_target_lines` (300), optional `kinds` (default `["bugs", "tests", "docs", "risk"]`),
+  optional `pr_window_h` (48), and `repos`. Each repo has a `workspace`, either `modules`
+  or `roots` (the folders directly under each root), and an optional `github` slug
+  (`owner/name`) for merged-PR reviews.
+- Splitting. A module whose code (`.py`, `.sql`, `.sh`) is over `max_target_lines` is
+  split into its child packages, and a child still over the limit into its files of at
+  least `min_target_lines`. A module with no code stays whole. Targets are read when the
+  seed file changes.
+- Audit kinds. `bugs` (correctness defects and dead code), `tests` (risky paths with no
+  test, with the test cases described, not written), `docs` (docstrings, runbooks and
+  AGENTS.md text that no longer matches the code), `risk` (security issues and expensive
+  patterns such as unbounded scans of large tables). A target and kind pair is due when
+  it has never run or the target changed since that kind last ran. Due pairs rotate
+  across targets, and the kind that ran longest ago goes first. Reports go to
+  `<report_dir>/filler/<repo>/<kind>/<module-slug>.md`.
+- PR reviews. Each merged PR into `main` in the last `pr_window_h` hours, for a repo with
+  a `github` slug, gets one `pr` review job, checking what the merge introduced and
+  whether its tests cover it. It is read through one bounded `gh pr list` call per repo
+  every 30 minutes (at most 50 PRs per call). Reviewed PRs are recorded in `filler_prs`,
+  and a PR is reviewed once. Reports go to `<report_dir>/filler/<repo>/pr/<number>.md`.
+- Findings index. After each filler job, its top findings (at most five, most severe
+  first) are added to `<report_dir>/filler/INDEX.md`, newest first. Each finding is one
+  bullet, ``- **high** `file:line` — title``, and a finding whose file:line and title are
+  already in the index is skipped.
+- Each job is a single step: the next unreviewed PR first, then the next due pair. The
+  cursor rotates the targets, and an open job for a pair blocks it until it ends. Labels
+  come from `label make` as `hub-exec-backlog-filler-<kind>-<repo>-<module>`.
+- Dry run: `python3 -m agentq.filler --home <copy of the agentq home>` prints the targets,
+  the due target and kind pairs by kind, and the merged PRs due for review. It runs the
+  store migration, so point it at a copy of the store.
 - Pacing (`broker.json` `pacing`, on by default). A DeepSeek job launches only while
   the current Morph minute's uncached input, plus an estimate for each DeepSeek launch
   whose first request the proxy has not recorded yet, stays under `uncached_frac`
@@ -291,7 +315,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 
 | Path | What it is |
 |---|---|
-| `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_targets`, `filler_state`. `proxy_minutes` belongs to the proxy |
+| `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_audits`, `filler_prs`, `filler_targets` (older, read once by the migration), `filler_state`. `proxy_minutes` belongs to the proxy |
 | `backlog/<name>.md` | a backlog template's prompt copy |
 | `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings and the `fill` and `pacing` settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |

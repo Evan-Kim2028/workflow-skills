@@ -60,6 +60,7 @@ from agentq import backlog as backlog_lib
 from agentq import db
 from agentq import fill as fill_lib
 from agentq import filler as filler_lib
+from agentq import pr_source
 from agentq import headroom as headroom_lib
 
 TICK_S = 2.0
@@ -108,6 +109,7 @@ RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IG
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
 CONTROLLER_STATE_KEY = "fill_controller"
+PR_REFRESH_S = 1800.0
 MEASURE_REFRESH_S = 600.0
 PROCESS_REFRESH_S = 30.0
 OPEN = db.OPEN_STATES
@@ -756,7 +758,8 @@ class Broker:
         self._fill_key: str | None = None
         self._ps: tuple[float, str | None] | None = None
         self._measured: tuple[float, int | None] | None = None
-        self._filler_cache: tuple[float, tuple] | None = None
+        self._filler_cache: tuple[float, filler_lib.Settings] | None = None
+        self._pr_cache: tuple[float, list] | None = None
         self._filler_retry = 0.0
 
     def log(self, message: str) -> None:
@@ -1024,9 +1027,9 @@ class Broker:
             self._ps = (now, fill_lib.process_table())
         return self._ps[1]
 
-    def _filler_targets(self) -> tuple[list, float]:
-        """Filler targets and max runtime from backlog-seed.json, re-read when the file changes.
-        A malformed section logs once and yields no targets."""
+    def _filler_settings(self) -> filler_lib.Settings:
+        """The filler's settings from backlog-seed.json, re-read when the file changes.
+        A malformed section logs once and yields no work."""
         path = self.home / filler_lib.CONFIG_NAME
         try:
             mtime = path.stat().st_mtime
@@ -1036,13 +1039,33 @@ class Broker:
             return self._filler_cache[1]
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if mtime is not None else {}
-            targets, max_runtime = filler_lib.load_targets(data)
-            result = (targets, max_runtime)
+            result = filler_lib.load_settings(data)
         except (OSError, ValueError) as exc:
             self.log(f"filler config refused: {exc}")
-            result = ([], filler_lib.DEFAULT_MAX_RUNTIME_S)
+            result = filler_lib.load_settings({})
         self._filler_cache = (mtime, result)
         return result
+
+    def _pr_candidates(self, now: float, settings: filler_lib.Settings) -> list[dict]:
+        """Merged PRs in the review window across the configured repos, newest first. One ``gh`` call per repo, at
+        most every PR_REFRESH_S. A repo whose call fails is logged and skipped until the next refresh."""
+        if self._pr_cache is not None and now - self._pr_cache[0] < PR_REFRESH_S:
+            return self._pr_cache[1]
+        found: list[dict] = []
+        for repo in settings.pr_repos:
+            try:
+                rows = pr_source.merged_prs(repo.slug, pr_source.since_date(now, settings.pr_window_h))
+            except pr_source.PRSourceError as exc:
+                self.log(f"filler PR source {repo.repo}: {exc}")
+                continue
+            window_start = now - settings.pr_window_h * 3600
+            for row in rows:
+                if pr_source.merged_epoch(row) >= window_start:
+                    found.append({**row, "repo": repo.repo, "slug": repo.slug, "workspace": repo.workspace,
+                                  "report_dir": settings.report_dir})
+        found.sort(key=lambda row: pr_source.merged_epoch(row), reverse=True)
+        self._pr_cache = (now, found)
+        return found
 
     def _log_fill(self, plan: fill_lib.FillPlan) -> None:
         """Log the controller's reason once per change of reason, not once per tick."""
@@ -1085,40 +1108,43 @@ class Broker:
             self._saved_controller = state
         if decision.plan.submit <= 0 or now < self._filler_retry:
             return []
-        targets, max_runtime = self._filler_targets()
+        settings = self._filler_settings()
         submitted = []
         for _ in range(decision.plan.submit):
-            job_id = self._filler_job(conn, now, targets, max_runtime)
+            job_id = self._filler_job(conn, now, settings)
             if job_id is None:
                 break
             submitted.append(job_id)
         return submitted
 
-    def _filler_job(self, conn, now: float, targets: list, max_runtime: float) -> str | None:
-        """Queue one audit for the next due target. Returns the job id, or None when nothing is due or the label is refused."""
-        found = filler_lib.next_target(conn, targets, head_of=filler_lib.module_head)
-        if found is None:
+    def _filler_job(self, conn, now: float, settings: filler_lib.Settings) -> str | None:
+        """Queue the next filler job: an unreviewed merged PR, else a due target and kind. Returns the job id, or
+        None when nothing is due or the label is refused."""
+        work = filler_lib.next_work(
+            conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head,
+            prs=self._pr_candidates(now, settings),
+        )
+        if work is None:
             return None
-        target, commit = found
-        label = self.labeler("read", filler_lib.label_slug(target))
+        label = self.labeler("read", work.slug)
         if label is None:
             self._filler_retry = now + BACKLOG_RETRY_S
-            self.log(f"filler {target.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
+            self.log(f"filler {work.key}: label make refused; retry in {int(BACKLOG_RETRY_S)}s")
             return None
         job_id = db.new_job_id()
         prompt = db.job_dir(self.home, job_id) / "prompt.md"
         prompt.parent.mkdir(parents=True, exist_ok=True)
-        prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_body(target, commit)), encoding="utf-8")
+        prompt.write_text(backlog_lib.preamble_for("read", filler_lib.prompt_for(work)), encoding="utf-8")
         job = {
             "id": job_id, "lane": "backlog", "kind": "read", "res": "light",
-            "tier": db.default_tier("read"), "label": label, "workspace": target.workspace,
+            "tier": db.default_tier("read"), "label": label, "workspace": work.workspace,
             "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
-            "max_runtime_s": max_runtime,
+            "max_runtime_s": settings.max_runtime,
         }  # fmt: skip
         with db.tx(conn):
             db.insert_job(conn, job, now)
-            filler_lib.record_submission(conn, target, commit, job_id, now)
-        self.log(f"filler {target.key} submitted {job_id} ({label}) at {commit[:12]}")
+            filler_lib.record_work(conn, work, job_id, now)
+        self.log(f"filler {work.key} submitted {job_id} ({label})")
         return job_id
 
     def _proxy_status(self) -> dict | None:
@@ -1250,6 +1276,8 @@ class Broker:
         dest = db.job_dir(self.home, job["id"]) / "report.md"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
+        if is_filler(job):
+            self._index_findings(job, text, now)
         verdict = verdict_of(text)
         note = "; ".join(part for part in (note, worktree_note(job)) if part)
         self._move(
@@ -1257,6 +1285,16 @@ class Broker:
             state="done", verdict=verdict, report_path=str(dest), finished_at=now,
             pi_session=pi_session_of(job["run_dir"], job["label"]) or job["pi_session"],
         )  # fmt: skip
+
+    def _index_findings(self, job: dict, text: str, now: float) -> None:
+        """Add a finished filler job's top findings to the owner's index. Best effort: a failure is logged."""
+        settings = self._filler_settings()
+        if not settings.report_dir:
+            return
+        try:
+            filler_lib.append_index(settings.report_dir, job["label"], filler_lib.top_findings(text, 5), now)
+        except OSError as exc:
+            self.log(f"filler index not updated: {exc}")
 
     def _fail(self, conn, job: dict, now: float, reason: str, attempt: int | None = None) -> None:
         self._move(
