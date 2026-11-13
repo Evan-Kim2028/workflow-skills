@@ -125,7 +125,7 @@ VERDICTS = ("PASS", "PARTIAL", "FAIL")
 FAR_FUTURE = 4102444800.0
 BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ds_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
 PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached", "pct_ds_uncached")
-WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued", "queued_unsplit")
+WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued")
 DS_TIER = "pi-deepseek-flash"
 KIMI_TIER = "pi-kimi"
 SAMPLE_COLUMNS = ("ts", "ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued")
@@ -1257,10 +1257,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var tb = d.token_bucket_s || bucket;
     var tunit = unitLabel(tb);
     var workers = (d.workers || []).map(function (w) {
-      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued, unsplit: w.queued_unsplit };
+      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued };
     });
-    var firstSplit = workers.find(function (w) { return w.dsq !== null && w.dsq !== undefined; });
-    var unsplitName = firstSplit ? "Queued, unsplit (before " + hm(firstSplit.t) + ")" : "Queued, unsplit";
     var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
@@ -1294,8 +1292,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
         { key: "dsq", name: "DeepSeek queued", color: COLORS.s3, area: true, fillOpacity: 0.32 },
-        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 },
-        { key: "unsplit", name: unsplitName, color: COLORS.muted, dash: "2 3", width: 1.25, opacity: 0.6 }
+        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 }
       ],
       y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
@@ -1324,8 +1321,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       { name: "DeepSeek runs", color: COLORS.s1 },
       { name: "Kimi runs", color: COLORS.s2 },
       { name: "DeepSeek queued", color: COLORS.s3, block: true },
-      { name: "Kimi queued", color: COLORS.kimiQueue, block: true },
-      { name: unsplitName, color: COLORS.muted, dashed: true }
+      { name: "Kimi queued", color: COLORS.kimiQueue, block: true }
     ]);
     legendFor($("lg-tokens"), [
       { name: "Tokens billed", color: COLORS.s1, block: true },
@@ -2118,8 +2114,8 @@ def read_caps(home: Path) -> dict[str, int]:
 def read_samples(dash_db: Path, since: float) -> list[dict]:
     """Worker samples recorded at or after ``since``. Empty before the first sample exists.
 
-    A database written before the per-tier queue split has no split columns: those read as None. A sample with
-    a total but no split is reported as ``queued_unsplit``, so the chart never invents a per-tier figure.
+    A database written before the per-tier queue split has no split columns: those samples read as None,
+    so the chart shows no queued value for them.
     """
     if not dash_db.exists():
         return []
@@ -2130,9 +2126,6 @@ def read_samples(dash_db: Path, since: float) -> list[dict]:
         rows = [dict(row) for row in connection.execute(f"SELECT {columns} FROM samples WHERE ts >= ? ORDER BY ts", (since,))]
     finally:
         connection.close()
-    for row in rows:
-        split = row["ds_queued"] is not None
-        row["queued_unsplit"] = None if split or row["queued_jobs"] is None else row["queued_jobs"]
     return rows
 
 
@@ -2296,7 +2289,7 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
     return buckets
 
 
-RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "ds_queued", "kimi_queued", "queued_unsplit")
+RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "ds_queued", "kimi_queued")
 RUNS_AXIS_HEADROOM = 1.15
 RUNS_AXIS_MIN = 10
 RUNS_AXIS_STEPS = tuple(sorted({m * 10**k for k in range(7) for m in (1, 2, 5, 10, 20, 25, 50)}))

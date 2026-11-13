@@ -241,7 +241,7 @@ class SamplerTest(unittest.TestCase):
         conn.close()
         self.assertEqual(stored, [(2, 1, 1)])
 
-    def test_old_samples_without_the_split_stay_unsplit_and_the_table_is_migrated(self) -> None:
+    def test_old_samples_without_the_split_show_no_queued_value_and_the_table_is_migrated(self) -> None:
         dash_db = self.home / "dash.db"
         conn = sqlite3.connect(dash_db)
         conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
@@ -251,14 +251,14 @@ class SamplerTest(unittest.TestCase):
         conn.close()
         old = dash.read_samples(dash_db, NOW - 3600)
         self.assertIsNone(old[0]["ds_queued"])
-        self.assertEqual(old[0]["queued_unsplit"], 3)
+        self.assertEqual(old[0]["queued_jobs"], 3)
         dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
         conn = sqlite3.connect(dash_db)
         columns = [r[1] for r in conn.execute("PRAGMA table_info(samples)")]
         conn.close()
         self.assertIn("ds_queued", columns)
         new = dash.read_samples(dash_db, NOW - 3600)
-        self.assertEqual([s["queued_unsplit"] for s in new], [3, None])
+        self.assertEqual([s["queued_jobs"] for s in new], [3, 1])
         self.assertEqual(new[1]["ds_queued"], 1)
 
     def test_samples_older_than_seven_days_are_pruned(self) -> None:
@@ -1868,7 +1868,7 @@ class QueuedSplitChartTest(unittest.TestCase):
         self.assertIn('{ key: "ds", name: "DeepSeek runs", color: COLORS.s1 }', block)
         self.assertIn('{ key: "kimi", name: "Kimi runs", color: COLORS.s2 }', block)
         self.assertNotIn('dash: "4 3"', block)
-        self.assertIn('key: "unsplit"', block)
+        self.assertNotIn("unsplit", block.lower())
         self.assertIn("dsq: w.ds_queued", html)
         self.assertNotIn("Queued jobs", block)
         self.assertIn("stroke-dasharray", html)
@@ -1886,7 +1886,7 @@ class QueuedSplitChartTest(unittest.TestCase):
             workers = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)["workers"]
         self.assertEqual(len(workers), 59)
         self.assertTrue(all(w["ds_workers"] == 3 and w["kimi_workers"] == 1 for w in workers))
-        self.assertTrue(all(w["queued_unsplit"] == 2 and w["ds_queued"] is None for w in workers))
+        self.assertTrue(all(w["ds_queued"] is None and "queued_unsplit" not in w for w in workers))
 
     def test_summary_workers_follow_the_selected_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
