@@ -40,7 +40,8 @@ AVERAGE_SATURATION_FRAC = 0.90
 ROOM_FRAC = 0.95
 POOL_NEAR_CAPACITY_FRAC = 0.85
 MORPH_429_MINUTES = 2
-SLOW_FACTOR = 2.0
+TTFB_SLOW_FACTOR = 1.8
+TTFB_SLOW_MINUTES = 3
 LAPTOP_BAR_DEFAULTS = {
     "tests_max_cpu_busy": 0.80, "tests_min_free_pct": 35.0, "light_max_cpu_busy": 0.92,
     "light_min_free_pct": 20.0, "max_swap_frac": 0.90,
@@ -150,7 +151,9 @@ SELECT minute,
        {upstream_p50_weight} AS upstream_p50_weight,
        {upstream_p95_ms} AS upstream_p95_ms,
        {ds_p50_weighted} AS ds_p50_weighted,
-       {ds_p50_weight} AS ds_p50_weight
+       {ds_p50_weight} AS ds_p50_weight,
+       {ds_ttfb_p50_ms} AS ds_ttfb_p50_ms,
+       {inflight_limit} AS inflight_limit
 FROM proxy_minutes
 WHERE minute >= ? AND minute < ?
 GROUP BY minute
@@ -390,7 +393,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         <div class="kpi head"><div class="label">Total pool, 5 min avg</div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
         <div class="kpi"><div class="label">DeepSeek uncached, 5 min avg</div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
         <div class="kpi"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
-        <div class="kpi"><div class="label">Requests in flight now</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered</div></div>
+        <div class="kpi"><div class="label">In flight / limit</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered; limit is the DeepSeek cap (shadow: the cap it would set)</div></div>
         <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
       </div>
     </section>
@@ -1165,7 +1168,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   function renderPerf(d) {
     var pk = d.perf_kpis || {};
     setText("p-morph", seconds(pk.upstream_response_p50_ms) + " / " + seconds(pk.upstream_response_p95_ms));
-    setTile("p-inflight", pk.in_flight_now);
+    setTileList("p-inflight", pk.inflight_limit == null ? [pk.in_flight_now] : [pk.in_flight_now, pk.inflight_limit]);
   }
 
   function renderRange(d) {
@@ -1829,6 +1832,10 @@ def minutes_sql(columns: set[str]) -> str:
             "SUM(CASE WHEN model LIKE 'morph-dsv%' AND upstream_p50_ms IS NOT NULL THEN COALESCE(upstream_n, 0) ELSE 0 END)"
             if has("upstream_p50_ms", "upstream_n") else "NULL"
         ),
+        ds_ttfb_p50_ms=(
+            "MAX(CASE WHEN model LIKE 'morph-dsv%' THEN ttfb_p50_ms END)" if has("ttfb_p50_ms") else "NULL"
+        ),
+        inflight_limit="MAX(inflight_limit)" if has("inflight_limit") else "NULL",
     )
 
 
@@ -2426,6 +2433,8 @@ def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float, li
         ),
         "upstream_response_p95_ms": max(upstream_p95s) if upstream_p95s else None,
         "in_flight_now": in_flight_total(live),
+        "inflight_limit": live_inflight_limit(live),
+        "inflight_mode": (live or {}).get("inflight_mode"),
         "upstream_median_ms": median_or_none(upstream),
         "r429_rate_60m": window_sum(raw, until, RATE_WINDOW_MINUTES, "r429") / req_60m if req_60m else None,
         "requests_per_min_5m": window_sum(raw, until, LIMIT_WINDOW_MINUTES, "req") / LIMIT_WINDOW_MINUTES,
@@ -2525,12 +2534,23 @@ def resolve_limits(live: dict | None) -> dict[str, int]:
     return limits
 
 
-def ds_upstream_p50(rows: list[dict]) -> int | None:
-    """Request-weighted DeepSeek upstream p50 over minute rows; None when no DeepSeek minute recorded one."""
-    weight = sum(int(row.get("ds_p50_weight") or 0) for row in rows)
-    if not weight:
-        return None
-    return round(sum(int(row.get("ds_p50_weighted") or 0) for row in rows) / weight)
+def live_inflight_limit(live: dict | None) -> int | None:
+    """The DeepSeek in-flight limit the proxy reports (shadow included), or None."""
+    value = (live or {}).get("inflight_limit")
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def live_ttfb_baseline(live: dict | None, baseline_raw: dict[int, dict], until: int) -> int | None:
+    """DeepSeek first-byte baseline: the proxy's long-run value when it reports one, else the median of
+    the 6-hour per-minute first-byte p50s."""
+    value = (live or {}).get("ttfb_baseline_ms")
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value)
+    values = [
+        int(row["ds_ttfb_p50_ms"]) for stamp, row in baseline_raw.items()
+        if stamp >= until - 6 * 3600 and row.get("ds_ttfb_p50_ms")
+    ]
+    return round(statistics.median(values)) if values else None
 
 
 def read_calib_429s(home: Path) -> dict | None:
@@ -2876,6 +2896,58 @@ def read_fill(home: Path) -> dict:
     return {"enabled": bool(enabled), **numbers}
 
 
+def ttfb_slow(raw: dict[int, dict], until: int, baseline_ms: int | None, limit: int | None) -> dict | None:
+    """DeepSeek first-byte slowdown over the last 5 complete minutes, or None.
+
+    Slow when at least TTFB_SLOW_MINUTES of those minutes have a DeepSeek first-byte p50 at or above
+    TTFB_SLOW_FACTOR times the baseline. The text quotes the 5-minute median, not one minute.
+    """
+    five = range(until - LIMIT_WINDOW_MINUTES * 60, until, 60)
+    values = [int(raw[t]["ds_ttfb_p50_ms"]) for t in five if t in raw and raw[t].get("ds_ttfb_p50_ms")]
+    if not values or not baseline_ms:
+        return None
+    slow_minutes = sum(1 for v in values if v >= TTFB_SLOW_FACTOR * baseline_ms)
+    if slow_minutes < TTFB_SLOW_MINUTES:
+        return None
+    return {
+        "ttfb_ms": round(statistics.median(values)),
+        "baseline_ms": baseline_ms,
+        "slow_minutes": slow_minutes,
+        "minutes": len(values),
+        "limit": limit,
+    }
+
+
+def slow_text(slow: dict, *, shadow: bool) -> str:
+    """The Morph slow headline. In shadow mode the limit is named as what it would be, not what it is."""
+    base = f"Morph is slow: first byte {slow['ttfb_ms'] / 1000:.1f} s vs {slow['baseline_ms'] / 1000:.1f} s usual"
+    if slow.get("limit") is None:
+        return f"{base}; extra workers would only queue at Morph."
+    if shadow:
+        return f"{base}; extra workers would only queue at Morph (shadow: would limit to {slow['limit']} in flight)."
+    return f"{base}; extra workers would only queue at Morph (limit {slow['limit']} in flight)."
+
+
+def budget_429_in_window(budget_429s: dict[str, set[int]] | None, minutes: range) -> bool:
+    """True when any Morph budget that the headline counts returned a 429 in these minutes."""
+    return any(t in (budget_429s or {}).get(name, set()) for name in HEADLINE_429_BUDGETS for t in minutes)
+
+
+def proxy_budget_waiting_ds(live: dict | None) -> int:
+    """DeepSeek requests the proxy holds for a budget, not for the in-flight limit.
+
+    A proxy that reports blocked_by_family counts only budget holds. An older proxy reports queues only,
+    so its queued count stands in.
+    """
+    budgets = (live or {}).get("budgets")
+    if not isinstance(budgets, dict):
+        return 0
+    if any(isinstance((b or {}).get("blocked_by_family"), dict) for b in budgets.values()):
+        return sum(int((b or {}).get("blocked_by_family", {}).get(DEEPSEEK_FAMILY) or 0) for b in budgets.values() if isinstance(b, dict))
+    waiting = proxy_waiting_by_budget(live)
+    return sum(waiting.values()) if waiting is not None else 0
+
+
 def verdict(
     raw: dict[int, dict],
     until: int,
@@ -2886,8 +2958,7 @@ def verdict(
     budget_429s: dict[str, set[int]],
     laptop: dict,
     ds_jobs_ready: int | None,
-    ds_p50_5m_ms: int | None,
-    ds_p50_base_ms: int | None,
+    slow: dict | None = None,
     ds_holds: list[str] | None = None,
     ssh_in_use: int | None = None,
     filler_running: int = 0,
@@ -2941,13 +3012,9 @@ def verdict(
         else:
             detail = f"{label} returned 429s in {minutes_429} of the last 5 minutes ({context})"
         key, text = "morph_limit", f"Morph is limiting us: {detail}."
-    elif ds_p50_5m_ms and ds_p50_base_ms and ds_p50_5m_ms > SLOW_FACTOR * ds_p50_base_ms and ds_waiting == 0:
+    elif slow is not None and proxy_budget_waiting_ds(live) == 0 and not budget_429_in_window(budget_429s, five):
         key = "morph_slow"
-        text = (
-            f"Morph is slow: DeepSeek response p50 is {ds_p50_5m_ms / 1000:.1f} s, "
-            f"{ds_p50_5m_ms / ds_p50_base_ms:.1f}x its 6-hour median of {ds_p50_base_ms / 1000:.1f} s, "
-            "with nothing queued at the proxy."
-        )
+        text = slow_text(slow, shadow=(live or {}).get("inflight_mode") == "shadow")
     elif pool >= POOL_NEAR_CAPACITY_FRAC:
         key = "near_capacity"
         text = f"Near capacity: pool at {pool * 100:.0f}% of Morph's {limits['total'] // 1_000_000}M/min limit."
@@ -3067,11 +3134,6 @@ def build_summary(
     kpis = run_kpis(runs, day, caps, verdicts)
     laptop_now = laptop if laptop is not None else laptop_reading(home, now)
     baseline_raw = raw if hours >= 6 else _guard("minutes_6h", errors, read_minute_rows, {}, agentq_db, until - 6 * 3600, until)
-    five = range(until - LIMIT_WINDOW_MINUTES * 60, until, 60)
-    ds_p50_5m = ds_upstream_p50([raw[t] for t in five if t in raw])
-    base_p50s = [
-        p for p in (ds_upstream_p50([row]) for stamp, row in sorted(baseline_raw.items()) if stamp >= until - 6 * 3600) if p is not None
-    ]
     worker_vals = [s["ds_workers"] for s in samples if until - LIMIT_WINDOW_MINUTES * 60 <= s["ts"] < until and s["ds_workers"] is not None]
     jobs_by_tier = (jobs or {}).get("by_tier") or {}
     verdict_now = verdict(
@@ -3080,8 +3142,7 @@ def build_summary(
         budget_429s=budget_429_minutes(home, until),
         laptop=laptop_now,
         ds_jobs_ready=int((jobs_by_tier.get("pi-deepseek-flash") or {}).get("queued") or 0),
-        ds_p50_5m_ms=ds_p50_5m,
-        ds_p50_base_ms=median_or_none(base_p50s),
+        slow=ttfb_slow(raw, until, live_ttfb_baseline(live, baseline_raw, until), live_inflight_limit(live)),
         ds_holds=(jobs or {}).get("ds_holds"),
         ssh_in_use=int((jobs or {}).get("running_by_res", {}).get("ssh", 0)) if jobs else None,
         filler_running=int((jobs or {}).get("filler_running") or 0),

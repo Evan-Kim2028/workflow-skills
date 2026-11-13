@@ -298,6 +298,17 @@ def cmd_slots(args, ctx: Context) -> int:
     return answer(ctx, "slots held: " + "; ".join(parts), 0)
 
 
+def cmd_inflight_report(args, ctx: Context) -> int:
+    from agentq import inflight as inflight_lib
+
+    text, summary = inflight_lib.report(db.db_path(ctx.home), args.hours, now=ctx.now())
+    ctx.print(text)
+    if not summary:
+        return answer(ctx, "no DeepSeek minutes recorded in the window", 1)
+    arms = ", ".join(sorted(summary))
+    return answer(ctx, f"per-arm DeepSeek report over the last {args.hours:g} h (arms: {arms}); read-only", 0)
+
+
 def _when(ts) -> str:
     return "never" if ts is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
@@ -429,6 +440,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("daemon", help="run the broker loop (launchd runs this)").set_defaults(func=cmd_daemon)
     sub.add_parser("status", help="daemon, queue depth, running slots, proxy").set_defaults(func=cmd_status)
+    inflight = sub.add_parser("inflight", help="DeepSeek in-flight limiter evidence").add_subparsers(dest="inflight_cmd", required=True)
+    p = inflight.add_parser("report", help="throughput and latency per limiter arm, from proxy_minutes (read-only)")
+    p.add_argument("--hours", type=float, default=4.0)
+    p.set_defaults(func=cmd_inflight_report)
     sub.add_parser("slots", help="ssh and pytest slots held by pi workers, with holder pid and label").set_defaults(func=cmd_slots)
 
     p = sub.add_parser("backlog", help="recurring low-priority jobs that fill idle Morph capacity")

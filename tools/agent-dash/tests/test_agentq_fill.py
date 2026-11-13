@@ -742,3 +742,37 @@ class NeverPool:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InflightFillGateTest(unittest.TestCase):
+    """Filler waits while DeepSeek is at the in-flight limit and the limit is below its maximum."""
+
+    def status(self, **fields) -> dict:
+        base = {"inflight_limit": 28, "inflight_max": 96, "inflight_enforcing": True,
+                "inflight_queued": 0, "inflight_in_flight": 28, "inflight_mode": "enforce"}
+        return base | fields
+
+    def test_enforced_limit_holding_deepseek_requests_holds_filler(self) -> None:
+        self.assertEqual(F.inflight_gate(self.status(inflight_queued=3)), "Morph slow: in-flight limit 28 reached")
+
+    def test_enforced_limit_with_nothing_held_does_not_hold_filler(self) -> None:
+        self.assertIsNone(F.inflight_gate(self.status(inflight_queued=0)))
+
+    def test_shadow_limit_is_named_as_would_be_when_deepseek_is_at_it(self) -> None:
+        reason = F.inflight_gate(self.status(inflight_enforcing=False, inflight_mode="shadow", inflight_queued=0))
+        self.assertEqual(reason, "Morph slow: in-flight limit 28 reached (shadow: would limit to 28)")
+
+    def test_shadow_below_the_limit_does_not_hold_filler(self) -> None:
+        self.assertIsNone(F.inflight_gate(self.status(inflight_enforcing=False, inflight_in_flight=10)))
+
+    def test_a_limit_at_its_maximum_never_holds_filler_here(self) -> None:
+        self.assertIsNone(F.inflight_gate(self.status(inflight_limit=96, inflight_queued=4)))
+
+    def test_no_limit_means_no_gate(self) -> None:
+        self.assertIsNone(F.inflight_gate(self.status(inflight_limit=None)))
+
+    def test_gate_reason_reports_the_limit_before_the_budget_gate(self) -> None:
+        calm = H.Headroom(free_pct=60.0, cpu_busy=0.3, swap_frac=0.1, load_per_cpu=0.1)
+        laptop_cfg = {"fill_max_cpu_busy": 0.9, "fill_min_free_pct": 10.0, "fill_max_swap_frac": 0.9}
+        reason = F.gate_reason(self.status(inflight_queued=2), 0, calm, laptop_cfg, F.DEFAULT_FILL)
+        self.assertEqual(reason, "Morph slow: in-flight limit 28 reached")
