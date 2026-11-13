@@ -120,7 +120,7 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(limits["total"]["target_frac"], 0.9)
         self.assertEqual(limits["uncached"]["target_frac"], 1.18)
 
-    def test_current_minute_feeds_only_the_projected_live_point(self) -> None:
+    def test_current_minute_feeds_only_the_live_point(self) -> None:
         summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)
         self.assertEqual(summary["window"]["end"], UNTIL)
         complete = [p for p in summary["minutes"] if not p.get("live")]
@@ -628,7 +628,7 @@ CURRENT_MINUTE_ROW = (dash.minute_stamp(UNTIL), "morph-dsv41flash-1017", 9, 9, 9
 
 
 class LiveMinuteTest(unittest.TestCase):
-    """The minute in progress is one extra projected chart point; no average, rate or table reads it."""
+    """The minute in progress is one extra chart point with its values so far; no average, rate or table reads it."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -648,25 +648,25 @@ class LiveMinuteTest(unittest.TestCase):
     def summary(self, *, now: float = NOW, hours: int = 1) -> dict:
         return dash.build_summary(self.home, hours, now=now, fetch_live=proxy_status)
 
-    def test_live_point_is_the_last_minute_projected_at_the_pace_so_far(self) -> None:
+    def test_live_point_is_the_last_minute_with_its_values_so_far(self) -> None:
         point = self.summary()["minutes"][-1]
         self.assertTrue(point["live"])
         self.assertEqual(point["t"], UNTIL)
         self.assertEqual(point["elapsed_s"], 30)
         self.assertEqual(point["so_far"]["total"], 1_999_998)
-        self.assertEqual(point["total"], 1_999_998 * 2)
-        self.assertEqual(point["r429"], 9 * 2)
-        self.assertEqual(point["req"], 9 * 2)
-        self.assertEqual(point["pct_total"], dash.fraction(1_999_998 * 2, 10_000_000))
-        self.assertEqual(point["total_source"], "projected")
+        self.assertEqual(point["total"], 1_999_998)
+        self.assertEqual(point["r429"], 9)
+        self.assertEqual(point["req"], 9)
+        self.assertEqual(point["pct_total"], dash.fraction(1_999_998, 10_000_000))
+        self.assertEqual(point["total_source"], "so_far")
         self.assertIn("this minute so far", point["live_note"])
 
-    def test_no_live_point_in_the_first_twenty_seconds(self) -> None:
-        minutes = self.summary(now=UNTIL + 10)["minutes"]
+    def test_no_live_point_in_the_first_ten_seconds(self) -> None:
+        minutes = self.summary(now=UNTIL + 5)["minutes"]
         self.assertNotIn(UNTIL, [p["t"] for p in minutes])
         self.assertFalse(any(p.get("live") for p in minutes))
-        self.assertIsNotNone(dash.live_minute_point({"total": 10}, UNTIL, 20))
-        self.assertIsNone(dash.live_minute_point({"total": 10}, UNTIL, 19))
+        self.assertIsNotNone(dash.live_minute_point({"total": 10}, UNTIL, 10))
+        self.assertIsNone(dash.live_minute_point({"total": 10}, UNTIL, 9))
         self.assertIsNone(dash.live_minute_point(None, UNTIL, 40))
 
     def test_averages_rates_fractions_and_the_minute_table_ignore_the_live_minute(self) -> None:
@@ -694,8 +694,6 @@ class LiveMinuteTest(unittest.TestCase):
 
     def test_page_styles_the_live_point_and_keeps_it_out_of_the_minute_table(self) -> None:
         html = dash.PAGE_HTML
-        self.assertIn('lastDot.fill = lastP.live ? "var(--surface)" : COLORS.muted', html)
-        self.assertIn('lastDot.stroke = lastP.live ? COLORS.muted : "var(--surface)"', html)
         self.assertIn('"stroke-dasharray": "4 3"', html)
         self.assertIn('(d.minutes || []).filter(function (p) { return !p.live; })', html)
         self.assertIn('head = fmtX(p.t) + " \\u00b7 in progress, " + p.elapsed_s + "s in";', html)
@@ -769,9 +767,7 @@ class BucketAndTotalsTest(unittest.TestCase):
             self.assertEqual(row["cumulative"], running)
         minutes = [p for p in summary["minutes"] if not p.get("live")]
         self.assertEqual(complete[-1]["cumulative"], sum(p["total"] for p in minutes))
-        live = mix[-1]
-        self.assertTrue(live["live"])
-        self.assertEqual(live["cumulative"], complete[-1]["cumulative"] + live["total"])
+        self.assertFalse(any(row.get("live") for row in mix))
 
     def test_range_totals_sum_the_range_and_count_runs_and_verdicts(self) -> None:
         totals = dash.build_summary(self.home, 1, now=NOW, fetch_live=proxy_status)["range_totals"]

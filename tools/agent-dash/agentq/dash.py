@@ -42,7 +42,7 @@ BUCKET_S = {1: 60, 6: 60, 24: 300, 168: 1800}
 DEFAULT_HOURS = 6
 RECENT_JOBS = 200
 LIMIT_WINDOW_MINUTES = 5
-LIVE_MINUTE_MIN_ELAPSED_S = 20
+LIVE_MINUTE_MIN_ELAPSED_S = 10
 LIVE_PACE_KEYS = (
     "total", "ds_output", "kimi_uncached", "ds_uncached", "input", "cache_read", "output", "ok", "req", "r429",
 )
@@ -480,7 +480,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute, and the hollow marker at the right edge is the minute in progress, projected to a full minute at its pace so far. The step line is the average of each complete Eastern clock hour over its minutes, with idle minutes counted as zero; the hour in progress has no step until it completes. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute, and the hollow marker at the right edge is the minute in progress, showing its tokens so far. The step line is the average of each complete Eastern clock hour over its minutes, with idle minutes counted as zero; the hour in progress has no step until it completes. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -1167,7 +1167,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var slot = (cfg.bucket_s / Math.max(1, x1 - x0)) * iw;
     var barW = Math.min(24, Math.max(1, slot - 2));
     function X(t) { return m.l + ((t - x0) / Math.max(1, x1 - x0)) * iw; }
-    function center(p) { return Math.min(X(p.t) + slot / 2, W - m.r - barW / 2 - 1); }
+    function center(p) { return X(p.t) + slot / 2; }
     function YL(v) { return plotBottom - (v / (left.max || 1)) * ih; }
     function YR(v) { return plotBottom - (v / (right.max || 1)) * ih; }
 
@@ -1198,14 +1198,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var l = cx - barW / 2, rt = cx + barW / 2;
       var d = "M" + l + "," + base + " L" + l + "," + (top + r) + " Q" + l + "," + top + " " + (l + r) + "," + top +
         " L" + (rt - r) + "," + top + " Q" + rt + "," + top + " " + rt + "," + (top + r) + " L" + rt + "," + base + " Z";
-      var barAttrs = { d: d, fill: cfg.series[0].color };
-      if (p.live) {
-        barAttrs["fill-opacity"] = 0.45;
-        barAttrs.stroke = cfg.series[0].color;
-        barAttrs["stroke-dasharray"] = "4 3";
-        barAttrs["stroke-width"] = 1;
-      }
-      svgEl("path", barAttrs, svg);
+      svgEl("path", { d: d, fill: cfg.series[0].color }, svg);
     });
 
     var line = points.map(function (p, idx) {
@@ -1214,10 +1207,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     svgEl("path", { d: line, fill: "none", stroke: "var(--surface)", "stroke-width": 4.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
     svgEl("path", { d: line, fill: "none", stroke: COLORS.muted, "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
     var lastP = points[points.length - 1];
-    var lastDot = { cx: center(lastP), cy: YR(lastP.cumulative), r: 4, "stroke-width": 2 };
-    lastDot.fill = lastP.live ? "var(--surface)" : COLORS.muted;
-    lastDot.stroke = lastP.live ? COLORS.muted : "var(--surface)";
-    svgEl("circle", lastDot, svg);
+    svgEl("circle", { cx: center(lastP), cy: YR(lastP.cumulative), r: 4, fill: COLORS.muted, stroke: "var(--surface)", "stroke-width": 2 }, svg);
 
     var tip = document.createElement("div");
     tip.className = "tip";
@@ -1229,18 +1219,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       band.setAttribute("x", X(p.t));
       band.setAttribute("visibility", "visible");
       var head = (cfg.tickFmt || hm)(p.t) + " \u2013 " + hm(p.t + cfg.bucket_s);
-      var rows = [
+      fillTip(tip, head, [
         { color: cfg.series[0].color, text: "Total: " + fmtTokens(p.total) },
         { color: null, text: "Cache read: " + fmtTokens(p.cache_read) + " (" + shareText(p.cache_read, p.total) + ")" },
         { color: null, text: "Uncached input: " + fmtTokens(p.uncached) + " (" + shareText(p.uncached, p.total) + ")" },
         { color: null, text: "Output: " + fmtTokens(p.output) + " (" + shareText(p.output, p.total) + ")" },
         { color: COLORS.muted, text: "Cumulative (right axis): " + fmtTokens(p.cumulative) }
-      ];
-      if (p.live) {
-        head = (cfg.tickFmt || hm)(p.t) + " \u00b7 in progress, " + p.elapsed_s + "s in";
-        if (p.live_note) rows = rows.concat([{ color: null, text: p.live_note }]);
-      }
-      fillTip(tip, head, rows);
+      ]);
       placeTip(tip, W, center(p), 8);
     }
     function hide() {
@@ -2207,28 +2192,22 @@ def minute_series(raw: dict[int, dict], since: int, until: int) -> list[dict]:
 def live_minute_point(row: dict | None, until: int, elapsed_s: int) -> dict | None:
     """The minute in progress as one extra chart point, or None before LIVE_MINUTE_MIN_ELAPSED_S or without a row.
 
-    Its token, request and 429 counts are projected to a full minute at the pace so far (value x 60 / elapsed_s).
-    ``so_far`` keeps the raw values the proxy has written for the minute. Every average, rate and fraction in
-    the summary is computed from complete minutes before this point is built, so it only feeds the charts.
+    Its values are what the proxy has written for the minute so far, not a projection: the proxy's budgets reset
+    on the calendar minute and admit queued work in a burst, so a minute carries most of its final total within
+    its first half and a linear projection overshoots. ``so_far`` repeats those values for the tooltip. Every
+    average, rate and fraction in the summary is computed from complete minutes before this point is built, so
+    it only feeds the charts.
     """
     if row is None or elapsed_s < LIVE_MINUTE_MIN_ELAPSED_S:
         return None
     point = minute_point(until, row)
     so_far = {key: point[key] for key in LIVE_PACE_KEYS}
-    pace = 60 / elapsed_s
-    for key in LIVE_PACE_KEYS:
-        point[key] = int(round(point[key] * pace))
-    point["r429_per_min"] = point["r429"]
-    point["pct_total"] = fraction(point["total"], LIMITS["total"])
-    point["pct_ds_output"] = fraction(point["ds_output"], LIMITS["output"])
-    point["pct_kimi_uncached"] = fraction(point["kimi_uncached"], LIMITS["uncached"])
-    point["pct_ds_uncached"] = fraction(point["ds_uncached"], LIMITS["uncached_ds"])
-    point["total_source"] = "projected"
+    point["total_source"] = "so_far"
     point["live"] = True
     point["elapsed_s"] = elapsed_s
     point["so_far"] = so_far
     point["live_note"] = (
-        f"this minute so far {so_far['total']:,} tokens; projected {point['total']:,}/min after {elapsed_s}s"
+        f"this minute so far: {so_far['total']:,} tokens after {elapsed_s}s; still filling"
     )
     return point
 
@@ -2904,29 +2883,6 @@ def token_mix(minutes: list[dict]) -> list[dict]:
         running += total
         mix.append({"t": point["t"], "minute": point["minute"], "total": total, **parts, "cumulative": running})
     return mix
-
-
-def live_mix_point(live_point: dict, mix: list[dict], bucket_s: int) -> dict:
-    """The minute in progress as one extra token-mix bar, at the live pace for a whole bucket.
-
-    Its cumulative total carries on from the last complete bucket, so the running line stays monotonic and
-    the range totals and axes, which are built from complete buckets, do not move with every poll.
-    """
-    factor = max(1, bucket_s // 60)
-    total = live_point["total"] * factor
-    return {
-        "t": live_point["t"],
-        "minute": live_point["minute"],
-        "total": total,
-        "cache_read": live_point["cache_read"] * factor,
-        "uncached": live_point["input"] * factor,
-        "output": live_point["output"] * factor,
-        "cumulative": (mix[-1]["cumulative"] if mix else 0) + total,
-        "live": True,
-        "elapsed_s": live_point["elapsed_s"],
-        "so_far": live_point["so_far"],
-        "live_note": live_point["live_note"],
-    }
 
 
 def token_totals(mix: list[dict]) -> dict:
@@ -3740,7 +3696,6 @@ def build_summary(
     live_point = live_minute_point(live_row, until, elapsed_s)
     if live_point is not None:
         minutes = minutes + [live_point]
-        mix = mix + [live_mix_point(live_point, mix, token_bucket)]
     range_verdicts = _guard("range_verdicts", errors, read_verdicts, {}, agentq_db, float(since), float(until))
     workers_bucketed = bucket_workers(samples, bucket)
     kpis = run_kpis(runs, since, caps)
