@@ -32,21 +32,32 @@ A source that fails shows as null or empty in the JSON and is named under
 
 ## Cadence and cost
 
-- The server computes the summary for all four ranges in a background worker
+- The server computes the summary for all four ranges on background threads
   and serves the stored JSON. Cadence: 1 h and 6 h every 5 s, 24 h every 15 s,
   7 d every 60 s. A range nobody has requested for two minutes is not
-  recomputed. The first request for a range computes it on the spot.
+  recomputed. No request waits for a compute, a reader or the proxy.
+- A request with no stored body gets a DB-only partial summary, built with
+  every SQLite wait cut to a 0.8 s budget (`partial: true`, with the cut
+  sources named under `errors`). The full compute replaces it.
+- A watchdog checks each range's data age. Past 3 times its cadence the server
+  logs once and starts a fresh compute thread for that range. The page shows the
+  age in amber past twice the cadence ("data 48 s old").
+- `SIGUSR1` dumps every thread's stack to stderr (`faulthandler`), for a stalled
+  server: `kill -USR1 <pid>` and read `logs/dash.log`.
 - The page polls `/api/summary` on the same cadence as the range it shows
   (5 s for 1 h and 6 h, 15 s for 24 h, 60 s for 7 d) and only while the tab is
   visible. Hiding the tab stops polling; showing it again refreshes at once.
   The run log refreshes every 15 s.
-- The "updated Ns ago" status counts from the summary's `generated_at`, so it
-  shows the age of the data, not of the last poll.
+- The header shows "updated HH:MM:SS ET", the time the data was computed (the
+  summary's `generated_at`). Every time on the page is US Eastern, set
+  explicitly with `America/New_York` rather than the browser's zone; the run
+  log's times stay in UTC and are labelled so.
 - The proxy status probe and the laptop memory reading run on their own threads.
   The summary carries the last value of each with its age (`source_age_s`).
-- The sampler runs one `ps -E -axo pid=,command=` call and one count query on
+- The sampler runs one `ps -axo pid=,command=` call and two count queries on
   `agentq.db` each minute, whether or not anyone has the page open. That is the
-  only standing work.
+  only standing work. Queue workers are the jobs in the `running` state, not
+  an environment count, because `ps -E` is the slow part under load.
 - The "Now" tiles (waiting, in flight, runs active, queued, and the 5 and
   15 minute activity) read the latest minutes. Every other tile follows the
   selected range and says so in its label. A minute with no proxy row counts
