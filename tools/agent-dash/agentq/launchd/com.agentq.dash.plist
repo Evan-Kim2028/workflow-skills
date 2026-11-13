@@ -26,9 +26,7 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>ProcessType</key>
-    <string>Background</string>
-    <key>Nice</key>
-    <integer>10</integer>
+    <string>Standard</string>
     <key>StandardOutPath</key>
     <string>__HOME__/.local/state/agentq/logs/dash.log</string>
     <key>StandardErrorPath</key>
