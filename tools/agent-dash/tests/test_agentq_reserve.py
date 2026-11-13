@@ -198,15 +198,34 @@ class GovernorReserveTest(unittest.TestCase):
         self.assertTrue(urgent.holds)
         self.assertEqual(self.output_level(), 180_000)
 
-    def test_normal_work_waits_when_the_reserve_cannot_pay_and_does_not_raise_the_target(self) -> None:
+    def test_normal_work_waits_when_the_reserve_cannot_pay_and_marks_the_allowance_full(self) -> None:
         self.gov.budgets["output"].reserve.empty()
         normal = self.ticket(100_000)
         self.gov.enqueue(normal)
         self.gov.pump()
         self.assertFalse(normal.holds)
         self.assertEqual(normal.last_refusal, EMPTY)
+        self.assertTrue(self.gov.budgets["output"].saturated)
+
+    def test_a_cut_reserve_target_recovers_while_backlog_waits_at_the_allowance(self) -> None:
+        output = self.gov.budgets["output"]
+        output.target = 0.6
+        output.last_429 = self.wall[0] - 3600.0
+        output.last_grow = self.wall[0] - 3600.0
+        for _ in range(30):
+            self.occupy("output", round(output.cap()))
+            self.gov.enqueue(self.ticket(5_000, lane="backlog"))
+            self.gov.pump()
+            self.wall[0] += 61.0
+            self.gov.tick()
+        self.assertEqual(output.target, 1.0)
+
+    def test_a_reserve_budget_below_its_allowance_is_not_saturated(self) -> None:
+        backlog = self.ticket(1_000, lane="backlog")
+        self.gov.enqueue(backlog)
+        self.gov.pump()
+        self.assertTrue(backlog.holds)
         self.assertFalse(self.gov.budgets["output"].saturated)
-        self.assertNotEqual(normal.last_refusal, CAPACITY)
 
     def test_the_reserve_refills_over_thirty_minutes(self) -> None:
         normal = self.ticket(100_000)
