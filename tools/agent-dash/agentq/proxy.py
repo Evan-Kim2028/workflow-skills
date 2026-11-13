@@ -1562,6 +1562,8 @@ class Governor:
         Backlog runs only on budgets that no waiting urgent or normal ticket is blocked on.
         A backlog ticket also waits once its budget is past backlog_max_frac of its target, so
         normal and urgent work keep the rest of the budget. That hold does not raise the target.
+        On a budget with a burst reserve, RESERVE and EMPTY both mean the free allowance is full,
+        so they mark the budget saturated like CAPACITY; tick() keeps its target at or below 1.0.
 
         A block caused only by the urgent share guard closes its budget for the rest of the urgent
         lane. Normal and backlog tickets still use that budget, which is what the guard intends.
@@ -1612,7 +1614,7 @@ class Governor:
                 head.last_refusal = refusal
                 if refusal in (RESERVE, EMPTY):
                     head.reserve_seen = True
-                if refusal == CAPACITY:
+                if refusal == CAPACITY or (blocker.reserve is not None and refusal in (RESERVE, EMPTY)):
                     blocker.saturated = True
                     blocker.saturated_since_tick = True
                 if refusal == RESERVE and lane == "backlog":
