@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -27,6 +28,7 @@ from agentq.proxy import (
     Entry,
     Governor,
     INFLIGHT,
+    LANE_CACHE_S,
     ARMED,
     SUSPENDED,
     UNARMED,
@@ -335,6 +337,8 @@ class LearningTest(ProxyCase):
     async def test_key_never_reaches_logs_state_or_status(self) -> None:
         self.fake.script = [{"status": 429, "body": "Limit: 60000 output tokens/minute."}]
         await self.post(self.chat(MODEL_OUT), job="job-k")
+        if self.proxy.flush_task is not None:
+            await self.proxy.flush_task
         await self.proxy.flush_state()
         _, status_text = await asyncio.to_thread(get_json, self.port, "/agentq/status")
         self.assertNotIn(KEY, json.dumps(self.logs, default=str))
@@ -2369,3 +2373,146 @@ class InflightMinuteRecordTest(unittest.TestCase):
         connection.close()
 
 
+
+
+class StalledUpstreamTest(ProxyCase):
+    """With upstream responses stalled, status still answers at once and new requests are still admitted."""
+
+    async def wait_until(self, condition, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail("condition not reached")
+            await asyncio.sleep(0.01)
+
+    async def test_status_answers_under_100_ms_while_requests_stall(self) -> None:
+        releases = [asyncio.Event() for _ in range(3)]
+        self.fake.script = [{"hold": event} for event in releases]
+        stalled = [
+            asyncio.create_task(self.post(self.chat(MODEL_OUT, stream=False), job=f"stall{k}")) for k in range(3)
+        ]
+        await self.wait_until(lambda: len(self.fake.requests) == 3)
+        try:
+            started = time.monotonic()
+            status, text = await asyncio.to_thread(get_json, self.port, "/agentq/status")
+            elapsed = time.monotonic() - started
+            self.assertEqual(status, 200)
+            self.assertLess(elapsed, 0.1)
+            self.assertEqual(json.loads(text)["upstream"]["in_flight"][MODEL_OUT], 3)
+        finally:
+            for event in releases:
+                event.set()
+            await asyncio.gather(*stalled)
+
+    async def test_a_new_request_is_admitted_while_others_stall(self) -> None:
+        releases = [asyncio.Event() for _ in range(2)]
+        self.fake.script = [{"hold": releases[0]}, {"hold": releases[1]}, {}]
+        stalled = [
+            asyncio.create_task(self.post(self.chat(MODEL_OUT, stream=False), job=f"stall{k}")) for k in range(2)
+        ]
+        await self.wait_until(lambda: len(self.fake.requests) == 2)
+        try:
+            status, _ = await asyncio.wait_for(self.post(self.chat(MODEL_OUT, stream=False), job="fresh"), 5)
+            self.assertEqual(status, 200)
+            self.assertEqual(len(self.fake.requests), 3)
+        finally:
+            for event in releases:
+                event.set()
+            await asyncio.gather(*stalled)
+
+    async def test_store_writes_run_on_the_dedicated_writer_threads(self) -> None:
+        name = await self.proxy.run_db(lambda: threading.current_thread().name)
+        self.assertTrue(name.startswith("agentq-db"))
+
+    async def test_a_flush_writes_on_the_writer_thread(self) -> None:
+        seen: list[str] = []
+        real = write_minute_rows
+
+        def recorder(path, rows):
+            seen.append(threading.current_thread().name)
+            return real(path, rows)
+
+        with mock.patch("agentq.proxy.write_minute_rows", recorder):
+            self.gov.row(MODEL_OUT)["req"] += 1
+            await self.proxy.flush()
+        self.assertTrue(seen and seen[0].startswith("agentq-db"))
+
+    async def test_a_stuck_store_write_does_not_hold_up_admission(self) -> None:
+        gate = threading.Event()
+
+        def stuck(path, rows):
+            gate.wait(5)
+
+        with mock.patch("agentq.proxy.write_minute_rows", stuck):
+            self.gov.row(MODEL_OUT)["req"] += 1
+            self.proxy.schedule_flush()
+            first = self.proxy.flush_task
+            self.proxy.schedule_flush()
+            self.assertIs(self.proxy.flush_task, first)
+            started = time.monotonic()
+            self.gov.pump()
+            self.assertLess(time.monotonic() - started, 0.1)
+            gate.set()
+            await first
+
+
+    async def test_the_maintenance_loop_keeps_admitting_while_a_store_write_is_stuck(self) -> None:
+        gate = threading.Event()
+
+        def stuck(path, rows):
+            gate.wait(5)
+
+        self.proxy.maintenance.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.proxy.maintenance
+        with mock.patch("agentq.proxy.write_minute_rows", stuck), mock.patch("agentq.proxy.FLUSH_S", 0.0):
+            self.gov.row(MODEL_OUT)["req"] += 1
+            self.gov.state_dirty = True
+            with mock.patch.object(self.gov, "pump", wraps=self.gov.pump) as pump:
+                self.proxy.maintenance = asyncio.create_task(self.proxy.maintain())
+                await asyncio.sleep(0.6)
+                try:
+                    self.assertGreaterEqual(pump.call_count, 2)
+                finally:
+                    gate.set()
+                    self.proxy.maintenance.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.proxy.maintenance
+
+
+class CachedLaneTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.now = [1000.0]
+        self.gov = Governor(Path(tmp.name), config_with(), clock=lambda: self.now[0], log=quiet)
+
+    def test_an_unseen_job_has_no_cached_lane(self) -> None:
+        self.assertIsNone(self.gov.cached_lane("job1"))
+
+    def test_a_looked_up_job_is_answered_without_the_store(self) -> None:
+        self.gov.lane_for("job1")
+        with mock.patch("agentq.proxy.read_lane", side_effect=AssertionError("store read")):
+            self.assertEqual(self.gov.cached_lane("job1"), "normal")
+
+    def test_anonymous_jobs_are_normal_without_a_lookup(self) -> None:
+        self.assertEqual(self.gov.cached_lane(""), "normal")
+
+    def test_the_cached_lane_expires_after_lane_cache_s(self) -> None:
+        self.gov.lane_for("job1")
+        self.now[0] += LANE_CACHE_S + 1
+        self.assertIsNone(self.gov.cached_lane("job1"))
+
+
+class LoopLagTest(unittest.TestCase):
+    def test_status_reports_the_latest_and_worst_lag_over_a_minute(self) -> None:
+        now = [1000.0]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        gov = Governor(Path(tmp.name), config_with(), clock=lambda: now[0], log=quiet)
+        gov.note_loop_lag(0.02)
+        gov.note_loop_lag(0.25)
+        self.assertEqual(gov.status()["loop_lag_ms"], {"last_ms": 250, "max_60s_ms": 250})
+        now[0] += 61
+        gov.note_loop_lag(0.01)
+        self.assertEqual(gov.status()["loop_lag_ms"], {"last_ms": 10, "max_60s_ms": 10})
