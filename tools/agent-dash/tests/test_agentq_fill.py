@@ -61,8 +61,9 @@ class HysteresisTests(unittest.TestCase):
         self.assertFalse(F.filling_state(False, 7_500_000, target, low, high))
 
 
-def tick(ctl, now, billed, active, *, fill=FILL, real=0, ready_real=0, queued_filler=0, gate=None, paused=False):
-    return ctl.tick(now, fill=fill, paused=paused, billed_avg=billed, active=active, ready_real=ready_real,
+def tick(ctl, now, billed, active, *, fill=FILL, filler=None, ready_real=0, queued_filler=0, gate=None, paused=False):
+    return ctl.tick(now, fill=fill, paused=paused, billed_avg=billed, active=active,
+                    filler_busy=active if filler is None else filler, ready_real=ready_real,
                     queued_filler=queued_filler, gate=gate)
 
 
@@ -88,7 +89,8 @@ def run(ctl, *, seconds, billed_fn, start_filler, real_fn=lambda t: 0, life=None
         filler = start_filler + sum(n for lt, n in launches if life is None or t - lt < life)
         real = real_fn(t)
         busy = filler + real
-        plan = tick(ctl, NOW + t, billed_fn(filler, real), busy, fill=fill, queued_filler=0, gate=gate_fn(t))
+        plan = tick(ctl, NOW + t, billed_fn(filler, real), busy, fill=fill, filler=filler, queued_filler=0,
+                    gate=gate_fn(t))
         if plan.submit:
             launches.append((t, plan.submit))
         plans.append(plan)
@@ -170,6 +172,84 @@ class ControllerTests(unittest.TestCase):
         held = [tick(ctl, NOW + 2 * i, 0.0, 0, gate="laptop gate: load 2.00 per CPU") for i in range(300)]
         self.assertTrue(all(p.submit == 0 and p.key == "gate" for p in held))
         self.assertIsNone(ctl.last_step_at)
+
+
+class LevelTests(unittest.TestCase):
+    """Refill up to the level is immediate; only growth above it is step-limited; the level follows the high mark,
+    decays after a long gate closure, and never exceeds max_workers."""
+
+    def test_fifteen_minute_filler_with_fast_morph_reaches_the_target_band(self):
+        peak, final, plans = run(F.FillController(), seconds=3 * 3600, billed_fn=lambda f, r: 175_000.0 * (f + r),
+                                 start_filler=0, life=900)
+        self.assertGreaterEqual(175_000.0 * final, 0.9 * 8_000_000)
+        self.assertLessEqual(peak, 64)
+
+    def test_zero_gain_with_fifteen_minute_filler_stays_bounded_at_max_workers(self):
+        peak, final, plans = run(F.FillController(), seconds=3 * 3600, billed_fn=lambda f, r: 0.0,
+                                 start_filler=0, life=900)
+        self.assertLessEqual(peak, 64)
+        self.assertLessEqual(final, 64)
+
+    def test_a_finished_filler_is_replaced_at_once_up_to_the_level(self):
+        ctl = F.FillController()
+        ctl.level, ctl.last_step_at = 20, NOW - 1000
+        plan = tick(ctl, NOW, 4_000_000, 10, filler=10)
+        self.assertEqual((plan.submit, plan.key), (10, "refill"))
+
+    def test_growth_above_the_level_is_step_limited(self):
+        ctl = F.FillController()
+        ctl.level, ctl.last_step_at = 20, NOW - 1000
+        self.assertEqual(tick(ctl, NOW, 4_000_000, 20, filler=20).key, "stepping")
+        self.assertEqual(tick(ctl, NOW + 60, 4_000_000, 24, filler=24).key, "step-wait")
+        self.assertEqual(tick(ctl, NOW + 121, 4_000_000, 24, filler=24).key, "stepping")
+
+    def test_a_closed_gate_submits_nothing_and_no_refill_happens(self):
+        ctl = F.FillController()
+        ctl.level, ctl.last_step_at = 20, NOW - 1000
+        plan = tick(ctl, NOW, 4_000_000, 10, filler=10, gate="Morph gate: 3 DeepSeek requests waiting at the proxy")
+        self.assertEqual((plan.submit, plan.key), (0, "gate"))
+        plan = tick(ctl, NOW + 60, 4_000_000, 10, filler=10)
+        self.assertEqual((plan.submit, plan.key), (10, "refill"))
+
+    def test_the_high_mark_sets_the_level_to_the_current_filler_count(self):
+        ctl = F.FillController()
+        ctl.level = 40
+        plan = tick(ctl, NOW, 8_000_000, 25, filler=25)
+        self.assertEqual((plan.submit, plan.key), (0, "high-mark"))
+        self.assertEqual(ctl.level, 25)
+
+    def test_a_gate_closed_for_more_than_ten_minutes_decays_the_level(self):
+        ctl = F.FillController()
+        ctl.level = 40
+        gate = "proxy status unavailable; filler held"
+        tick(ctl, NOW, 4_000_000, 12, filler=12, gate=gate)
+        tick(ctl, NOW + 300, 4_000_000, 12, filler=12, gate=gate)
+        self.assertEqual(ctl.level, 40)
+        tick(ctl, NOW + 601, 4_000_000, 12, filler=12, gate=gate)
+        self.assertEqual(ctl.level, 12)
+
+    def test_the_level_never_exceeds_max_workers(self):
+        ctl = F.FillController()
+        ctl.level = 70
+        tick(ctl, NOW, 4_000_000, 64, filler=64)
+        self.assertEqual(ctl.level, 64)
+
+
+class StateTests(unittest.TestCase):
+    """The step timer and the level survive a restart: a fresh controller loaded from the saved state keeps both."""
+
+    def test_a_fresh_controller_loaded_from_state_keeps_the_step_interval(self):
+        ctl = F.FillController()
+        self.assertEqual(tick(ctl, NOW, 0.0, 0).key, "stepping")
+        saved = json.loads(json.dumps(ctl.state()))
+        restarted = F.FillController.from_state(saved)
+        self.assertEqual(restarted.level, 4)
+        self.assertEqual(tick(restarted, NOW + 30, 0.0, 4, filler=4).key, "step-wait")
+        self.assertEqual(tick(restarted, NOW + 121, 0.0, 4, filler=4).key, "stepping")
+
+    def test_without_saved_state_a_restart_steps_at_once(self):
+        self.assertEqual(tick(F.FillController.from_state(None), NOW, 0.0, 0).key, "stepping")
+        self.assertEqual(F.FillController.from_state({"level": "x", "last_step_at": None}).level, None)
 
 
 class GateSimulationTest(unittest.TestCase):
@@ -532,6 +612,20 @@ class BrokerWiringTest(unittest.TestCase):
         job = self.filler_jobs()[0]
         self.assertEqual((job["lane"], job["kind"], job["res"], job["session"]), ("backlog", "read", "light", "backlog"))
         self.assertIn("filler alpha/pkg/a submitted", self.log_text())
+
+    def test_the_controller_state_is_saved_and_a_restarted_broker_loads_it(self):
+        self.set_billed(1_000_000)
+        self.tick(self.broker())
+        raw = Fl.state_get(self.conn, "fill_controller")
+        self.assertIsNotNone(raw)
+        self.assertEqual(json.loads(raw)["last_step_at"], NOW)
+        restarted = self.broker()
+        self.assertIsNone(restarted._controller)
+        with mock.patch.object(F, "process_table", return_value=""):
+            submitted = restarted.submit_filler(self.conn, NOW + 30, status_doc())
+        self.assertEqual(submitted, [])
+        self.assertEqual(restarted._controller.last_step_at, NOW)
+        self.assertEqual(restarted._controller.level, 4)
 
     def test_fill_disabled_submits_nothing_and_reads_no_process_table(self):
         self.write_json("broker.json", {"fill": {"enabled": False}})

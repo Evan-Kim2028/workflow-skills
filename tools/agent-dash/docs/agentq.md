@@ -96,11 +96,16 @@ instead of letting it swing between idle and burst.
   DeepSeek 5-minute billed average (`input + cache_read + output` of DeepSeek rows in
   `proxy_minutes`) is below `low_frac` (0.9) of `target_billed_per_min` (8M), the
   controller adds up to `step_workers` (4) filler workers every `step_interval_s`
-  (120 s). It adds only when every gate is open, and it stops at `high_frac` (0.97).
-  Hysteresis keeps its state between the marks. It never takes busy DeepSeek workers
-  above `max_workers` (64), and it never kills a running worker. No gain is judged and
-  no ceiling is learned: the gates keep the pool safe, and the step timer paces it.
-  A step's filler must launch before the next step starts.
+  (120 s) only while the level is not yet reached. The controller tracks a `level`,
+  the filler population it has reached. Finished filler is replaced up to `level` at
+  once while the gates are open (pacing still applies); growth above `level` is
+  limited to the step rate. Growth steps must launch before the next one. At
+  `high_frac` (0.97) the level is set to the current filler count, so nothing grows,
+  and hysteresis keeps the state between the marks. While a gate is closed nothing is
+  submitted; after 10 minutes closed the level decays to the current count. The level
+  never exceeds `max_workers` (64), and nothing is killed. No gain is judged and no
+  ceiling is learned. The level and the step timer are saved in `filler_state`, so a
+  broker restart keeps the step interval.
 - Gates, all checked each tick (`gate_reason`). Filler is held, with the reason shown
   in the Limited-by headline and the broker log, when:
   - the proxy status is missing or empty ("proxy status unavailable");
