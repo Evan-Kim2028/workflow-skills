@@ -1738,6 +1738,21 @@ class QueuedSplitChartTest(unittest.TestCase):
         self.assertNotIn("Queued jobs", block)
         self.assertIn("stroke-dasharray", html)
 
+    def test_old_format_store_still_draws_runs_across_the_whole_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            conn = sqlite3.connect(home / "dash.db")
+            conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
+                         "queue_workers INT, direct_workers INT, queued_jobs INT)")
+            conn.executemany("INSERT INTO samples VALUES (?, 3, 1, 0, 0, 2)",
+                             [(NOW - age,) for age in range(3500, 0, -60)])
+            conn.commit()
+            conn.close()
+            workers = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)["workers"]
+        self.assertEqual(len(workers), 59)
+        self.assertTrue(all(w["ds_workers"] == 3 and w["kimi_workers"] == 1 for w in workers))
+        self.assertTrue(all(w["queued_unsplit"] == 2 and w["ds_queued"] is None for w in workers))
+
     def test_summary_workers_follow_the_selected_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = make_home(Path(tmp))
