@@ -155,6 +155,7 @@ def load_config(home) -> dict:
         "auto_worktree": _auto_worktree(data.get("auto_worktree")),
         "fill": fill_lib.section(data.get("fill"), fill_lib.DEFAULT_FILL),
         "pacing": fill_lib.section(data.get("pacing"), fill_lib.DEFAULT_PACING),
+        "proxy_heal": _proxy_heal(data.get("proxy_heal")),
     }
 
 
@@ -196,6 +197,20 @@ def _laptop(override) -> dict:
             try:
                 settings[name] = float(value)
             except (TypeError, ValueError):
+                continue
+    return settings
+
+
+def _proxy_heal(override) -> dict:
+    """Hang auto-heal settings. Absent means on with defaults; ``enabled: false`` turns it off."""
+    settings = dict(DEFAULT_PROXY_HEAL)
+    if isinstance(override, dict):
+        if "enabled" in override:
+            settings["enabled"] = bool(override["enabled"])
+        for name in ("fail_s", "min_interval_s"):
+            try:
+                settings[name] = float(override[name])
+            except (KeyError, TypeError, ValueError):
                 continue
     return settings
 
@@ -368,6 +383,86 @@ def proxy_status(url: str = PROXY_STATUS_URL, timeout: float = 0.5) -> dict | No
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+PROXY_JOB = "com.agentq.proxy"
+HEAL_PROBE_S = 5.0
+DEFAULT_PROXY_HEAL = {"enabled": True, "fail_s": 90.0, "min_interval_s": 600.0}
+
+
+def launchctl(args: list[str]) -> tuple[int, str]:
+    """Run launchctl and return (exit code, stdout). A launchctl that cannot run reads as failed, never raises."""
+    try:
+        proc = subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return proc.returncode, proc.stdout
+
+
+class ProxyHealer:
+    """Restarts a proxy that has stopped answering, through launchd, when its job is loaded and running.
+
+    Each check probes the status endpoint with a HEAL_PROBE_S timeout. A probe that fails or is slower than that
+    counts as unresponsive. After ``fail_s`` seconds of continuous failure, and if the job reports a running pid,
+    it logs one line for the episode and runs ``launchctl kickstart -k``. Restarts are at least ``min_interval_s``
+    apart. A job that is not loaded, or has no pid, is never touched.
+    """
+
+    def __init__(self, settings: dict, *, probe, runner=launchctl, uid: int, now=time.time, log=lambda message: None):
+        self.enabled = bool(settings["enabled"])
+        self.fail_s = float(settings["fail_s"])
+        self.min_interval_s = float(settings["min_interval_s"])
+        self.probe = probe
+        self.runner = runner
+        self.target = f"gui/{uid}/{PROXY_JOB}"
+        self.now = now
+        self.log = log
+        self.unhealthy_since: float | None = None
+        self.announced = False
+        self.last_restart: float | None = None
+
+    @classmethod
+    def for_home(cls, home) -> "ProxyHealer":
+        return cls(
+            load_config(home)["proxy_heal"],
+            probe=lambda: proxy_status(timeout=HEAL_PROBE_S),
+            uid=os.getuid(),
+            log=lambda message: log_line(home, message),
+        )
+
+    def running_pid(self) -> int | None:
+        code, out = self.runner(["print", self.target])
+        if code != 0:
+            return None
+        found = re.search(r"^\s*pid = (\d+)", out, re.MULTILINE)
+        return int(found.group(1)) if found else None
+
+    def check(self) -> bool:
+        """One look at the proxy. Returns True when it ran a restart."""
+        if not self.enabled:
+            return False
+        now = self.now()
+        if self.probe() is not None:
+            self.unhealthy_since = None
+            self.announced = False
+            return False
+        if self.unhealthy_since is None:
+            self.unhealthy_since = now
+        down_for = now - self.unhealthy_since
+        if down_for < self.fail_s:
+            return False
+        if self.last_restart is not None and now - self.last_restart < self.min_interval_s:
+            return False
+        if self.running_pid() is None:
+            return False
+        if not self.announced:
+            self.log(f"proxy unresponsive for {int(down_for)} s; restarting")
+            self.announced = True
+        self.runner(["kickstart", "-k", self.target])
+        self.last_restart = now
+        self.unhealthy_since = None
+        self.announced = False
+        return True
 
 
 def verdict_of(text: str) -> str:
@@ -737,8 +832,9 @@ class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
     def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
-                 labeler=None, work_synchronous=False):
+                 labeler=None, work_synchronous=False, healer: ProxyHealer | None = None):
         self.home = Path(home)
+        self.healer = healer
         self.launcher = launcher or run_worker_launcher
         self.labeler = labeler or label_for
         self.now = now
@@ -769,6 +865,7 @@ class Broker:
         conn = db.connect(self.home)
         try:
             now = self.now()
+            self._heal_proxy()
             self._collect_launches(conn, now)
             self.reconcile(conn, now)
             status = self._proxy_status()
@@ -1106,6 +1203,15 @@ class Broker:
             self.log(f"filler {work.key} submitted {job_id} ({label})")
             submitted.append(job_id)
         return submitted
+
+    def _heal_proxy(self) -> None:
+        """Restart a hung proxy through the healer. A healer failure is logged and never stops the tick."""
+        if self.healer is None:
+            return
+        try:
+            self.healer.check()
+        except Exception as exc:
+            self.log(f"proxy heal failed: {exc!r}")
 
     def _proxy_status(self) -> dict | None:
         """The proxy status for this tick (None when down). Logs each change of its saturated flag."""

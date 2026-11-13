@@ -226,6 +226,21 @@ The template `agentq/launchd/com.agentq.proxy.plist` has `__PYTHON__` and
 `__HOME__` placeholders. Install it by substituting them and copying it to
 `~/Library/LaunchAgents/`, then reload the agent (see the commands in the PR). Nothing is installed by this change.
 
+## Hang auto-heal
+
+The broker probes `GET /agentq/status` on every tick, with a 5 s limit. If the probe
+fails, or takes longer than 5 s, for `proxy_heal.fail_s` (90 s) without a break, and the
+launchd job `com.agentq.proxy` reports a running pid, the broker logs
+`proxy unresponsive for N s; restarting` once and runs
+`launchctl kickstart -k gui/<uid>/com.agentq.proxy`. Restarts are at least
+`min_interval_s` (600 s) apart, and after each restart the proxy must fail for another
+`fail_s` before the next one. A job that is not loaded, or has no pid, is never touched.
+Settings live in `broker.json` under `proxy_heal`: `{"enabled": true, "fail_s": 90,
+"min_interval_s": 600}`. Only the daemon started by `agentq.cli daemon` runs the healer.
+
+The launch agent restarts quickly after a crash: `ThrottleInterval` is 5 s and the job
+runs at `Interactive` priority.
+
 ## Failure handling
 
 Every path after admission settles or releases the ticket's charge: a 200 that
