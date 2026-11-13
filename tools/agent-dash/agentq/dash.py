@@ -54,6 +54,8 @@ ROOM_BOUND_LABELS = {
     "total": "bounded by Morph total",
     "uncached_ds": "bounded by Morph uncached input",
 }
+HEADLINE_AVERAGE_BUDGETS = ("total",)
+HEADLINE_429_BUDGETS = ("total", "uncached_ds")
 VERDICT_CHIPS = {
     "morph_limit": "Morph limit",
     "morph_slow": "Morph slow",
@@ -415,7 +417,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The dashed line is that limit; carets mark values above the 120% axis top, and the tooltip shows the true value.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute; the bold line is the trailing 5-minute average of those minutes (the mean of that minute and the four before it). The dashed line is the limit; carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -876,7 +878,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
           d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + Yc(v).toFixed(1);
           lastPoint = p;
         });
-        if (d) svgEl("path", { d: d.trim(), fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+        if (d) svgEl("path", {
+          d: d.trim(), fill: "none", stroke: s.color, "stroke-width": s.width || 2,
+          "stroke-opacity": s.opacity === undefined ? 1 : s.opacity, "stroke-linejoin": "round", "stroke-linecap": "round"
+        }, svg);
         if (cfg.y.clip !== undefined) {
           points.forEach(function (p) {
             if (p[s.key] > cfg.y.clip) {
@@ -1184,7 +1189,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: minutes,
-      series: [{ key: "pct_total", name: "Total pool, % of 10M/min", color: COLORS.s1 }],
+      series: [
+        { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 },
+        { key: "pct_total_avg5", name: "5-min average", color: COLORS.s2, width: 2.5 }
+      ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
       refs: [{ v: 1, label: "Morph limit (10M/min)" }],
       fmt: pctFmt
@@ -1219,7 +1227,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("h-tokens", "Tokens billed per " + tunit);
     setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
-      { name: "Total pool, % of 10M/min", color: COLORS.s1 }
+      { name: "Per minute", color: COLORS.s1 },
+      { name: "5-min average", color: COLORS.s2 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
@@ -2064,6 +2073,19 @@ def apply_admitted_totals(points: list[dict], admitted: dict[int, int]) -> None:
             point["total_source"] = "completed"
 
 
+def add_trailing_average(points: list[dict], source: str, target: str, window: int) -> None:
+    """Set ``target`` on each point to the mean of ``source`` over it and the window - 1 minutes before it.
+
+    Points are consecutive minutes (``minute_series`` fills gaps with zero), so a window is a time window.
+    The first window - 1 points have no full window and get None, which the chart draws as a gap.
+    """
+    for i, point in enumerate(points):
+        if i < window - 1:
+            point[target] = None
+        else:
+            point[target] = round(sum(p[source] for p in points[i - window + 1:i + 1]) / window, 4)
+
+
 def bucket_minutes(points: list[dict], size: int) -> list[dict]:
     """Minute points grouped into buckets of ``size`` seconds.
 
@@ -2089,6 +2111,8 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
         bucket["upstream_p95_ms"] = max(upstream_p95s) if upstream_p95s else None
         for key in PCT_KEYS:
             bucket[key] = round(sum(m[key] for m in members) / len(members), 4)
+        averaged = [m["pct_total_avg5"] for m in members if m.get("pct_total_avg5") is not None]
+        bucket["pct_total_avg5"] = round(sum(averaged) / len(averaged), 4) if averaged else None
         buckets.append(bucket)
     return buckets
 
@@ -2760,15 +2784,17 @@ def verdict(
     ds_holds: list[str] | None = None,
     ssh_in_use: int | None = None,
 ) -> dict:
-    """What limits the pool, from the last 5 complete minutes. The first matching rule wins:
+    """What limits the DeepSeek pool, from the last 5 complete minutes. The first matching rule wins:
     Morph limit, Morph slow, Laptop, Near capacity, Proxy pacing, Launching, Headroom.
 
     Launching names the broker's hold reason when ready DeepSeek jobs carry one (``ds_holds``, the queued
     jobs' detail strings), and says the broker is starting them otherwise.
 
-    An enforced budget counts as hit when its 5-minute average reached AVERAGE_SATURATION_FRAC of its limit,
-    or when upstream 429s named it in MORPH_429_MINUTES of the 5 minutes. The peak minute is context only: it
-    never decides the verdict. Kimi uncached counts only while Kimi jobs wait.
+    Only Morph's own budgets can make the Morph limit verdict. The total pool counts when its 5-minute average
+    reached AVERAGE_SATURATION_FRAC of its limit, or when upstream 429s named it in MORPH_429_MINUTES of the 5
+    minutes. DeepSeek uncached input is our estimate of Morph's count, so it counts only on 429s naming it.
+    The peak minute is context only: it never decides the verdict. Kimi never decides the headline: its
+    budget is not checked here, and waiting Kimi reviews add only the secondary line.
 
     Waiting work in the headline is DeepSeek only: requests queued at the proxy and DeepSeek jobs ready in
     agentq. Kimi waits never change the headline; they add a secondary line instead.
@@ -2778,15 +2804,15 @@ def verdict(
     ds_waiting = sum(waiting.values()) if waiting is not None else None
     kimi_waiting = kimi_jobs_waiting > 0
     hits = []
-    for name in ("total", "uncached_ds", "uncached"):
-        if name == "uncached" and not kimi_waiting:
-            continue
+    for name in dict.fromkeys(HEADLINE_AVERAGE_BUDGETS + HEADLINE_429_BUDGETS):
         field = BUDGET_FIELDS[name]
         average = sum(int((raw.get(t) or {}).get(field) or 0) for t in five) / LIMIT_WINDOW_MINUTES / limits[name]
         peak = max(int((raw.get(t) or {}).get(field) or 0) for t in five) / limits[name]
         minutes_429 = sum(1 for t in five if t in budget_429s.get(name, set()))
-        if average >= AVERAGE_SATURATION_FRAC or minutes_429 >= MORPH_429_MINUTES:
-            hits.append((name, average, peak, minutes_429))
+        by_average = name in HEADLINE_AVERAGE_BUDGETS and average >= AVERAGE_SATURATION_FRAC
+        by_429 = name in HEADLINE_429_BUDGETS and minutes_429 >= MORPH_429_MINUTES
+        if by_average or by_429:
+            hits.append((name, average, peak, minutes_429, by_average))
     pool = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES / limits["total"]
     load = laptop.get("load_per_cpu")
     free = laptop.get("memory_free_pct")
@@ -2798,10 +2824,10 @@ def verdict(
             f"(Kimi's own {limits['uncached']:,}/min uncached limit)."
         )
     if hits:
-        name, average, peak, minutes_429 = hits[0]
+        name, average, peak, minutes_429, by_average = hits[0]
         label = LIMIT_LABELS[name]
         context = f"peak minute {peak * 100:.0f}%"
-        if average >= AVERAGE_SATURATION_FRAC:
+        if by_average:
             detail = f"{label} averaged {average * 100:.0f}% of its limit over the last 5 minutes ({context})"
         else:
             detail = f"{label} returned 429s in {minutes_429} of the last 5 minutes ({context})"
@@ -2910,7 +2936,7 @@ def build_summary(
     limits = {
         name: {
             "label": LIMIT_LABELS[name],
-            "limit": resolved[name],
+            "limit": LIMITS[name],
             "last_min_frac": last_minute_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "avg_5m_frac": average_fraction(raw, until, LIMIT_KEYS[name], LIMITS[name]),
             "target_frac": targets[name],
@@ -2920,6 +2946,7 @@ def build_summary(
     runs = shape_runs(run_rows, now)
     minute_points = minute_series(raw, since, until)
     apply_admitted_totals(minute_points, admitted)
+    add_trailing_average(minute_points, "pct_total", "pct_total_avg5", LIMIT_WINDOW_MINUTES)
     minutes = bucket_minutes(minute_points, bucket)
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
