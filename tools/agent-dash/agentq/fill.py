@@ -132,9 +132,10 @@ def proxy_available(status: dict | None) -> bool:
 def inflight_gate(status: dict) -> str | None:
     """Hold filler while DeepSeek is at the in-flight limit and the limit is below its maximum.
 
-    When the limit is enforced, the test is requests held by it. In shadow or the A/B off arm nothing
-    is held, so the test is requests in flight at or above the limit the proxy would enforce, and the
-    reason says so. A limit at its maximum never holds filler here: the budgets decide that.
+    Only an enforced limit holds filler: the test is requests held by it. In shadow or the A/B off arm the
+    limit is advisory and holds nothing; the 2026-11-13 A/B (enforce 5.99M billed/min vs off 7.43M at
+    -0.3 s first byte) showed the advisory limit is too conservative to gate on. A limit at its maximum
+    never holds filler here: the budgets decide that.
     """
     limit = status.get("inflight_limit")
     maximum = status.get("inflight_max")
@@ -145,9 +146,6 @@ def inflight_gate(status: dict) -> str | None:
         if isinstance(held, int) and held > 0:
             return f"Morph slow: in-flight limit {limit} reached"
         return None
-    in_flight = status.get("inflight_in_flight")
-    if isinstance(in_flight, int) and in_flight >= limit:
-        return f"Morph slow: in-flight limit {limit} reached (shadow: would limit to {limit})"
     return None
 
 
