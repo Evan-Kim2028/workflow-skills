@@ -771,8 +771,12 @@ class InflightFillGateTest(unittest.TestCase):
     def test_no_limit_means_no_gate(self) -> None:
         self.assertIsNone(F.inflight_gate(self.status(inflight_limit=None)))
 
-    def test_gate_reason_reports_the_limit_before_the_budget_gate(self) -> None:
+    def test_gate_reason_reports_the_limit_after_the_429_check(self) -> None:
         calm = H.Headroom(free_pct=60.0, cpu_busy=0.3, swap_frac=0.1, load_per_cpu=0.1)
         laptop_cfg = {"fill_max_cpu_busy": 0.9, "fill_min_free_pct": 10.0, "fill_max_swap_frac": 0.9}
-        reason = F.gate_reason(self.status(inflight_queued=2), 0, calm, laptop_cfg, F.DEFAULT_FILL)
-        self.assertEqual(reason, "Morph slow: in-flight limit 28 reached")
+        status = self.status(inflight_queued=2, budgets={"total": {"blocked_by_family": {}, "queued": {}}})
+        self.assertEqual(F.gate_reason(status, 0, calm, laptop_cfg, F.DEFAULT_FILL), "Morph slow: in-flight limit 28 reached")
+        self.assertEqual(
+            F.gate_reason(status, 3, calm, laptop_cfg, F.DEFAULT_FILL),
+            "Morph gate: 3 DeepSeek 429s in the last 120 s",
+        )
