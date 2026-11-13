@@ -92,36 +92,26 @@ the same units.
 Two controls in the broker keep the DeepSeek pool near Morph's total-token limit
 instead of letting it swing between idle and burst.
 
-- Fill (`broker.json` `fill`, off by default; `"enabled": true` turns it on). The
-  controller judges only probes. A probe is a submission that takes busy DeepSeek
-  workers above the highest count reached since the ceiling was set, or above the
-  ceiling. Each probe is judged `step_interval_s` (300 s) later, by the billed gain per
-  worker it actually started, against the long-run per-worker rate (median over
-  `rate_window_s`, 1800 s, of samples taken before the probe). A gain counts as good
-  only if it is positive and at least `min_marginal_frac` (0.5) of that rate. The gain
-  is attributed to the filler the probe started, never to total busy workers. If real
-  DeepSeek work changes during the probe, or the probe's filler falls short, the window
-  is extended once; a probe still unclean after that is judged poor, never good. A poor
-  probe records a ceiling of max(the count before the probe, the current ceiling),
-  never below the real (non-filler) DeepSeek count, for `ceiling_ttl_s` (1800 s). The
-  ceiling survives a broker restart. Refills at or below the peak are plain launches:
-  they are not judged and never change the ceiling. After a ceiling expires the
-  controller may probe one step past it, and no further. While the long-run rate is
-  unknown (fewer than `rate_min_samples` samples, so no busy workers yet) or below
-  `rate_min` (10k), the controller holds, with one exception. With no busy DeepSeek
-  worker at all, it takes one bootstrap step of `step_workers` (4), judged against the
-  prior `bootstrap_rate` (150k per worker). Zero gain sets a ceiling at the real-job
-  count for `ceiling_ttl_s`, and no retry comes before that expires and the pool has
-  drained, so poor bootstraps cannot pile up idle workers. Good gain hands over to
-  measured probes once samples exist. It
-  adds at most `step_workers` (4) per probe, and `max_workers` (64) caps everything.
-  Above `high_frac` (0.97) of `target_billed_per_min` (8M) it stops, and it never kills
-  a running worker. Filler is held with the reason "proxy status unavailable" when the
-  proxy's status is missing or empty. Filler waits while real DeepSeek work is ready,
-  while the proxy holds
-  a DeepSeek request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and
-  while the laptop is past the filler bars in `laptop`: CPU busy at or above `fill_max_cpu_busy`
-  (0.75), memory free under `fill_min_free_pct` (20), or swap used at or above `fill_max_swap_frac` (0.85).
+- Fill (`broker.json` `fill`, off by default; `"enabled": true` turns it on). While the
+  DeepSeek 5-minute billed average (`input + cache_read + output` of DeepSeek rows in
+  `proxy_minutes`) is below `low_frac` (0.9) of `target_billed_per_min` (8M), the
+  controller adds up to `step_workers` (4) filler workers every `step_interval_s`
+  (120 s). It adds only when every gate is open, and it stops at `high_frac` (0.97).
+  Hysteresis keeps its state between the marks. It never takes busy DeepSeek workers
+  above `max_workers` (64), and it never kills a running worker. No gain is judged and
+  no ceiling is learned: the gates keep the pool safe, and the step timer paces it.
+  A step's filler must launch before the next step starts.
+- Gates, all checked each tick (`gate_reason`). Filler is held, with the reason shown
+  in the Limited-by headline and the broker log, when:
+  - the proxy status is missing or empty ("proxy status unavailable");
+  - DeepSeek requests are blocked at the proxy;
+  - a DeepSeek 429 came in the last `gate_429_window_s` (120 s);
+  - the in-flight limit is binding ("Morph slow: in-flight limit N reached"; the
+    shadow mode says so). A limit at its maximum never holds filler here;
+  - the laptop is past the filler bars: CPU busy over `fill_max_cpu_busy`, memory free
+    under `fill_min_free_pct`, or swap used over `fill_max_swap_frac` (`broker.json`
+    `laptop`).
+  Real DeepSeek work that is ready always goes first.
 - Filler jobs are read-only audits (kind `read`, resource `light`, lane `backlog`).
   The targets come from the `"filler"` key of `$AGENTQ_HOME/backlog-seed.json`:
   `report_dir`, an optional `max_runtime` (default `15m`), and `repos`, each with a
