@@ -312,6 +312,14 @@ class FillPlan:
 
 
 GATE_DECAY_S = 600.0
+GATE_KEY_CHARS = 60
+GATE_KEY_DROP = str.maketrans("", "", "0123456789,.")
+
+
+def gate_key(reason: str) -> str:
+    """The plan key for a closed gate: its cause with the changing numbers removed, so a gate whose counts move is
+    logged once and a different cause is logged again. Two reasons that differ only in their numbers share a key."""
+    return "gate:" + reason.translate(GATE_KEY_DROP)[:GATE_KEY_CHARS]
 
 
 class FillController:
@@ -380,7 +388,7 @@ class FillController:
                 self.gate_since = now
             if now - self.gate_since >= GATE_DECAY_S:
                 self.level = min(population, max_workers)
-            return FillPlan(True, 0, f"{gate}; level {self.level} held", "gate")
+            return FillPlan(True, 0, f"{gate}; level {self.level} held", gate_key(gate))
         self.gate_since = None
         room = max_workers - active - queued_filler
         if room <= 0:

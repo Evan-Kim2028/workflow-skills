@@ -107,10 +107,48 @@ class MinuteGateTests(unittest.TestCase):
         reason = F.gate_reason(self.status(output=69_000), 0, None, LAPTOP, FILL)
         self.assertIn("output budget", reason)
         plan = tick(F.FillController(), NOW, 1e6, 10, gate=reason)
-        self.assertEqual((plan.submit, plan.key), (0, "gate"))
+        self.assertEqual(plan.submit, 0)
+        self.assertTrue(plan.key.startswith("gate"), plan.key)
 
     def test_a_deepseek_429_still_holds_when_the_output_budget_is_clear(self):
         self.assertIn("429", F.gate_reason(self.status(output=1_000), 1, None, LAPTOP, FILL))
+
+
+class GateKeyTests(unittest.TestCase):
+    """A closed gate's key names its cause without its changing numbers, so a moving count is not logged as a new
+    reason while a different cause still is."""
+
+    def reserve_status(self, level):
+        return {"budgets": {"output": {"used_60s": 1_000, "free": 68_600, "limit": 70_000, "target_frac": 0.98,
+                                       "reserve": {"level": level, "capacity": 210_000}}}}
+
+    def allowance_status(self, used):
+        return {"budgets": {"output": {"used_60s": used, "free": 68_600, "limit": 70_000, "target_frac": 0.98}}}
+
+    def test_a_gate_whose_numbers_change_keeps_one_key(self):
+        first = F.gate_reason(status_doc(blocked=7), 0, None, LAPTOP, FILL)
+        second = F.gate_reason(status_doc(blocked=42), 0, None, LAPTOP, FILL)
+        self.assertNotEqual(first, second)
+        self.assertEqual(F.gate_key(first), F.gate_key(second))
+        self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, gate=first).key,
+                         tick(F.FillController(), NOW, 1e6, 10, gate=second).key)
+        self.assertFalse(any(ch.isdigit() for ch in F.gate_key(first)), F.gate_key(first))
+        self.assertIn("requests waiting", F.gate_key(first))
+
+    def test_a_reserve_gate_whose_numbers_change_keeps_one_key(self):
+        first = F.gate_reason(self.reserve_status(16_408), 0, None, LAPTOP, FILL)
+        second = F.gate_reason(self.reserve_status(9_120), 0, None, LAPTOP, FILL)
+        self.assertIn("reserve", first)
+        self.assertNotEqual(first, second)
+        self.assertEqual(F.gate_key(first), F.gate_key(second))
+
+    def test_requests_waiting_and_the_reserve_floor_give_different_keys(self):
+        waiting = F.gate_reason(status_doc(blocked=7), 0, None, LAPTOP, FILL)
+        reserve = F.gate_reason(self.reserve_status(16_408), 0, None, LAPTOP, FILL)
+        allowance = F.gate_reason(self.allowance_status(69_000), 0, None, LAPTOP, FILL)
+        keys = {F.gate_key(waiting), F.gate_key(reserve), F.gate_key(allowance)}
+        self.assertEqual(len(keys), 3, keys)
+        self.assertTrue(all(key.startswith("gate:") for key in keys), keys)
 
 
 def total_status(used_ds, seconds_to_reset, used_other=0, window_mode="calendar"):
@@ -335,7 +373,8 @@ class ControllerTests(unittest.TestCase):
 
     def test_any_gate_holds_filler_with_its_reason(self):
         plan = tick(F.FillController(), NOW, 1e6, 10, gate="Morph slow: in-flight limit 20 reached")
-        self.assertEqual((plan.submit, plan.key), (0, "gate"))
+        self.assertEqual(plan.submit, 0)
+        self.assertTrue(plan.key.startswith("gate"), plan.key)
         self.assertIn("in-flight limit 20", plan.reason)
 
     def test_max_workers_is_never_exceeded(self):
@@ -354,7 +393,7 @@ class ControllerTests(unittest.TestCase):
     def test_a_held_gate_never_grows_the_pool(self):
         ctl = F.FillController()
         held = [tick(ctl, NOW + 2 * i, 0.0, 0, gate="laptop gate: load 2.00 per CPU") for i in range(300)]
-        self.assertTrue(all(p.submit == 0 and p.key == "gate" for p in held))
+        self.assertTrue(all(p.submit == 0 and p.key.startswith("gate") for p in held))
         self.assertIsNone(ctl.last_step_at)
 
 
@@ -391,7 +430,8 @@ class LevelTests(unittest.TestCase):
         ctl = F.FillController()
         ctl.level, ctl.last_step_at = 20, NOW - 1000
         plan = tick(ctl, NOW, 4_000_000, 10, filler=10, gate="Morph gate: 3 DeepSeek requests waiting at the proxy")
-        self.assertEqual((plan.submit, plan.key), (0, "gate"))
+        self.assertEqual(plan.submit, 0)
+        self.assertTrue(plan.key.startswith("gate"), plan.key)
         plan = tick(ctl, NOW + 60, 4_000_000, 10, filler=10)
         self.assertEqual((plan.submit, plan.key), (10, "refill"))
 
@@ -451,7 +491,7 @@ class GateSimulationTest(unittest.TestCase):
         billed = lambda f, r: 120_000.0 * (f + r)  # noqa: E731
         plans_held = run(F.FillController(), seconds=3600, billed_fn=billed, start_filler=0,
                          gate_fn=self.closed_between(0, 3600, reason))[2]
-        self.assertTrue(all(p.submit == 0 and p.key == "gate" for p in plans_held))
+        self.assertTrue(all(p.submit == 0 and p.key.startswith("gate") for p in plans_held))
         peak, final, plans = run(F.FillController(), seconds=3 * 3600, billed_fn=billed, start_filler=0,
                                  gate_fn=self.closed_between(0, 1800, reason))
         self.assertEqual(sum(p.submit for p in plans[:900]), 0)
