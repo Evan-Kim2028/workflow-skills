@@ -25,6 +25,10 @@ worker, name it in your report; the lead submits it.
 - Long jobs: never babysit. Start anything that runs longer than a few
   minutes detached (`nohup` or `systemd-run --user`), write a status file,
   and return the PID, log path and status path. Do not sleep-poll.
+- Ad hoc analysis scripts (your own `python3 -`, loops over files) finish
+  in under 2 minutes: prefix them with `timeout 120`. For "is X used
+  anywhere" use `codegraph callers <symbol>` or one `rg -w` per name, never
+  a script that regex-scans every file for every definition.
 - Worktrees: create new worktrees at `~/Documents/worktrees/<repo>/<task>`
   with `workspace-manager new --repo <repo> --task <task>` (dry run; add
   `--apply` to create). Keep existing active worktrees where they are. Before
