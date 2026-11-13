@@ -1560,12 +1560,12 @@ class RejectionAndPerMinuteValuesTest(unittest.TestCase):
 class FillerHeadlineTest(unittest.TestCase):
     FILL = {"enabled": True, "target_billed_per_min": 8_000_000, "low_frac": 0.9}
 
-    def headline(self, total, filler_running, fill=FILL, ds_jobs_ready=0, ds_waiting=None):
+    def headline(self, ds_total, filler_running, fill=FILL, ds_jobs_ready=0, ds_waiting=None, kimi_total=0):
         live = IDLE_LIVE if ds_waiting is None else live_queued(ds_waiting)
         return dash.verdict(
-            five_minutes(total=total), UNTIL, LIMITS_NOW, live, kimi_jobs_waiting=0, budget_429s={},
-            laptop=CALM, ds_jobs_ready=ds_jobs_ready, ds_p50_5m_ms=None, ds_p50_base_ms=None,
-            filler_running=filler_running, fill=fill,
+            five_minutes(total=ds_total + kimi_total, ds_total=ds_total), UNTIL, LIMITS_NOW, live,
+            kimi_jobs_waiting=0, budget_429s={}, laptop=CALM, ds_jobs_ready=ds_jobs_ready,
+            ds_p50_5m_ms=None, ds_p50_base_ms=None, filler_running=filler_running, fill=fill,
         )
 
     def test_near_target_with_filler_running_says_holding_near_target(self) -> None:
@@ -1579,6 +1579,9 @@ class FillerHeadlineTest(unittest.TestCase):
 
     def test_below_the_low_mark_is_not_held_by_fill(self) -> None:
         self.assertEqual(self.headline(5_000_000, 3)["key"], "headroom")
+
+    def test_kimi_traffic_does_not_make_deepseek_look_near_target(self) -> None:
+        self.assertEqual(self.headline(5_000_000, 3, kimi_total=2_500_000)["key"], "headroom")
 
     def test_fill_disabled_never_claims_the_headline(self) -> None:
         self.assertEqual(self.headline(7_800_000, 3, fill=dict(self.FILL, enabled=False))["key"], "headroom")

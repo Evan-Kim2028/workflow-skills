@@ -53,7 +53,6 @@ import sys
 import time
 import urllib.request
 import uuid
-from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 
@@ -98,7 +97,6 @@ VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGN
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
-PACING_WINDOW_S = 60.0
 MEASURE_REFRESH_S = 600.0
 PROCESS_REFRESH_S = 30.0
 OPEN = db.OPEN_STATES
@@ -763,10 +761,8 @@ class Broker:
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
         self._plans: dict[str, tuple[Path, Path] | None] = {}
         self._backlog_retry: dict[str, float] = {}
-        self._filling = False
+        self._controller: fill_lib.FillController | None = None
         self._fill_key: str | None = None
-        self._active_samples: deque = deque()
-        self._ds_launch_times: deque = deque()
         self._ps: tuple[float, str | None] | None = None
         self._measured: tuple[float, int | None] | None = None
         self._filler_cache: tuple[float, tuple] | None = None
@@ -820,7 +816,7 @@ class Broker:
         cfg = load_config(self.home)
         adaptive = cfg["adaptive"]
         on = adaptive["enabled"]
-        pace = self._pacing_gate(conn, now, cfg["pacing"])
+        pace = self._pacing_gate(conn, now, cfg["pacing"], status)
         filler_paused = filler_lib.paused(conn)
         running = db.select_jobs(conn, "state = 'running'")
         ready = [
@@ -900,8 +896,6 @@ class Broker:
                 urgent_running += 1
             if self._launch(conn, job, now):
                 launched.append(job["id"])
-                if job["tier"] == fill_lib.DS_TIER:
-                    self._ds_launch_times.append(now)
                 if paced:
                     self._spend_pacing(pace)
             self._holds.pop(job["id"], None)
@@ -994,23 +988,22 @@ class Broker:
         self.log(f"backlog {name} submitted {job_id} ({label})")
         return job_id
 
-    def _pacing_gate(self, conn, now: float, pacing: dict) -> dict | None:
-        """This tick's DeepSeek launch allowance, or None when pacing is off or the store has no proxy data.
+    def _pacing_gate(self, conn, now: float, pacing: dict, status: dict | None) -> dict | None:
+        """This tick's DeepSeek launch allowance, or None when pacing is off.
 
-        ``left`` counts launches allowed now; ``urgent_free`` lets one urgent DeepSeek job launch per tick
-        even with nothing left; ``hold`` is the (key, text) a paced job waits under.
+        The current Morph minute's uncached input comes from the live proxy status (the store when the
+        proxy is down), and each DeepSeek launch whose first request is not yet recorded adds its
+        first-request cost. ``left`` counts launches allowed now; ``urgent_free`` lets one urgent DeepSeek
+        job launch per tick even with nothing left; ``hold`` is the (key, text) a paced job waits under.
         """
         if not pacing["enabled"]:
             return None
-        try:
-            last_input = fill_lib.last_minute_input(conn, now)
-        except sqlite3.OperationalError:
-            return None
-        recent = self._recent_ds_launches(now)
-        left, cost = fill_lib.pacing_allowance(last_input, recent, pacing, self._measured_cost(conn, now, pacing))
+        current, source = fill_lib.current_uncached(status, conn, now)
+        pending = fill_lib.pending_launches(conn, now, pacing["first_request_grace_s"])
+        left, cost = fill_lib.pacing_allowance(current, pending, pacing, self._measured_cost(conn, now, pacing))
         cap = pacing["uncached_frac"] * pacing["uncached_limit"]
-        text = (f"proxy uncached pacing: last minute {last_input:,} uncached, {recent} recent launch(es) "
-                f"at {cost:,} each, cap {cap:,.0f}")
+        text = (f"proxy uncached pacing: {current:,} uncached this minute ({source}), {pending} pending "
+                f"launch(es) at {cost:,} each, cap {cap:,.0f}")
         return {"left": left, "cost": cost, "urgent_free": True, "hold": ("proxy uncached pacing", text)}
 
     def _spend_pacing(self, pace: dict) -> None:
@@ -1019,11 +1012,6 @@ class Broker:
             pace["left"] -= 1
         else:
             pace["urgent_free"] = False
-
-    def _recent_ds_launches(self, now: float) -> int:
-        while self._ds_launch_times and self._ds_launch_times[0] < now - PACING_WINDOW_S:
-            self._ds_launch_times.popleft()
-        return len(self._ds_launch_times)
 
     def _measured_cost(self, conn, now: float, pacing: dict) -> int | None:
         """The measured first-request cost, refreshed every MEASURE_REFRESH_S. None when off or unmeasured."""
@@ -1070,27 +1058,40 @@ class Broker:
             self._fill_key = plan.key
             self.log(f"fill: {plan.reason}")
 
-    def submit_filler(self, conn, now: float, status: dict | None) -> list[str]:
-        """Submit the filler jobs the fill controller asks for this tick. Returns the new job ids.
+    def _load_ceiling(self, conn) -> tuple[int, float] | None:
+        """The learned ceiling saved by an earlier broker, or None. Survives restarts; expiry is checked by the controller."""
+        raw = filler_lib.state_get(conn, "ceiling")
+        try:
+            data = json.loads(raw) if raw else None
+            return (int(data["workers"]), float(data["at"])) if data else None
+        except (ValueError, KeyError, TypeError):
+            return None
 
-        Filler is submitted only while the controller is filling and the gates hold (see
-        ``fill.plan_fill``). Nothing is read from git or the process table while fill is disabled.
+    def submit_filler(self, conn, now: float, status: dict | None) -> list[str]:
+        """Run the fill controller for this tick and submit the filler jobs it asks for. Returns the new job ids.
+
+        With fill disabled, nothing is read from the process table, git or the store's DeepSeek history.
         """
         cfg = load_config(self.home)
         fill_cfg, pacing = cfg["fill"], cfg["pacing"]
-        if not fill_cfg["enabled"]:
-            self._filling = False
-            self._log_fill(fill_lib.FillPlan(False, 0, "fill disabled", "disabled"))
-            return []
+        if self._controller is None:
+            self._controller = fill_lib.FillController(ceiling=self._load_ceiling(conn))
+        enabled = fill_cfg["enabled"]
+        ps_text = self._process_table(now) if enabled else None
+        laptop = self.gauges.read(cfg["adaptive"]["gauge_ttl_s"]) if enabled else (None, None)
         decision = fill_lib.decide(
-            conn, now, fill=fill_cfg, pacing=pacing, status=status,
-            ps_text=self._process_table(now), laptop=self.gauges.read(cfg["adaptive"]["gauge_ttl_s"]),
-            was_filling=self._filling, samples=self._active_samples,
-            recent_launches=self._recent_ds_launches(now),
-            measured=self._measured_cost(conn, now, pacing),
-            paused=filler_lib.paused(conn),
+            conn, now, controller=self._controller, fill=fill_cfg, pacing=pacing, status=status,
+            ps_text=ps_text, laptop=laptop,
+            paused=filler_lib.paused(conn), measured=self._measured_cost(conn, now, pacing),
         )
-        self._filling = decision.plan.filling
+        controller = self._controller
+        if controller.new_ceiling is not None:
+            workers, at = controller.new_ceiling
+            filler_lib.state_set(conn, "ceiling", json.dumps({"workers": workers, "at": at}))
+            controller.new_ceiling = None
+        if controller.judgement is not None:
+            self.log(f"fill: {controller.judgement}")
+            controller.judgement = None
         self._log_fill(decision.plan)
         if decision.plan.submit <= 0 or now < self._filler_retry:
             return []

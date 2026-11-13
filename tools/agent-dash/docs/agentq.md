@@ -93,17 +93,21 @@ Two controls in the broker keep the DeepSeek pool near Morph's total-token limit
 instead of letting it swing between idle and burst.
 
 - Fill (`broker.json` `fill`, off by default; `"enabled": true` turns it on). The
-  controller reads the last five complete minutes of DeepSeek billed tokens
-  (`input + cache_read + output` in `proxy_minutes`) and the number of busy
-  DeepSeek workers. Per-worker rate is the billed average over the active average,
-  clamped to `rate_min`..`rate_max` (100k to 250k), and `default_rate` (175k)
-  applies with no history. Desired workers are `ceil(target / rate)`, capped at
-  `max_workers` (64). Below `low_frac` (0.9) of `target_billed_per_min` (8M) the
-  controller submits filler jobs, at most `max_launch_per_tick` (4) per tick, to close
-  the gap; it stops above `high_frac` (0.97). Hysteresis keeps its state between.
-  Filler waits while real DeepSeek work is ready, while the proxy holds a DeepSeek
-  request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and while the
-  laptop is short of memory (`laptop_min_free_pct`, 20) or load (`laptop_max_load_per_cpu`, 1.0).
+  controller adds filler workers in steps: at most `step_workers` (4) every
+  `step_interval_s` (300 s), while the DeepSeek billed 5-minute average
+  (`input + cache_read + output` of DeepSeek rows in `proxy_minutes`) is below
+  `low_frac` (0.9) of `target_billed_per_min` (8M). It stops above `high_frac` (0.97),
+  and never kills a running worker. Each step is judged `step_interval_s` later by the
+  billed gain per worker it actually started, against the long-run per-worker rate
+  (median over `rate_window_s`, 1800 s, of samples taken before the step; `default_rate`
+  175k with too few samples). A gain below `min_marginal_frac` (0.5) of that rate
+  records a ceiling at the step's starting count for `ceiling_ttl_s` (1800 s). The
+  ceiling survives a broker restart. After it expires the controller may probe one
+  step past it, and a poor probe keeps the old ceiling. `max_workers` (64) caps
+  everything. Filler waits while real DeepSeek work is ready, while the proxy holds a
+  DeepSeek request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and
+  while the laptop is short of memory (`laptop_min_free_pct`, 20) or load
+  (`laptop_max_load_per_cpu`, 1.0).
 - Filler jobs are read-only audits (kind `read`, resource `light`, lane `backlog`).
   The targets come from the `"filler"` key of `$AGENTQ_HOME/backlog-seed.json`:
   `report_dir`, an optional `max_runtime` (default `15m`), and `repos`, each with a
@@ -114,11 +118,15 @@ instead of letting it swing between idle and burst.
   retried until the module changes. Labels come from `label make` as
   `hub-exec-backlog-filler-<repo>-<module>`.
 - Pacing (`broker.json` `pacing`, on by default). A DeepSeek job launches only while
-  the last minute's uncached input (`proxy_minutes.input`), plus each launch of the
-  last minute at the first-request cost, stays under `uncached_frac` (0.8) of
-  `uncached_limit` (400k). The first-request cost is the `measure_percentile` (75th)
-  of single-request DeepSeek jobs in `proxy_jobs`, once `min_measured_jobs` (20) are
-  seen; otherwise `first_request_uncached` (40k). One urgent DeepSeek job per tick
+  the current Morph minute's uncached input, plus an estimate for each DeepSeek launch
+  whose first request the proxy has not recorded yet, stays under `uncached_frac`
+  (0.8) of `uncached_limit` (400k). The current minute comes from the proxy's live
+  `uncached_ds` budget (in-flight charges included), or from the store's current-minute
+  row when the proxy is down. Pending launches are running DeepSeek jobs started within
+  `first_request_grace_s` (120) with no `proxy_jobs` row, read from `jobs.started_at`, so
+  a broker restart keeps the count. The first-request cost is the `measure_percentile`
+  (75th) of single-request DeepSeek jobs in `proxy_jobs`, once `min_measured_jobs` (20)
+  are seen; otherwise `first_request_uncached` (40k). One urgent DeepSeek job per tick
   launches even when the allowance is spent.
 - Proxy reserve (`proxy.json` `backlog_max_frac`, 0.9): a backlog request waits once
   its budget passes that fraction of the target, so normal and urgent work keep the
@@ -232,7 +240,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 |---|---|
 | `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_targets`, `filler_state`. `proxy_minutes` belongs to the proxy |
 | `backlog/<name>.md` | a backlog template's prompt copy |
-| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings and the `auto_worktree` settings (see above) |
+| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings and the `fill` and `pacing` settings (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
 | `jobs/<id>/runs/<n>/` | the run folder of each launch (run_worker's files live here) |

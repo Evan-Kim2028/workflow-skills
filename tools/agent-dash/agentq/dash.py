@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS samples (
 MINUTES_SQL = """
 SELECT minute,
        SUM(COALESCE(input, 0) + COALESCE(cache_read, 0) + COALESCE(output, 0)) AS total,
+       SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(input, 0) + COALESCE(cache_read, 0) + COALESCE(output, 0)
+                ELSE 0 END) AS ds_total,
        SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(output, 0) ELSE 0 END) AS ds_output,
        SUM(CASE WHEN model LIKE 'morph-kimi%' THEN COALESCE(input, 0) ELSE 0 END) AS kimi_uncached,
        SUM(CASE WHEN model LIKE 'morph-dsv%' THEN COALESCE(input, 0) ELSE 0 END) AS ds_uncached,
@@ -2775,10 +2777,13 @@ def held_verdict(details: list[str], ssh_in_use: int | None) -> tuple[str, str] 
 
 
 def fill_near_target(raw: dict[int, dict], until: int, fill: dict | None) -> bool:
-    """True when the fill controller is on and the 5-minute billed average is at or above its low mark."""
+    """True when the fill controller is on and DeepSeek's own 5-minute billed average is at or above its low mark.
+
+    Kimi and other models are excluded: the fill controller steers DeepSeek alone.
+    """
     if not fill or not fill.get("enabled"):
         return False
-    average = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES
+    average = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "ds_total") / LIMIT_WINDOW_MINUTES
     return average >= fill["low_frac"] * fill["target_billed_per_min"]
 
 

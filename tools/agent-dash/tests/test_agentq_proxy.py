@@ -1982,3 +1982,21 @@ class BacklogReserveTest(unittest.TestCase):
         self.gov.enqueue(backlog)
         self.gov.pump()
         self.assertNotIn(backlog, self.gov.queues["backlog"])
+
+    def test_a_reserve_hold_does_not_set_the_global_saturated_flag(self) -> None:
+        self.occupy(8_900_000)
+        backlog = make_ticket(self.gov, job="bl", model=MODEL_OUT, text="x", max_tokens=8, lane="backlog")
+        self.gov.enqueue(backlog)
+        backlog.queued_at -= 10
+        self.gov.pump()
+        self.assertFalse(self.gov.budgets["total"].saturated)
+        self.assertFalse(self.gov.status()["saturated"])
+
+    def test_a_capacity_hold_still_sets_the_global_saturated_flag(self) -> None:
+        self.occupy(9_800_000)
+        normal = make_ticket(self.gov, job="nm", model=MODEL_OUT, text="x", max_tokens=8, lane="normal")
+        self.gov.enqueue(normal)
+        normal.queued_at -= 10
+        self.gov.pump()
+        self.assertTrue(self.gov.budgets["total"].saturated)
+        self.assertTrue(self.gov.status()["saturated"])

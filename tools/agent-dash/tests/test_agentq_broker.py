@@ -173,7 +173,7 @@ def write_config(home, slots=None, tiers=None):
 
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True)
-    data = {}
+    data = {"pacing": {"enabled": False}}
     if slots is not None:
         data["slots"] = slots
     if tiers is not None:
@@ -814,6 +814,7 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         import json
 
         self.home.mkdir(parents=True, exist_ok=True)
+        data.setdefault("pacing", {"enabled": False})
         (self.home / "broker.json").write_text(json.dumps(data), encoding="utf-8")
 
     def test_morph_gate_holds_deepseek_above_the_waiting_limit(self):
@@ -1280,6 +1281,7 @@ class BlockingLauncher(FakeLauncher):
 class NonBlockingLaunchTests(ProcessCleanup):
     def setUp(self):
         super().setUp()
+        write_config(self.home)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=B.MAX_CONCURRENT_LAUNCHES)
         self.addCleanup(self.pool.shutdown, wait=False)
         self.release = threading.Event()

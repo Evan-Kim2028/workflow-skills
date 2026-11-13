@@ -10,7 +10,6 @@ import os
 import sys
 import tempfile
 import unittest
-from collections import deque
 from pathlib import Path
 from unittest import mock
 
@@ -44,20 +43,7 @@ def status_doc(blocked=0):
     }
 
 
-class RateAndTargetTests(unittest.TestCase):
-    def test_per_worker_rate_is_billed_over_active_and_clamped(self):
-        self.assertEqual(F.per_worker_rate(9_000_000, 50, FILL), (180_000.0, "measured"))
-        self.assertEqual(F.per_worker_rate(1_000_000, 50, FILL), (100_000.0, "measured"))
-        self.assertEqual(F.per_worker_rate(50_000_000, 50, FILL), (250_000.0, "measured"))
-
-    def test_no_active_history_uses_the_default_rate(self):
-        self.assertEqual(F.per_worker_rate(9_000_000, None, FILL), (175_000.0, "default"))
-        self.assertEqual(F.per_worker_rate(9_000_000, 0, FILL), (175_000.0, "default"))
-
-    def test_desired_workers_rounds_up_and_respects_the_cap(self):
-        self.assertEqual(F.desired_workers(8_000_000, 175_000, 64), 46)
-        self.assertEqual(F.desired_workers(8_000_000, 100_000, 64), 64)
-
+class HysteresisTests(unittest.TestCase):
     def test_hysteresis_fills_below_low_stops_above_high_and_holds_between(self):
         target, low, high = 8_000_000, 0.9, 0.97
         self.assertTrue(F.filling_state(False, 7_000_000, target, low, high))
@@ -66,66 +52,89 @@ class RateAndTargetTests(unittest.TestCase):
         self.assertFalse(F.filling_state(False, 7_500_000, target, low, high))
 
 
-class PlanTests(unittest.TestCase):
-    def plan(self, **overrides):
-        args = dict(enabled=True, paused=False, avg_billed=5_000_000, was_filling=False, fill=FILL,
-                    rate=175_000, running_ds=10, ready_real=0, queued_filler=0, gate=None)
-        args.update(overrides)
-        return F.plan_fill(**args)
-
-    def test_low_average_submits_up_to_the_per_tick_limit(self):
-        plan = self.plan()
-        self.assertTrue(plan.filling)
-        self.assertEqual(plan.submit, FILL["max_launch_per_tick"])
-        self.assertEqual(plan.key, "submitting")
-
-    def test_queued_filler_counts_against_the_gap(self):
-        self.assertEqual(self.plan(queued_filler=40).submit, 0)
-        self.assertEqual(self.plan(queued_filler=40).key, "queued-covers")
-
-    def test_ready_real_work_goes_first(self):
-        plan = self.plan(ready_real=2)
-        self.assertEqual((plan.submit, plan.key), (0, "real-ready"))
-
-    def test_each_gate_holds_the_filler(self):
-        plan = self.plan(gate="Morph gate: 3 DeepSeek requests waiting at the proxy")
-        self.assertEqual((plan.submit, plan.key), (0, "gate"))
-
-    def test_disabled_and_paused_never_fill(self):
-        self.assertEqual(self.plan(enabled=False).key, "disabled")
-        self.assertFalse(self.plan(paused=True).filling)
-        self.assertEqual(self.plan(paused=True).submit, 0)
-
-    def test_above_the_high_mark_the_filler_stops(self):
-        plan = self.plan(avg_billed=8_000_000, was_filling=True)
-        self.assertFalse(plan.filling)
-        self.assertEqual(plan.key, "high-mark")
-
-    def test_a_full_gap_submits_nothing(self):
-        self.assertEqual(self.plan(running_ds=60, avg_billed=7_000_000).submit, 0)
+def tick(ctl, now, billed, active, *, fill=FILL, ready_real=0, queued_filler=0, gate=None, paused=False):
+    return ctl.tick(now, fill=fill, paused=paused, billed_avg=billed, active=active,
+                    ready_real=ready_real, queued_filler=queued_filler, gate=gate)
 
 
-class GateTests(unittest.TestCase):
-    def test_no_proxy_status_holds(self):
-        self.assertIsNotNone(F.gate_reason(None, 0, (90.0, 0.1), FILL))
+class ControllerTests(unittest.TestCase):
+    def test_disabled_and_paused_never_step(self):
+        ctl = F.FillController()
+        self.assertEqual(tick(ctl, NOW, 1e6, 10, fill=dict(FILL, enabled=False)).key, "disabled")
+        self.assertEqual(tick(ctl, NOW, 1e6, 10, paused=True).key, "paused")
+        self.assertIsNone(ctl.step)
 
-    def test_blocked_deepseek_requests_hold(self):
-        self.assertIn("waiting at the proxy", F.gate_reason(status_doc(blocked=2), 0, (90.0, 0.1), FILL))
+    def test_a_low_average_starts_one_step_of_step_workers(self):
+        ctl = F.FillController()
+        plan = tick(ctl, NOW, 4_700_000, 47)
+        self.assertEqual((plan.submit, plan.key), (4, "stepping"))
+        self.assertEqual(tick(ctl, NOW + 2, 4_700_000, 47).key, "step-wait")
+        self.assertEqual(tick(ctl, NOW + 2, 4_700_000, 47).submit, 0)
 
-    def test_a_recent_deepseek_429_holds(self):
-        self.assertIn("429", F.gate_reason(status_doc(), 1, (90.0, 0.1), FILL))
+    def test_real_work_and_gates_hold_before_a_step_starts(self):
+        self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, ready_real=2).key, "real-ready")
+        self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, gate="Morph gate: x").key, "gate")
 
-    def test_laptop_memory_and_load_hold_but_unreadable_gauges_do_not(self):
-        self.assertIn("memory", F.gate_reason(status_doc(), 0, (10.0, 0.1), FILL))
-        self.assertIn("load", F.gate_reason(status_doc(), 0, (90.0, 1.5), FILL))
-        self.assertIsNone(F.gate_reason(status_doc(), 0, (None, None), FILL))
+    def test_above_the_high_mark_it_stops_and_does_not_kill(self):
+        ctl = F.FillController()
+        plan = tick(ctl, NOW, 8_000_000, 60)
+        self.assertEqual((plan.filling, plan.submit, plan.key), (False, 0, "high-mark"))
 
-    def test_clear_gates_are_open(self):
-        self.assertIsNone(F.gate_reason(status_doc(), 0, (90.0, 0.2), FILL))
+    def test_the_worker_cap_stops_a_step(self):
+        self.assertEqual(tick(F.FillController(), NOW, 1e6, 64).key, "at-limit")
 
-    def test_ds_blocked_falls_back_to_the_queue_for_an_old_proxy(self):
-        old = {"budgets": {"total": {"queued": {"urgent": 0, "normal": 2, "backlog": 1}}}}
-        self.assertEqual(F.ds_blocked(old), 3)
+    def test_a_step_that_starts_no_worker_is_void_and_records_nothing(self):
+        ctl = F.FillController()
+        tick(ctl, NOW, 4_700_000, 47)
+        plan = tick(ctl, NOW + 301, 4_700_000, 47)
+        self.assertIsNone(ctl.new_ceiling)
+        self.assertIn("void", ctl.judgement)
+        self.assertEqual(plan.key, "stepping")
+
+    def test_the_47_worker_scenario_does_not_walk_to_64(self):
+        ctl = F.FillController()
+        active, now, peak = 47, NOW, 47
+        for _ in range(int(3 * 3600 / 2)):
+            billed = 4_700_000 + 25_000 * (active - 47)
+            plan = tick(ctl, now, billed, active)
+            active += plan.submit
+            peak = max(peak, active)
+            now += 2
+        self.assertLessEqual(peak, 51)
+        self.assertEqual(ctl.last_ceiling, 47)
+        self.assertIn("poor", ctl.judgement)
+
+    def test_good_gain_per_step_reaches_the_target_band(self):
+        ctl = F.FillController()
+        active, now, billed = 0, NOW, 0.0
+        for _ in range(int(2 * 3600 / 2)):
+            billed = 175_000.0 * active
+            plan = tick(ctl, now, billed, active)
+            active += plan.submit
+            now += 2
+        self.assertGreaterEqual(billed, 0.9 * 8_000_000)
+        self.assertIsNone(ctl.new_ceiling)
+        self.assertIsNone(ctl.last_ceiling)
+
+    def test_an_expired_ceiling_allows_one_probe_past_it_and_no_more(self):
+        ctl = F.FillController(ceiling=(47, NOW))
+        self.assertEqual(tick(ctl, NOW + 10, 4_700_000, 47).key, "at-limit")
+        probe = tick(ctl, NOW + 1801, 4_700_000, 47)
+        self.assertEqual((probe.key, probe.submit), ("stepping", 4))
+        tick(ctl, NOW + 1801 + 301, 4_700_000, 51)
+        self.assertEqual(ctl.new_ceiling[0], 47)
+        self.assertEqual(tick(ctl, NOW + 1801 + 302, 4_700_000, 51).key, "at-limit")
+
+    def test_a_saved_ceiling_survives_a_restart(self):
+        ctl = F.FillController(ceiling=(47, NOW - 60))
+        self.assertEqual(tick(ctl, NOW, 4_700_000, 47).key, "at-limit")
+
+    def test_the_rate_judging_a_step_ignores_samples_from_the_step_itself(self):
+        ctl = F.FillController()
+        for k in range(10):
+            ctl.samples.append((NOW - 600 + k * 30, 4_700_000.0, 47))
+        ctl.samples.append((NOW + 100, 9_000_000.0, 50))
+        self.assertEqual(ctl.long_run_rate(NOW + 400, NOW, FILL), 100_000)
 
 
 class PacingTests(unittest.TestCase):
@@ -133,8 +142,9 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(F.pacing_allowance(0, 0, PACING, None), (8, 40_000))
         self.assertEqual(F.pacing_allowance(300_000, 0, PACING, None), (0, 40_000))
 
-    def test_recent_launches_each_take_their_cost_out_of_the_allowance(self):
+    def test_each_pending_launch_takes_its_cost_out_of_the_allowance(self):
         self.assertEqual(F.pacing_allowance(0, 3, PACING, None), (5, 40_000))
+        self.assertEqual(F.pacing_allowance(200_000, 1, PACING, None), (2, 40_000))
 
     def test_a_measured_cost_replaces_the_default(self):
         self.assertEqual(F.pacing_allowance(0, 0, PACING, 80_000), (4, 80_000))
@@ -160,11 +170,6 @@ class SectionAndWorkerTests(unittest.TestCase):
         ])
         self.assertEqual(F.direct_ds_workers(ps), 1)
         self.assertIsNone(F.direct_ds_workers(None))
-
-    def test_active_average_keeps_only_the_window(self):
-        samples = deque()
-        F.active_average(samples, 0.0, 10, 300)
-        self.assertEqual(F.active_average(samples, 400.0, 20, 300), 20)
 
 
 class StoreTest(unittest.TestCase):
@@ -192,7 +197,27 @@ class StoreTest(unittest.TestCase):
         self.minute(LAST_MINUTE, 1_000_000, 0, 0, model="morph-kimik31")
         rows = F.minute_rows(self.conn, NOW, 5)
         self.assertEqual(rows[stamp(LAST_MINUTE)], {"input": 100_000, "billed": 170_000})
-        self.assertEqual(F.last_minute_input(self.conn, NOW), 100_000)
+
+    def test_current_uncached_prefers_the_live_proxy_budget_then_the_current_minute_row(self):
+        status = {"budgets": {"uncached_ds": {"used_60s": 350_000}}}
+        self.assertEqual(F.current_uncached(status, self.conn, NOW), (350_000, "proxy"))
+        self.minute(int(NOW // 60) * 60, 120_000, 0, 0)
+        self.assertEqual(F.current_uncached(None, self.conn, NOW), (120_000, "store"))
+
+    def test_pending_launches_are_running_ds_jobs_with_no_proxy_row_yet(self):
+        self.insert_job("seen", "running", "normal", "pi-deepseek-flash", "x")
+        self.insert_job("unseen", "running", "normal", "pi-deepseek-flash", "y")
+        self.insert_job("old", "running", "normal", "pi-deepseek-flash", "z")
+        self.conn.execute("UPDATE jobs SET started_at = ? WHERE id IN ('seen', 'unseen')", (NOW - 10,))
+        self.conn.execute("UPDATE jobs SET started_at = ? WHERE id = 'old'", (NOW - 3600,))
+        self.conn.execute("INSERT INTO proxy_jobs VALUES ('seen', ?, 1, 5, ?, ?)", (DS_MODEL, NOW - 9, NOW - 9))
+        self.assertEqual(F.pending_launches(self.conn, NOW, 120), 1)
+
+    def test_pending_launches_without_a_proxy_table_count_every_recent_start(self):
+        self.conn.execute("DROP TABLE proxy_jobs")
+        self.insert_job("a", "running", "normal", "pi-deepseek-flash", "x")
+        self.conn.execute("UPDATE jobs SET started_at = ? WHERE id = 'a'", (NOW - 5,))
+        self.assertEqual(F.pending_launches(self.conn, NOW, 120), 1)
 
     def test_recent_429_counts_the_overlapping_minutes(self):
         self.minute(NOW - 30, 0, 0, 0, r429=2)
@@ -224,17 +249,17 @@ class StoreTest(unittest.TestCase):
 
     def test_decide_reads_the_store_and_plans_a_fill(self):
         self.minute(LAST_MINUTE, 100_000, 0, 0)
-        samples = deque()
+        status = {"budgets": {"uncached_ds": {"used_60s": 100_000}}}
         decision = F.decide(
-            self.conn, NOW, fill=FILL, pacing=PACING, status=status_doc(), ps_text="",
-            laptop=(90.0, 0.2), was_filling=False, samples=samples, recent_launches=0, measured=None, paused=False,
+            self.conn, NOW, controller=F.FillController(), fill=FILL, pacing=PACING, status=status, ps_text="",
+            laptop=(90.0, 0.2), paused=False, measured=None,
         )
-        self.assertEqual(decision.plan.submit, FILL["max_launch_per_tick"])
+        self.assertEqual((decision.plan.submit, decision.plan.key), (4, "stepping"))
         self.assertEqual(decision.billed_avg, 20_000)
         self.assertEqual(decision.direct_ds, 0)
-        self.assertEqual(decision.last_input, 100_000)
-        self.assertEqual(decision.rate_source, "default")
-        self.assertEqual(len(samples), 1)
+        self.assertEqual(decision.pacing_current, 100_000)
+        self.assertEqual(decision.pacing_source, "proxy")
+        self.assertEqual(decision.pacing_left, 5)
 
 
 class FillerTargetTests(unittest.TestCase):
@@ -435,11 +460,12 @@ class BrokerWiringTest(unittest.TestCase):
         broker = self.broker()
         self.tick(broker)
         self.tick(broker)
-        self.assertEqual(self.log_text().count("fill: "), 1)
+        self.tick(broker)
+        self.assertEqual(self.log_text().count("fill: "), 2)
 
     def test_uncached_pacing_holds_a_deepseek_launch_and_lets_one_urgent_through(self):
         self.write_json("broker.json", {"fill": {"enabled": False}, "pacing": {"enabled": True}})
-        self.conn.execute("UPDATE proxy_minutes SET input = 390000 WHERE minute = ?", (stamp(NOW - 60),))
+        self.status = {"budgets": {"uncached_ds": {"used_60s": 390_000}}}
         for job_id, lane in (("normal-1", "normal"), ("urgent-1", "urgent")):
             db.insert_job(self.conn, {
                 "id": job_id, "lane": lane, "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
@@ -453,6 +479,7 @@ class BrokerWiringTest(unittest.TestCase):
         normal = db.get_job(self.conn, "normal-1")
         self.assertEqual(normal["state"], "queued")
         self.assertIn("proxy uncached pacing", normal["detail"])
+        self.assertIn("390,000 uncached this minute (proxy)", normal["detail"])
 
 
 class NeverPool:

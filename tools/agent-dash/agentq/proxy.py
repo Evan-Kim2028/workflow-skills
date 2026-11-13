@@ -648,6 +648,8 @@ class Ticket:
     holds: list[tuple[Budget, Entry]] = field(default_factory=list)
     blocked_by: str | None = None
     backoff_by: str | None = None
+    last_refusal: str | None = None
+    reserve_seen: bool = False
 
     def blocking_budget(self, now: float) -> str | None:
         """The budget holding this waiting ticket now: the budget its 429 named while it backs off,
@@ -940,10 +942,12 @@ class Governor:
                 closed = blocked | urgent_guarded if lane == "urgent" else blocked
                 if head.not_before > now:
                     head.blocked_by = None
+                    head.last_refusal = None
                     index += 1
                     continue
                 if not closed.isdisjoint(head.estimates):
                     head.blocked_by = next(name for name in head.estimates if name in closed)
+                    head.last_refusal = None
                     index += 1
                     continue
                 found = self._blocker(head, now, lower_waiting)
@@ -953,6 +957,9 @@ class Governor:
                     continue
                 blocker, refusal = found
                 head.blocked_by = blocker.name
+                head.last_refusal = refusal
+                if refusal == RESERVE:
+                    head.reserve_seen = True
                 if refusal == CAPACITY:
                     blocker.saturated = True
                     blocker.saturated_since_tick = True
@@ -995,7 +1002,8 @@ class Governor:
             ticket.holds.append((budget, entry))
         self.note_calib_admitted(ticket)
         wait = now - ticket.queued_at
-        self.waits.append((now, wait))
+        if not ticket.reserve_seen:
+            self.waits.append((now, wait))
         row = self.row(ticket.model)
         row["req"] += 1
         if len(row["waits"]) < ROW_WAIT_SAMPLES:
@@ -1413,7 +1421,12 @@ class Governor:
         window = self.window
         while self.waits and self.waits[0][0] < now - window:
             self.waits.popleft()
-        queued_ages = [now - t.queued_at for lane in LANES for t in self.queues[lane]]
+        queued_ages = [
+            now - t.queued_at
+            for lane in LANES
+            for t in self.queues[lane]
+            if lane != "backlog" or t.last_refusal in (CAPACITY, GUARD)
+        ]
         saturated = any(wait > SATURATION_WAIT_S for _, wait in self.waits) or any(
             age > SATURATION_WAIT_S for age in queued_ages
         )

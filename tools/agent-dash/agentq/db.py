@@ -13,6 +13,7 @@ import contextlib
 import os
 import random
 import sqlite3
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -210,16 +211,29 @@ def ensure_wal(conn: sqlite3.Connection) -> None:
     retrying(lambda: conn.execute("PRAGMA journal_mode = WAL").fetchone())
 
 
+_NEWER_STORE_WARNED: set[str] = set()
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the schema once, or upgrade an older store step by step.
 
-    A current schema is read without a write lock.
+    A current schema is read without a write lock. A store newer than this code is left as it is:
+    the version is never written back down, so an older process cannot flap the store between versions.
+    The refusal is logged once per store file.
     """
-    if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == SCHEMA_VERSION:
+        return
+    if version > SCHEMA_VERSION:
+        key = str(conn.execute("PRAGMA database_list").fetchone()[2])
+        if key not in _NEWER_STORE_WARNED:
+            _NEWER_STORE_WARNED.add(key)
+            print(f"agentq: store schema {version} is newer than this code ({SCHEMA_VERSION}); "
+                  "leaving it unchanged", file=sys.stderr)
         return
     with tx(conn):
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == SCHEMA_VERSION:
+        if version == SCHEMA_VERSION or version > SCHEMA_VERSION:
             return
         if version == 0:
             for statement in _STATEMENTS:

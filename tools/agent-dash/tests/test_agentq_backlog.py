@@ -389,6 +389,35 @@ class SchemaUpgradeTests(BacklogTestCase):
         self.assertEqual(backlog_lib.select_all(self.conn()), [])
 
 
+class NewerStoreTests(BacklogTestCase):
+    def test_older_code_leaves_a_newer_store_at_its_version(self):
+        current = db.SCHEMA_VERSION
+        db.connect(self.home).close()
+        conn = db.connect(self.home)
+        conn.execute(f"PRAGMA user_version = {current + 1}")
+        conn.close()
+        with mock.patch.object(db, "SCHEMA_VERSION", current - 1):
+            db.connect(self.home).close()
+            db.connect(self.home).close()
+        conn = db.connect(self.home)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], current + 1)
+
+    def test_the_newer_store_keeps_its_jobs_when_an_older_process_opens_it(self):
+        self.run_cli(["submit", str(self.prompt), "--label", "hub-exec-kept", "--workspace", str(self.workspace)])
+        newer = db.SCHEMA_VERSION + 1
+        conn = db.connect(self.home)
+        conn.execute(f"PRAGMA user_version = {newer}")
+        conn.close()
+        with mock.patch.object(db, "SCHEMA_VERSION", newer - 2):
+            conn = db.connect(self.home)
+            conn.close()
+        conn = db.connect(self.home)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], newer)
+        self.assertEqual([job["label"] for job in db.select_jobs(conn)], ["hub-exec-kept"])
+
+
 class SeedTests(BacklogTestCase):
     def setUp(self):
         super().setUp()

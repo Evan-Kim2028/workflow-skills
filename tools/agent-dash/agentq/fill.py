@@ -1,14 +1,20 @@
 """DeepSeek fill controller and launch pacing.
 
-The controller holds the DeepSeek pool near ``fill.target_billed_per_min`` by submitting
-filler jobs (``agentq.filler``) when the 5-minute billed average is low. Pacing caps how
-fast DeepSeek jobs may start, from the uncached input the last minute already spent and
-the first-request cost each recent launch will add.
+The fill controller holds the DeepSeek pool near ``fill.target_billed_per_min`` by adding filler
+workers in steps (``fill.step_workers`` at a time, each step judged after ``fill.step_interval_s``).
+A step is judged by the billed gain per worker it actually added, against the long-run per-worker
+rate measured before the step. Poor gain records a learned ceiling that expires after
+``fill.ceiling_ttl_s``.
 
-Everything here is a pure function of values the caller reads, except the readers at the
-bottom (``minute_rows``, ``recent_429``, ``job_counts``, ``measured_first_request``), which
-read agentq.db and never write. The broker calls ``decide`` each tick and
-``pacing_allowance`` at launch time; ``main`` prints one decision for a copy of the store.
+Pacing caps how fast DeepSeek jobs may start. It counts the current Morph minute's uncached input
+(the proxy's live ``uncached_ds`` budget, in-flight charges included) plus an estimate for each
+launch whose first request the proxy has not yet seen. Pending launches come from ``jobs.started_at``
+in agentq.db, so a broker restart keeps the history.
+
+Everything here is a pure function of values the caller reads, except the readers (``minute_rows``,
+``recent_429``, ``job_counts``, ``pending_launches``, ``current_uncached``, ``measured_first_request``),
+which read agentq.db and never write. The broker calls ``decide`` each tick and ``pacing_allowance``
+at launch time; ``main`` prints one reading for a copy of the store.
 """
 
 from __future__ import annotations
@@ -17,7 +23,9 @@ import argparse
 import json
 import math
 import re
+import statistics
 import subprocess
+import sqlite3
 import sys
 import time
 from collections import deque
@@ -38,6 +46,7 @@ WINDOW_MINUTES = 5
 MINUTE_S = 60.0
 PS_TIMEOUT_S = 10.0
 MEASURED_CLAMP = (10_000, 200_000)
+UNCACHED_BUDGET = "uncached_ds"
 
 DEFAULT_FILL = {
     "enabled": False,
@@ -45,12 +54,15 @@ DEFAULT_FILL = {
     "max_workers": 64,
     "low_frac": 0.9,
     "high_frac": 0.97,
-    "max_launch_per_tick": 4,
-    "rate_min": 100_000,
-    "rate_max": 250_000,
-    "default_rate": 175_000,
-    "gate_429_window_s": 120,
-    "laptop_min_free_pct": 20,
+    "step_workers": 4,
+    "step_interval_s": 300.0,
+    "min_marginal_frac": 0.5,
+    "ceiling_ttl_s": 1800.0,
+    "rate_window_s": 1800.0,
+    "rate_min_samples": 3,
+    "default_rate": 175_000.0,
+    "gate_429_window_s": 120.0,
+    "laptop_min_free_pct": 20.0,
     "laptop_max_load_per_cpu": 1.0,
 }
 DEFAULT_PACING = {
@@ -58,10 +70,11 @@ DEFAULT_PACING = {
     "uncached_limit": 400_000,
     "uncached_frac": 0.8,
     "first_request_uncached": 40_000,
+    "first_request_grace_s": 120.0,
     "measure_first_request": True,
     "measure_percentile": 75,
     "min_measured_jobs": 20,
-    "measure_window_s": 86_400,
+    "measure_window_s": 86_400.0,
 }
 
 
@@ -84,22 +97,6 @@ def section(override, defaults: dict) -> dict:
         except (TypeError, ValueError):
             continue
     return out
-
-
-def per_worker_rate(billed_avg: float, active_avg: float | None, fill: dict) -> tuple[float, str]:
-    """Billed tokens per minute one busy DeepSeek worker uses, clamped to [rate_min, rate_max].
-
-    With no active-worker history the default rate stands in, and the source says so.
-    """
-    if not active_avg or active_avg <= 0:
-        return float(fill["default_rate"]), "default"
-    rate = billed_avg / active_avg
-    return min(max(rate, float(fill["rate_min"])), float(fill["rate_max"])), "measured"
-
-
-def desired_workers(target: float, rate: float, max_workers: int) -> int:
-    """Busy DeepSeek workers needed to reach ``target`` at ``rate`` each, capped at ``max_workers``."""
-    return min(int(max_workers), math.ceil(target / rate))
 
 
 def filling_state(was_filling: bool, avg: float, target: float, low_frac: float, high_frac: float) -> bool:
@@ -161,61 +158,131 @@ class FillPlan:
     key: str
 
 
-def plan_fill(
-    *, enabled: bool, paused: bool, avg_billed: float, was_filling: bool, fill: dict, rate: float,
-    running_ds: int, ready_real: int, queued_filler: int, gate: str | None,
-) -> FillPlan:
-    """The fill decision. Real DeepSeek work that is ready always goes first, so filler waits for it."""
-    if not enabled:
-        return FillPlan(False, 0, "fill disabled", "disabled")
-    if paused:
-        return FillPlan(False, 0, "filler paused", "paused")
-    target = float(fill["target_billed_per_min"])
-    low, high = fill["low_frac"] * target, fill["high_frac"] * target
-    filling = filling_state(was_filling, avg_billed, target, fill["low_frac"], fill["high_frac"])
-    average = f"5-min average {avg_billed / 1e6:.2f}M/min"
-    if not filling:
-        return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; no filler", "high-mark")
-    desired = desired_workers(target, rate, fill["max_workers"])
-    if ready_real > 0:
-        return FillPlan(True, 0, f"{ready_real} real DeepSeek jobs ready; they launch before filler", "real-ready")
-    if gate is not None:
-        return FillPlan(True, 0, gate, "gate")
-    gap = desired - running_ds - ready_real
-    if gap <= 0:
-        return FillPlan(True, 0, f"{average}, below the {low / 1e6:.2f}M low mark; {running_ds} workers running covers desired {desired}", "covered")
-    submit = min(int(fill["max_launch_per_tick"]), max(0, gap - queued_filler))
-    if submit == 0:
-        return FillPlan(True, 0, f"{average}; gap {gap} already covered by {queued_filler} queued filler jobs", "queued-covers")
-    return FillPlan(True, submit, f"{average} below the {low / 1e6:.2f}M low mark; desired {desired}, running {running_ds}, submitting {submit}", "submitting")
+class FillController:
+    """Stepwise filler controller. It runs one step at a time and judges it by the workers it actually added.
+
+    A step adds up to ``step_workers`` filler workers and is judged ``step_interval_s`` later. The gain per
+    added worker is the change in the DeepSeek billed 5-minute average divided by the workers that started.
+    If that is below ``min_marginal_frac`` of the long-run per-worker rate, the step's starting count becomes
+    a ceiling for ``ceiling_ttl_s``. The long-run rate uses only samples taken before the step began, so the
+    concurrency a step just added never counts as evidence for more.
+
+    When a ceiling expires the controller may probe one step past it, and no further. A poor probe keeps the
+    old ceiling rather than recording the probe's own starting count, so the ceiling cannot walk upward.
+    """
+
+    def __init__(self, ceiling: tuple[int, float] | None = None):
+        self.filling = False
+        self.step: dict | None = None
+        self.ceiling = ceiling
+        self.last_ceiling = ceiling[0] if ceiling else None
+        self.samples: deque = deque()
+        self.new_ceiling: tuple[int, float] | None = None
+        self.judgement: str | None = None
+
+    def active_ceiling(self, now: float, fill: dict) -> int | None:
+        """The learned ceiling while it is fresh, else None. An expired ceiling is dropped but remembered."""
+        if self.ceiling is None:
+            return None
+        workers, at = self.ceiling
+        if now - at >= fill["ceiling_ttl_s"]:
+            self.ceiling = None
+            return None
+        return workers
+
+    def worker_limit(self, now: float, fill: dict) -> tuple[int, str]:
+        """The busy-worker limit now, and what sets it."""
+        cap = int(fill["max_workers"])
+        ceiling = self.active_ceiling(now, fill)
+        if ceiling is not None:
+            return min(cap, ceiling), "learned ceiling"
+        if self.last_ceiling is not None:
+            return min(cap, self.last_ceiling + int(fill["step_workers"])), "probe past expired ceiling"
+        return cap, "max_workers"
+
+    def long_run_rate(self, now: float, before: float, fill: dict) -> float:
+        """Median billed-per-busy-worker over the rate window, using only samples taken before ``before``."""
+        window = fill["rate_window_s"]
+        rates = [billed / active for ts, billed, active in self.samples if now - window <= ts < before and active > 0]
+        if len(rates) < fill["rate_min_samples"]:
+            return float(fill["default_rate"])
+        return statistics.median(rates)
+
+    def _judge(self, now: float, billed_avg: float, active: int, fill: dict) -> None:
+        step, self.step = self.step, None
+        added = active - step["workers_before"]
+        if added <= 0:
+            self.judgement = "step void: no filler worker started, nothing to judge"
+            return
+        gain = (billed_avg - step["avg_before"]) / added
+        rate = self.long_run_rate(now, step["start"], fill)
+        if gain < fill["min_marginal_frac"] * rate:
+            workers = step["workers_before"]
+            if self.last_ceiling is not None:
+                workers = min(workers, self.last_ceiling)
+            self.ceiling = (workers, now)
+            self.last_ceiling = workers
+            self.new_ceiling = self.ceiling
+            self.judgement = (f"step of {added} judged poor: {gain:,.0f} per added worker against "
+                              f"{rate:,.0f} per worker; ceiling {workers} workers")
+        else:
+            self.last_ceiling = None
+            self.judgement = f"step of {added} judged good: {gain:,.0f} per added worker against {rate:,.0f}"
+
+    def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int,
+             ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
+        """One decision. ``active`` counts busy DeepSeek workers, filler included."""
+        if not fill["enabled"]:
+            self.filling, self.step = False, None
+            return FillPlan(False, 0, "fill disabled", "disabled")
+        if paused:
+            self.filling, self.step = False, None
+            return FillPlan(False, 0, "filler paused", "paused")
+        self.samples.append((now, billed_avg, active))
+        while self.samples and self.samples[0][0] < now - fill["rate_window_s"]:
+            self.samples.popleft()
+        target = float(fill["target_billed_per_min"])
+        low, high = fill["low_frac"] * target, fill["high_frac"] * target
+        self.filling = filling_state(self.filling, billed_avg, target, fill["low_frac"], fill["high_frac"])
+        if self.step is not None and now - self.step["start"] >= fill["step_interval_s"]:
+            self._judge(now, billed_avg, active, fill)
+        average = f"5-min average {billed_avg / 1e6:.2f}M/min"
+        if not self.filling:
+            return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; no filler", "high-mark")
+        if ready_real > 0:
+            return FillPlan(True, 0, f"{ready_real} real DeepSeek jobs ready; they launch before filler", "real-ready")
+        if gate is not None:
+            return FillPlan(True, 0, gate, "gate")
+        if self.step is not None:
+            left = max(0.0, fill["step_interval_s"] - (now - self.step["start"]))
+            return FillPlan(True, 0, f"step of {self.step['added']} in progress; judged in {left:.0f} s", "step-wait")
+        limit, cause = self.worker_limit(now, fill)
+        room = limit - active - queued_filler
+        if room <= 0:
+            return FillPlan(True, 0, f"{average}; {active} busy at the {cause} of {limit}", "at-limit")
+        to_add = min(int(fill["step_workers"]), room)
+        self.step = {"start": now, "workers_before": active, "avg_before": billed_avg, "added": to_add}
+        return FillPlan(True, to_add, f"{average} below the {low / 1e6:.2f}M low mark; stepping {to_add} "
+                        f"filler workers from {active} busy (limit {limit})", "stepping")
 
 
-def pacing_allowance(last_input: int, recent_launches: int, pacing: dict, measured: int | None) -> tuple[int, int]:
-    """(DeepSeek launches allowed now, first-request cost used). The cost of each launch in the last minute
-    is added to the last minute's uncached input, so a burst cannot pass the cap before its requests show."""
+def pacing_allowance(current: int, pending: int, pacing: dict, measured: int | None) -> tuple[int, int]:
+    """(DeepSeek launches allowed now, first-request cost used).
+
+    ``current`` is the Morph minute's uncached input so far. Each pending launch, whose first request
+    the proxy has not counted yet, adds the first-request cost.
+    """
     est = int(measured) if measured else int(pacing["first_request_uncached"])
     cap = pacing["uncached_frac"] * pacing["uncached_limit"]
-    projected = last_input + est * recent_launches
-    return max(0, math.floor((cap - projected) / est)), est
-
-
-def active_average(samples: deque, now: float, active_now: int, window_s: float) -> float | None:
-    """Mean busy-worker count over the last ``window_s`` seconds, after recording ``active_now``."""
-    samples.append((now, active_now))
-    while samples and samples[0][0] < now - window_s:
-        samples.popleft()
-    values = [count for _, count in samples]
-    return sum(values) / len(values) if values else None
+    return max(0, math.floor((cap - current - est * pending) / est)), est
 
 
 @dataclass(frozen=True)
 class Decision:
-    """One controller reading: the inputs it used and the plan it reached."""
+    """One reading: the inputs the controller and pacing used, and the plan reached."""
 
     plan: FillPlan
     billed_avg: float
-    rate: float
-    rate_source: str
     active_now: int
     direct_ds: int | None
     running_ds: int
@@ -224,41 +291,39 @@ class Decision:
     running_filler: int
     recent_429: int
     gate: str | None
-    last_input: int
+    pacing_current: int
+    pacing_pending: int
+    pacing_source: str
     pacing_left: int
     pacing_cost: int
 
 
 def decide(
-    conn, now: float, *, fill: dict, pacing: dict, status: dict | None, ps_text: str | None,
-    laptop: tuple, was_filling: bool, samples: deque, recent_launches: int, measured: int | None,
-    paused: bool,
+    conn, now: float, *, controller: FillController, fill: dict, pacing: dict, status: dict | None,
+    ps_text: str | None, laptop: tuple, paused: bool, measured: int | None,
 ) -> Decision:
-    """Read the store and return what the controller would do now. Writes nothing; ``samples`` is the
-    caller's busy-worker history and gains this tick's reading."""
-    rows = minute_rows(conn, now, WINDOW_MINUTES)
-    billed_avg = sum(row["billed"] for row in rows.values()) / WINDOW_MINUTES
+    """Read the store and return what the controller and pacing would do now. The controller keeps its
+    own history; nothing else is written."""
     counts = job_counts(conn, now)
-    direct = direct_ds_workers(ps_text)
-    active_now = counts["running_ds"] + (direct or 0)
-    avg_active = active_average(samples, now, active_now, WINDOW_MINUTES * MINUTE_S)
-    rate, source = per_worker_rate(billed_avg, avg_active, fill)
+    direct = direct_ds_workers(ps_text) if fill["enabled"] else None
+    active = counts["running_ds"] + (direct or 0)
+    billed_avg = sum(row["billed"] for row in minute_rows(conn, now, WINDOW_MINUTES).values()) / WINDOW_MINUTES
     recent = recent_429(conn, now, fill["gate_429_window_s"])
     gate = gate_reason(status, recent, laptop, fill)
-    if direct is None and fill["enabled"] and gate is None:
+    if fill["enabled"] and direct is None and gate is None:
         gate = "worker count unknown (ps failed); filler waits"
-    plan = plan_fill(
-        enabled=bool(fill["enabled"]), paused=paused, avg_billed=billed_avg, was_filling=was_filling,
-        fill=fill, rate=rate, running_ds=active_now, ready_real=counts["ready_real"],
-        queued_filler=counts["queued_filler"], gate=gate,
+    plan = controller.tick(
+        now, fill=fill, paused=paused, billed_avg=billed_avg, active=active,
+        ready_real=counts["ready_real"], queued_filler=counts["queued_filler"], gate=gate,
     )
-    last_input = last_minute_input(conn, now)
-    left, cost = pacing_allowance(last_input, recent_launches, pacing, measured)
+    current, source = current_uncached(status, conn, now)
+    pending = pending_launches(conn, now, pacing["first_request_grace_s"])
+    left, cost = pacing_allowance(current, pending, pacing, measured)
     return Decision(
-        plan=plan, billed_avg=billed_avg, rate=rate, rate_source=source, active_now=active_now,
-        direct_ds=direct, running_ds=counts["running_ds"], ready_real=counts["ready_real"],
-        queued_filler=counts["queued_filler"], running_filler=counts["running_filler"],
-        recent_429=recent, gate=gate, last_input=last_input, pacing_left=left, pacing_cost=cost,
+        plan=plan, billed_avg=billed_avg, active_now=active, direct_ds=direct,
+        running_ds=counts["running_ds"], ready_real=counts["ready_real"], queued_filler=counts["queued_filler"],
+        running_filler=counts["running_filler"], recent_429=recent, gate=gate, pacing_current=current,
+        pacing_pending=pending, pacing_source=source, pacing_left=left, pacing_cost=cost,
     )
 
 
@@ -271,11 +336,14 @@ def minute_rows(conn, now: float, minutes: int) -> dict[str, dict]:
     """DeepSeek billed tokens per minute for the last ``minutes`` complete UTC minutes, keyed by minute stamp.
     Billed is input + cache_read + output, as Morph counts it. A minute with no rows is absent."""
     end = math.floor(now / 60) * 60
-    found = conn.execute(
-        """SELECT minute, SUM(input) AS input, SUM(cache_read) AS cache_read, SUM(output) AS output
-           FROM proxy_minutes WHERE model LIKE ? AND minute >= ? AND minute < ? GROUP BY minute""",
-        (DS_MODEL_LIKE, minute_stamp(end - MINUTE_S * minutes), minute_stamp(end)),
-    ).fetchall()
+    try:
+        found = conn.execute(
+            """SELECT minute, SUM(input) AS input, SUM(cache_read) AS cache_read, SUM(output) AS output
+               FROM proxy_minutes WHERE model LIKE ? AND minute >= ? AND minute < ? GROUP BY minute""",
+            (DS_MODEL_LIKE, minute_stamp(end - MINUTE_S * minutes), minute_stamp(end)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
     return {
         row["minute"]: {
             "input": int(row["input"] or 0),
@@ -285,17 +353,56 @@ def minute_rows(conn, now: float, minutes: int) -> dict[str, dict]:
     }
 
 
-def last_minute_input(conn, now: float) -> int:
-    """DeepSeek uncached input in the last complete UTC minute (0 when none was recorded)."""
-    return minute_rows(conn, now, 1).get(minute_stamp(math.floor(now / 60) * 60 - MINUTE_S), {}).get("input", 0)
+def current_uncached(status: dict | None, conn, now: float) -> tuple[int, str]:
+    """DeepSeek uncached input in the current Morph minute, and where it was read from.
+
+    The proxy's live ``uncached_ds`` budget is the source, since it counts in-flight charges. Without a
+    proxy reading, the store's current-minute row stands in (the proxy flushes it every few seconds).
+    """
+    budget = ((status or {}).get("budgets") or {}).get(UNCACHED_BUDGET) if isinstance(status, dict) else None
+    if isinstance(budget, dict) and isinstance(budget.get("used_60s"), int):
+        return int(budget["used_60s"]), "proxy"
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input), 0) FROM proxy_minutes WHERE model LIKE ? AND minute = ?",
+            (DS_MODEL_LIKE, minute_stamp(now)),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0, "store"
+    return int(row[0]), "store"
+
+
+def pending_launches(conn, now: float, grace_s: float) -> int:
+    """DeepSeek jobs started within ``grace_s`` whose first request the proxy has not recorded yet.
+
+    A job with a proxy_jobs row has been seen (its usage is in the live budget). A job without one may
+    still be starting, so it counts at the first-request estimate. Each launch is counted once, and the
+    count comes from the store, so a broker restart keeps it.
+    """
+    since = now - grace_s
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM jobs j WHERE j.state = 'running' AND j.tier = ? AND j.started_at >= ?
+               AND NOT EXISTS (SELECT 1 FROM proxy_jobs p WHERE p.job = j.id AND p.model LIKE ?)""",
+            (DS_TIER, since, DS_MODEL_LIKE),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'running' AND tier = ? AND started_at >= ?",
+            (DS_TIER, since),
+        ).fetchone()
+    return int(row[0])
 
 
 def recent_429(conn, now: float, seconds: float) -> int:
     """DeepSeek upstream 429s in the minutes that overlap the last ``seconds``."""
-    row = conn.execute(
-        "SELECT COALESCE(SUM(r429), 0) FROM proxy_minutes WHERE model LIKE ? AND minute >= ?",
-        (DS_MODEL_LIKE, minute_stamp(now - seconds)),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(r429), 0) FROM proxy_minutes WHERE model LIKE ? AND minute >= ?",
+            (DS_MODEL_LIKE, minute_stamp(now - seconds)),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
     return int(row[0])
 
 
@@ -340,14 +447,17 @@ def process_table(run=subprocess.run) -> str | None:
 def measured_first_request(conn, now: float, pacing: dict) -> int | None:
     """The first-request uncached cost, measured from single-request DeepSeek jobs in proxy_jobs.
 
-    A job with one request has that request's uncached input as its whole input, so the percentile of
+    A job with one request has that request's uncached input as its whole input, so a percentile of
     those is the launch cost. None when fewer than ``min_measured_jobs`` jobs have been seen in the window.
     The percentile (75 by default) leans high, because short jobs would understate a full session start.
     """
-    rows = conn.execute(
-        "SELECT input FROM proxy_jobs WHERE model LIKE ? AND req = 1 AND input > 0 AND last_ts >= ?",
-        (DS_MODEL_LIKE, now - pacing["measure_window_s"]),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT input FROM proxy_jobs WHERE model LIKE ? AND req = 1 AND input > 0 AND last_ts >= ?",
+            (DS_MODEL_LIKE, now - pacing["measure_window_s"]),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
     values = sorted(int(row[0]) for row in rows)
     if len(values) < pacing["min_measured_jobs"]:
         return None
@@ -357,13 +467,14 @@ def measured_first_request(conn, now: float, pacing: dict) -> int | None:
 
 
 def main(argv=None, out=None) -> int:
-    """Print one controller reading from an agentq home: what filler and pacing would do now, and why.
+    """Print one reading from an agentq home: what fill and pacing would do now, and why.
 
     Read-only: it reads the store, the live proxy status and the laptop gauges, and writes nothing.
-    Busy-worker history is not kept by a one-shot read, so the average is the current count.
-    Run it on a copy of the store when the live broker is running, so the copy is what gets migrated.
+    A one-shot read has no step history, so the controller starts from a clean state and its first
+    step is what it would do on a fresh broker. Run it on a copy of the store when the live broker runs.
     """
     from agentq import broker as broker_lib
+
     parser = argparse.ArgumentParser(prog="agentq.fill", description=(__doc__ or "").split("\n")[0])
     parser.add_argument("--home", required=True, help="agentq home holding agentq.db and broker.json")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
@@ -386,10 +497,9 @@ def main(argv=None, out=None) -> int:
         now = time.time()
         measured = measured_first_request(conn, now, pacing) if pacing["measure_first_request"] else None
         decision = decide(
-            conn, now, fill=fill, pacing=pacing, status=broker_lib.proxy_status(),
-            ps_text=process_table(), laptop=broker_lib.Gauges().read(15.0),
-            was_filling=False, samples=deque(), recent_launches=0, measured=measured,
-            paused=filler_lib.paused(conn),
+            conn, now, controller=FillController(), fill=fill, pacing=pacing, status=broker_lib.proxy_status(),
+            ps_text=process_table(), laptop=broker_lib.Gauges().read(15.0), paused=filler_lib.paused(conn),
+            measured=measured,
         )
         due = filler_lib.next_target(conn, targets, head_of=filler_lib.module_head)
     finally:
@@ -397,12 +507,13 @@ def main(argv=None, out=None) -> int:
     plan = decision.plan
     print(f"fill enabled={fill['enabled']} target={fill['target_billed_per_min']:,}/min "
           f"low={fill['low_frac'] * fill['target_billed_per_min']:,.0f} high={fill['high_frac'] * fill['target_billed_per_min']:,.0f}", file=out)
-    print(f"5-min billed average {decision.billed_avg:,.0f}/min; per-worker rate {decision.rate:,.0f} ({decision.rate_source})", file=out)
-    print(f"DeepSeek busy: queue {decision.running_ds} (filler {decision.running_filler}), direct {decision.direct_ds}; "
-          f"ready real {decision.ready_real}; queued filler {decision.queued_filler}", file=out)
-    print(f"Morph gate: {decision.gate or 'open'}; DeepSeek 429s in gate window {decision.recent_429}", file=out)
+    print(f"DeepSeek billed 5-min average {decision.billed_avg:,.0f}/min; busy {decision.active_now} "
+          f"(queue {decision.running_ds}, filler {decision.running_filler}, direct {decision.direct_ds})", file=out)
+    print(f"ready real {decision.ready_real}; queued filler {decision.queued_filler}; "
+          f"Morph gate: {decision.gate or 'open'}; DeepSeek 429s in gate window {decision.recent_429}", file=out)
     cost_source = "measured" if measured else "default"
-    print(f"pacing: last-minute uncached {decision.last_input:,}, launch cost {decision.pacing_cost:,} ({cost_source}), "
+    print(f"pacing: current minute uncached {decision.pacing_current:,} ({decision.pacing_source}), "
+          f"{decision.pacing_pending} pending launch(es) at {decision.pacing_cost:,} ({cost_source}), "
           f"launches allowed now {decision.pacing_left}", file=out)
     print(f"next filler target: {due[0].key} at {due[1][:12]}" if due else "next filler target: none due", file=out)
     print(f"ANSWER: would submit {plan.submit} filler job(s) now; filling={plan.filling}; {plan.reason}", file=out)
