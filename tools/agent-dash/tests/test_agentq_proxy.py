@@ -406,7 +406,7 @@ class LaneTest(ProxyCase):
         order = [request["job"] for request in self.fake.requests[1:]]
         self.assertEqual(order, ["urgent-job", "normal-job", "backlog-job"])
 
-    async def test_urgent_guard_keeps_half_budget_while_lower_lanes_wait(self) -> None:
+    async def test_urgent_guard_keeps_thirty_percent_while_lower_lanes_wait(self) -> None:
         make_db(self.home, {"urgent-a": "urgent", "urgent-b": "urgent", "normal-c": "normal"})
         self.gov.budgets["output"].limit = 1000
         self.gov.budgets["output"].target = 1.0
@@ -418,7 +418,7 @@ class LaneTest(ProxyCase):
         await wait_for(lambda: len(self.fake.requests) == 1)
         third = asyncio.create_task(self.post(self.chat(MODEL_OUT, 800), job="normal-c"))
         await asyncio.sleep(0.05)
-        second = asyncio.create_task(self.post(self.chat(MODEL_OUT, 300), job="urgent-b"))
+        second = asyncio.create_task(self.post(self.chat(MODEL_OUT, 450), job="urgent-b"))
         await asyncio.sleep(0.4)
         self.assertEqual([r["job"] for r in self.fake.requests], ["urgent-a"])
 
@@ -607,7 +607,7 @@ class PerBudgetQueueTest(unittest.TestCase):
     def test_urgent_guard_block_does_not_hold_normal_on_the_same_budget(self) -> None:
         self.gov.budgets["output"].limit = 1000
         self.gov.budgets["output"].target = 1.0
-        self.occupy("output", 500, lane="urgent")
+        self.occupy("output", 700, lane="urgent")
         urgent = make_ticket(self.gov, job="urgent-next", model=MODEL_OUT, text="x", max_tokens=100, lane="urgent")
         normal = make_ticket(self.gov, job="normal-x", model=MODEL_OUT, text="x", max_tokens=100)
         self.queue(urgent, normal)
