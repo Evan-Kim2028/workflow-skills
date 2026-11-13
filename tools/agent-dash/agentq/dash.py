@@ -458,7 +458,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The step line is the average of each Eastern clock hour over its minutes, with idle minutes counted as zero; the lighter dotted step is the hour in progress, averaged over the minutes so far. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
+      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute. The step line is the average of each complete Eastern clock hour over its minutes, with idle minutes counted as zero; the hour in progress has no step until it completes. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 
@@ -819,27 +819,23 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       }
     });
   }
-  function hourRowFor(rows, t) {
+  function completeHourFor(rows, t) {
     for (var i = 0; i < rows.length; i++) {
-      if (t >= rows[i].t && t < rows[i].t + 3600) return rows[i];
+      if (t >= rows[i].t && t < rows[i].t + 3600) return rows[i].partial || rows[i].avg === null ? null : rows[i];
     }
     return null;
   }
-  function withHourly(points, rows, until) {
-    // Each minute point carries its Eastern hour's average. At an hour boundary a point with the old
-    // value is inserted at the boundary time, so the step is vertical rather than a slope across one minute.
+  function withHourly(points, rows) {
+    // Each minute point carries its Eastern hour's average once that hour is complete; the hour in progress
+    // has no step yet. At an hour boundary a point with the old value is inserted at the boundary time, so the
+    // step is vertical rather than a slope across one minute.
     var out = [];
     var prev = null;
     points.forEach(function (p) {
-      var row = hourRowFor(rows, p.t);
-      var cur = Object.assign({}, p, { hourly: null, hourlyPartial: null });
-      if (row && row.avg !== null) {
-        if (row.partial) cur.hourlyPartial = row.avg; else cur.hourly = row.avg;
-      }
-      if (prev && row && prev.row && row !== prev.row) {
-        var step = Object.assign({}, p, { hourly: null, hourlyPartial: null });
-        if (prev.row.partial) step.hourlyPartial = prev.row.avg; else step.hourly = prev.row.avg;
-        out.push(step);
+      var row = completeHourFor(rows, p.t);
+      var cur = Object.assign({}, p, { hourly: row ? row.avg : null });
+      if (prev !== null && row !== prev.row) {
+        out.push(Object.assign({}, p, { hourly: prev.row ? prev.row.avg : null }));
       }
       out.push(cur);
       prev = { row: row };
@@ -959,26 +955,41 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         below = above;
       });
     } else {
-      cfg.series.filter(function (s) { return s.area; }).forEach(function (s) {
-        var base = Yc(cfg.y.min).toFixed(1);
-        var segments = [];
-        var current = null;
-        points.forEach(function (p) {
-          var v = p[s.key];
-          if (v === null || v === undefined) { current = null; return; }
-          if (!current) { current = []; segments.push(current); }
-          current.push({ x: X(p.t).toFixed(1), y: Yc(v).toFixed(1) });
-        });
-        segments.forEach(function (seg) {
-          var d = "M" + seg[0].x + "," + base + seg.map(function (q) { return " L" + q.x + "," + q.y; }).join("") +
-            " L" + seg[seg.length - 1].x + "," + base + " Z";
+      // Stacked layers: each band runs from the layers below it up to its own cumulative top.
+      var stackKeys = cfg.stack || [];
+      var stackSeries = stackKeys.map(function (key) {
+        return cfg.series.filter(function (s) { return s.key === key; })[0];
+      });
+      var stackRuns = [];
+      var run = null;
+      points.forEach(function (p) {
+        var complete = stackKeys.every(function (key) { return p[key] !== null && p[key] !== undefined; });
+        if (!complete) { run = null; return; }
+        if (!run) { run = []; stackRuns.push(run); }
+        run.push(p);
+      });
+      stackRuns.forEach(function (runPoints) {
+        stackKeys.forEach(function (key, layer) {
+          var upper = runPoints.map(function (p) {
+            var top = 0;
+            for (var j = 0; j <= layer; j++) top += p[stackKeys[j]];
+            return { x: X(p.t).toFixed(1), y: Yc(top).toFixed(1) };
+          });
+          var lower = runPoints.map(function (p) {
+            var base = 0;
+            for (var j = 0; j < layer; j++) base += p[stackKeys[j]];
+            return { x: X(p.t).toFixed(1), y: Yc(base).toFixed(1) };
+          }).reverse();
+          var d = "M" + upper.map(function (q) { return q.x + "," + q.y; }).join(" L") +
+            " L" + lower.map(function (q) { return q.x + "," + q.y; }).join(" L") + " Z";
+          var series = stackSeries[layer];
           svgEl("path", {
-            d: d, fill: s.color, "fill-opacity": s.fillOpacity || 0.3, stroke: s.color, "stroke-opacity": 0.55,
-            "stroke-width": 1, "stroke-linejoin": "round"
+            d: d, fill: series.color, "fill-opacity": series.fillOpacity || 0.3, stroke: series.color,
+            "stroke-opacity": 0.55, "stroke-width": 1, "stroke-linejoin": "round"
           }, svg);
         });
       });
-      cfg.series.filter(function (s) { return !s.area; }).forEach(function (s) {
+      cfg.series.filter(function (s) { return !s.stacked && !s.tooltipOnly; }).forEach(function (s) {
         var d = "";
         var lastPoint = null;
         points.forEach(function (p) {
@@ -1295,7 +1306,11 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var tb = d.token_bucket_s || bucket;
     var tunit = unitLabel(tb);
     var workers = (d.workers || []).map(function (w) {
-      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued };
+      var split = w.ds_queued !== null && w.ds_queued !== undefined && w.kimi_queued !== null && w.kimi_queued !== undefined;
+      return {
+        t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued,
+        queuedTotal: split ? w.ds_queued + w.kimi_queued : null
+      };
     });
     var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
@@ -1310,11 +1325,10 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       title: "Morph total-token limit used per minute",
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
-      points: withHourly(minutes, hourlyRows, win.end),
+      points: withHourly(minutes, hourlyRows),
       series: [
         { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 },
-        { key: "hourly", name: "Hourly average", color: COLORS.s3, width: 2.5 },
-        { key: "hourlyPartial", name: "This hour so far", color: COLORS.s3, width: 2.5, dash: "1 4", opacity: 0.75 }
+        { key: "hourly", name: "Hourly average", color: COLORS.s3, width: 2.5 }
       ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
       refs: [{ v: 1, label: "Morph limit (10M/min)" }],
@@ -1329,11 +1343,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
       points: workers,
+      stack: ["dsq", "kimiq"],
       series: [
         { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
-        { key: "dsq", name: "DeepSeek queued", color: COLORS.s3, area: true, fillOpacity: 0.32 },
-        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 }
+        { key: "dsq", name: "DeepSeek queued", color: COLORS.s3, stacked: true, fillOpacity: 0.32 },
+        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, stacked: true, fillOpacity: 0.3 },
+        { key: "queuedTotal", name: "Queued, total", color: COLORS.muted, tooltipOnly: true }
       ],
       y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
@@ -1356,8 +1372,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("tok-mix", mixCaption(d.token_totals));
     legendFor($("lg-billed"), [
       { name: "Per minute", color: COLORS.s1 },
-      { name: "Hourly average", color: COLORS.s3 },
-      { name: "This hour so far", color: COLORS.s3, dotted: true }
+      { name: "Hourly average", color: COLORS.s3 }
     ]);
     legendFor($("lg-workers"), [
       { name: "DeepSeek runs", color: COLORS.s1 },
