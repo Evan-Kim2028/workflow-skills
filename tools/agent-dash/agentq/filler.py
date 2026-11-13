@@ -35,11 +35,15 @@ writes jobs through ``db.insert_job`` as usual.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,10 +71,20 @@ DEFAULT_MAX_RUNTIME_S = 900.0
 DEFAULT_MAX_TARGET_LINES = 4000
 DEFAULT_MIN_TARGET_LINES = 300
 DEFAULT_PR_WINDOW_H = 48.0
+PR_REFRESH_S = 1800.0
 CODE_SUFFIXES = (".py", ".sql", ".sh")
-SLUG_MAX = 60
+SLUG_BASE_MAX = 48
+SLUG_HASH_LEN = 8
 GIT_TIMEOUT_S = 5.0
 SKIP_DIRS = frozenset({"__pycache__", "node_modules", "build", "dist"})
+GENERATED_DIRS = frozenset({
+    "target", "dbt_packages", "vendor", "venv", "site-packages", "htmlcov", "coverage", "out",
+})
+SCAN_MAX_FILES = 20_000
+SCAN_MAX_BYTES = 200 * 1024 * 1024
+SCAN_MAX_SECONDS = 5.0
+INDEX_MAX_ENTRIES = 2000
+INDEX_LOCK = "INDEX.lock"
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 FINDING_LINE = re.compile(r"^- \*\*(high|medium|low)\*\* `([^`]+)` [—–-] (.+?)\s*$")
 INDEX_HEADER = (
@@ -137,9 +151,14 @@ class Work:
 
 
 def module_slug(text: str) -> str:
-    """Lowercase letters, digits and dashes, at most SLUG_MAX characters. A name with none becomes ``root``."""
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug[:SLUG_MAX].strip("-") or "root"
+    """A readable slug plus an 8-hex hash of the full path, so two paths that share a prefix never share a slug.
+
+    The readable part is lowercase letters, digits and dashes, at most SLUG_BASE_MAX characters. The hash is the
+    first eight hex digits of sha1 over the full text.
+    """
+    base = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:SLUG_BASE_MAX].strip("-") or "root"
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:SLUG_HASH_LEN]
+    return f"{base}-{digest}"
 
 
 def label_slug(target: Target, kind: str = "bugs") -> str:
@@ -183,60 +202,157 @@ def _root_modules(workspace: str, roots: list) -> list[str]:
     return modules
 
 
-def _code_files(root: Path):
-    """Code files under ``root`` (a file yields itself), skipping hidden and cache folders. Sorted for stability."""
-    if root.is_file():
-        if root.suffix in CODE_SUFFIXES:
-            yield root
-        return
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS)
-        for name in sorted(filenames):
-            if name.endswith(CODE_SUFFIXES):
-                yield Path(dirpath, name)
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
-def _lines(path: Path) -> int:
-    with open(path, "rb") as fh:
-        return sum(1 for _ in fh)
+class ScanOverrun(Exception):
+    """A module scan went over its file, byte or time budget. The module is then kept whole."""
 
 
-def code_lines(root: Path) -> int:
-    """Lines in the code files under ``root``."""
-    return sum(_lines(path) for path in _code_files(root))
+class ScanBudget:
+    """Limits one module scan: files counted, bytes read, and seconds spent. Charge each file before reading it."""
+
+    def __init__(self, max_files: int = SCAN_MAX_FILES, max_bytes: int = SCAN_MAX_BYTES,
+                 max_seconds: float = SCAN_MAX_SECONDS, clock=time.monotonic):
+        self.max_files, self.max_bytes, self.max_seconds, self.clock = max_files, max_bytes, max_seconds, clock
+        self.files = 0
+        self.bytes = 0
+        self.started = clock()
+
+    def charge(self, size: int) -> None:
+        self.files += 1
+        self.bytes += size
+        if self.files > self.max_files or self.bytes > self.max_bytes:
+            raise ScanOverrun(f"over budget: {self.files} files, {self.bytes} bytes")
+        if self.clock() - self.started > self.max_seconds:
+            raise ScanOverrun(f"over {self.max_seconds:g} s")
 
 
-def split_module(workspace: str, module: str, max_lines: int, min_lines: int) -> list[str]:
+def _git_ignored(workspace: Path, rel_paths: list[str], run=subprocess.run) -> set[str]:
+    """The paths git ignores, from one ``git check-ignore --stdin`` call. Empty when the folder is not a repo or git fails."""
+    if not rel_paths:
+        return set()
+    try:
+        out = run(["git", "-C", str(workspace), "check-ignore", "--stdin"], input="\n".join(rel_paths) + "\n",
+                  capture_output=True, text=True, timeout=GIT_TIMEOUT_S * 2, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {line.strip() for line in (out or "").splitlines() if line.strip()}
+
+
+def _module_code_files(workspace: Path, module: str, budget: ScanBudget, run=subprocess.run) -> list[tuple[str, int]]:
+    """(workspace-relative path, line count) for every code file under ``module``.
+
+    Only regular files are read. FIFOs, devices and sockets are skipped, and so are symlinks whose resolved path
+    leaves the workspace. Generated and vendored folders are pruned, and git-ignored files are dropped with one
+    ``git check-ignore`` call. Each file is charged to ``budget`` before it is read, so a large or slow tree raises
+    ScanOverrun instead of blocking.
+    """
+    root = Path(workspace, module)
+    if root.is_symlink() and not _is_within(root.resolve(), workspace.resolve()):
+        return []
+    rel_files: list[str] = []
+    if root.is_file() or root.is_symlink():
+        candidates = [root] if root.suffix in CODE_SUFFIXES else []
+    else:
+        candidates = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not d.startswith(".") and d not in SKIP_DIRS and d not in GENERATED_DIRS
+                and not os.path.islink(os.path.join(dirpath, d))
+            )
+            for name in sorted(filenames):
+                if name.endswith(CODE_SUFFIXES):
+                    candidates.append(Path(dirpath, name))
+    for path in candidates:
+        if path.is_symlink() and not _is_within(path.resolve(), workspace.resolve()):
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        rel_files.append(str(path.relative_to(workspace)))
+    ignored = _git_ignored(workspace, rel_files, run=run)
+    out = []
+    for rel in rel_files:
+        if rel in ignored:
+            continue
+        path = Path(workspace, rel)
+        budget.charge(os.stat(path).st_size)
+        out.append((rel, _count_lines(path)))
+    return out
+
+
+def _count_lines(path: Path) -> int:
+    """Lines in a regular file. Opened without blocking, and skipped unless it is still a regular file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return 0
+        count, pending = 0, b""
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            count += chunk.count(b"\n")
+            pending = chunk[-1:]
+        return count + (1 if pending and pending != b"\n" else 0)
+    finally:
+        os.close(fd)
+
+
+def split_module(workspace: str, module: str, max_lines: int, min_lines: int,
+                 budget: ScanBudget | None = None) -> list[str]:
     """The audit targets for one module, relative to the workspace.
 
     A module at or under ``max_lines`` of code is one target. A larger one is split: each child package under
     the limit is a target, and each larger child contributes its files of at least ``min_lines``. Files directly
-    in the module do the same. A module with no code is kept whole, so a docs-only folder still gets its docs audit.
+    in the module do the same. A module with no code is kept whole, so a docs-only folder still gets its docs
+    audit. A scan over budget keeps the module whole.
     """
-    root = Path(workspace, module)
-    if root.is_file():
-        return [module]
-    if not root.is_dir():
+    ws = Path(workspace)
+    root = Path(ws, module)
+    if root.is_symlink() and not _is_within(root.resolve(), ws.resolve()):
         return []
-    total = code_lines(root)
+    if not root.exists():
+        return []
+    try:
+        files = _module_code_files(ws, module, budget or ScanBudget())
+    except ScanOverrun:
+        return [module]
+    if not files:
+        return [module]
+    total = sum(lines for _, lines in files)
     if total <= max_lines or total == 0:
         return [module]
-    base = Path(workspace)
+    groups: dict[str, list[tuple[str, int]]] = {}
+    for rel, lines in files:
+        parts = Path(rel).relative_to(module).parts if rel != module else ()
+        key = parts[0] if len(parts) > 1 else ""
+        groups.setdefault(key, []).append((rel, lines))
     pieces: set[str] = set()
-    for child in sorted(root.iterdir()):
-        if child.is_file() and child.suffix in CODE_SUFFIXES and _lines(child) >= min_lines:
-            pieces.add(str(child.relative_to(base)))
-        if not _is_visible_dir(child):
+    for key, members in groups.items():
+        if key == "":
+            pieces.update(rel for rel, lines in members if lines >= min_lines)
             continue
-        size = code_lines(child)
+        size = sum(lines for _, lines in members)
         if size == 0:
             continue
         if size <= max_lines:
-            pieces.add(str(child.relative_to(base)))
-            continue
-        for path in _code_files(child):
-            if _lines(path) >= min_lines:
-                pieces.add(str(path.relative_to(base)))
+            pieces.add(f"{module}/{key}")
+        else:
+            pieces.update(rel for rel, lines in members if lines >= min_lines)
     return sorted(pieces)
 
 
@@ -490,12 +606,54 @@ def index_path(report_dir: str) -> Path:
     return Path(report_dir) / "filler" / "INDEX.md"
 
 
-def append_index(report_dir: str, heading: str, findings, now: float) -> int:
-    """Add the findings not already in the index as a new block at the top. Returns how many were added."""
-    path = index_path(report_dir)
+def _index_blocks(text: str) -> tuple[str, list[str]]:
+    """Split the index into its header and its job blocks (each starts at a line that begins ``## ``)."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.startswith("## ")]
+    if not starts:
+        return text, []
+    header = "".join(lines[: starts[0]])
+    bounds = starts + [len(lines)]
+    return header, ["".join(lines[bounds[k]: bounds[k + 1]]) for k in range(len(starts))]
+
+
+def _block_bullets(block: str) -> list[tuple[str, str, str]]:
+    return parse_findings(block)
+
+
+def _block_month(block: str) -> str:
+    """YYYY-MM of a job block's heading (its stamp), or the current month when the heading has none."""
+    match = re.match(r"## (\d{4})-(\d{2})-\d{2}", block)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    return time.strftime("%Y-%m", time.gmtime())
+
+
+def append_index(report_dir: str, heading: str, findings, now: float,
+                 max_entries: int = INDEX_MAX_ENTRIES) -> int:
+    """Add the findings not already in the index as a new block at the top. Returns how many were added.
+
+    Safe for concurrent appenders: the index is read, changed and rewritten under an exclusive lock on
+    ``filler/INDEX.lock``, and the rewrite goes to a temporary file that replaces the index in one step.
+    The index keeps the newest ``max_entries`` findings. Older job blocks move to ``INDEX-<YYYY-MM>.md`` archives,
+    which are appended to and never reread. Deduplication is against the retained window.
+    """
+    base = Path(report_dir) / "filler"
+    base.mkdir(parents=True, exist_ok=True)
+    with open(base / INDEX_LOCK, "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            return _append_locked(base, heading, findings, now, max_entries)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _append_locked(base: Path, heading: str, findings, now: float, max_entries: int) -> int:
+    path = base / "INDEX.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    seen = {(loc, title) for _, loc, title in parse_findings(existing)}
-    fresh = []
+    header, blocks = _index_blocks(existing)
+    seen = {(loc, title) for block in blocks for _, loc, title in _block_bullets(block)}
+    fresh: list[tuple[str, str, str]] = []
     for severity, loc, title in findings:
         if (loc, title) in seen:
             continue
@@ -504,15 +662,105 @@ def append_index(report_dir: str, heading: str, findings, now: float) -> int:
     if not fresh:
         return 0
     stamp = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-    block = f"## {stamp} — {heading}\n" + "".join(f"- **{s}** `{loc}` — {title}\n" for s, loc, title in fresh) + "\n"
-    if not existing:
-        text = INDEX_HEADER + block
-    else:
-        cut = existing.find("\n## ")
-        text = existing + block if cut < 0 else existing[: cut + 1] + block + existing[cut + 1:]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    new_block = f"## {stamp} — {heading}\n" + "".join(f"- **{s}** `{loc}` — {t}\n" for s, loc, t in fresh) + "\n"
+    blocks.insert(0, new_block)
+    counts = [len(_block_bullets(block)) for block in blocks]
+    retained, total = len(blocks), sum(counts)
+    while retained > 1 and total > max_entries:
+        retained -= 1
+        total -= counts[retained]
+    moved = blocks[retained:]
+    kept = blocks[:retained]
+    if not header.strip():
+        header = INDEX_HEADER
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    tmp.write_text(header + "".join(kept), encoding="utf-8")
+    os.replace(tmp, path)
+    by_month: dict[str, list[str]] = {}
+    for block in moved:
+        by_month.setdefault(_block_month(block), []).append(block)
+    for month, group in by_month.items():
+        with open(base / f"INDEX-{month}.md", "a", encoding="utf-8") as archive:
+            archive.write("".join(group))
     return len(fresh)
+
+
+class WorkCache:
+    """The filler's settings and merged PRs, read off the caller's thread.
+
+    ``snapshot()`` never blocks. It returns the last complete read (empty before the first) and starts a background
+    refresh when that read is older than ``refresh_s`` or the seed file changed. The scan of the repos and the GitHub
+    calls run in that thread, so a slow tree or a slow ``gh`` cannot hold the broker tick. ``synchronous=True`` runs
+    the refresh inline (tests).
+    """
+
+    def __init__(self, home, *, now=time.time, synchronous: bool = False, refresh_s: float = PR_REFRESH_S,
+                 log=lambda message: None, run=subprocess.run):
+        self.path = Path(home) / CONFIG_NAME
+        self.now = now
+        self.synchronous = synchronous
+        self.refresh_s = refresh_s
+        self.log = log
+        self.run = run
+        self._lock = threading.Lock()
+        self._settings: Settings | None = None
+        self._prs: list[dict] = []
+        self._built_at: float | None = None
+        self._built_mtime: float | None = None
+        self._thread: threading.Thread | None = None
+
+    def _mtime(self) -> float | None:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
+
+    def snapshot(self) -> tuple[Settings, list[dict]]:
+        now = self.now()
+        mtime = self._mtime()
+        with self._lock:
+            stale = (self._built_at is None or now - self._built_at >= self.refresh_s
+                     or mtime != self._built_mtime)
+            busy = self._thread is not None and self._thread.is_alive()
+        if stale and not busy:
+            if self.synchronous:
+                self._refresh(now)
+            else:
+                thread = threading.Thread(target=self._refresh, args=(now,), name="filler-work", daemon=True)
+                with self._lock:
+                    self._thread = thread
+                thread.start()
+        with self._lock:
+            return (self._settings or empty_settings(), list(self._prs))
+
+    def _refresh(self, now: float) -> None:
+        mtime = self._mtime()
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8")) if mtime is not None else {}
+            settings = load_settings(data)
+        except (OSError, ValueError) as exc:
+            self.log(f"filler config refused: {exc}")
+            settings = empty_settings()
+        prs: list[dict] = []
+        window_start = now - settings.pr_window_h * 3600
+        for repo in settings.pr_repos:
+            try:
+                rows = pr_source.merged_prs(repo.slug, pr_source.since_date(now, settings.pr_window_h), run=self.run)
+            except pr_source.PRSourceError as exc:
+                self.log(f"filler PR source {repo.repo}: {exc}")
+                continue
+            for row in rows:
+                if pr_source.merged_epoch(row) >= window_start:
+                    prs.append({**row, "repo": repo.repo, "slug": repo.slug, "workspace": repo.workspace,
+                                "report_dir": settings.report_dir})
+        prs.sort(key=pr_source.merged_epoch, reverse=True)
+        with self._lock:
+            self._settings, self._prs = settings, prs
+            self._built_at, self._built_mtime = now, mtime
+
+
+def empty_settings() -> Settings:
+    return Settings([], DEFAULT_MAX_RUNTIME_S, DEFAULT_KINDS, "", DEFAULT_MAX_TARGET_LINES, DEFAULT_MIN_TARGET_LINES)
 
 
 def main(argv=None, out=None, run_pr=pr_source.merged_prs, now=None, head_of=None) -> int:

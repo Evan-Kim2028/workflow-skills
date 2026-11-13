@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -172,8 +174,9 @@ class KindDueTests(Temp):
 
     def test_the_report_path_and_label_carry_the_kind(self):
         work = F.audit_work(self.target, "docs", "h1")
-        self.assertEqual(work.report_path, str(self.tmp / "rep" / "filler" / "r" / "docs" / "pkg.md"))
-        self.assertEqual(work.slug, "backlog-filler-docs-r-pkg")
+        self.assertEqual(work.report_path,
+                         str(self.tmp / "rep" / "filler" / "r" / "docs" / f"{F.module_slug('pkg')}.md"))
+        self.assertEqual(work.slug, f"backlog-filler-docs-{F.module_slug('r')}-{F.module_slug('pkg')}")
         self.assertTrue(F.is_filler_label("hub-exec-" + work.slug))
 
     def test_the_prompt_for_each_kind_is_its_own_brief(self):
@@ -326,7 +329,7 @@ class BrokerFindingsTest(Temp):
         write_lines(self.ws / "x" / "a.py", 3)
         broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: None,
                           gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)), launch_pool=mock.Mock(),
-                          labeler=lambda kind, slug: f"hub-exec-{slug}")
+                          labeler=lambda kind, slug: f"hub-exec-{slug}", work_synchronous=True)
         conn = db.connect(self.home)
         self.addCleanup(conn.close)
         run_dir = self.home / "run"
@@ -349,6 +352,201 @@ class PrSourceUnitTests(unittest.TestCase):
     def test_merged_epoch_reads_gh_timestamps_and_tolerates_bad_rows(self):
         self.assertEqual(P.merged_epoch({"mergedAt": "1970-01-01T00:01:00Z"}), 60.0)
         self.assertEqual(P.merged_epoch({"mergedAt": "nope"}), 0.0)
+
+
+class ScanSafetyTests(Temp):
+    """A FIFO, a slow tree and an over-budget tree never block the caller, and only regular code files count."""
+
+    def test_a_fifo_named_like_code_is_not_counted_or_opened(self):
+        write_lines(self.ws / "pkg" / "real.py", 10)
+        os.mkfifo(self.ws / "pkg" / "pipe.py")
+        result = {}
+
+        def scan():
+            result["files"] = F._module_code_files(self.ws, "pkg", F.ScanBudget(), run=fake_git(set()))
+        worker = threading.Thread(target=scan, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), "scan blocked on a FIFO")
+        self.assertEqual([rel for rel, _ in result["files"]], ["pkg/real.py"])
+
+    def test_a_file_budget_overrun_keeps_the_module_whole(self):
+        for i in range(10):
+            write_lines(self.ws / "big" / f"c{i}" / "m.py", 50)
+        self.assertEqual(F.split_module(str(self.ws), "big", 100, 5, budget=F.ScanBudget(max_files=3)), ["big"])
+        self.assertGreater(len(F.split_module(str(self.ws), "big", 100, 5)), 1)
+
+    def test_a_slow_tree_over_the_time_budget_keeps_the_module_whole(self):
+        ticks = iter(range(100))
+        budget = F.ScanBudget(max_seconds=2.5, clock=lambda: float(next(ticks)))
+        for i in range(8):
+            write_lines(self.ws / "slow" / f"c{i}" / "m.py", 50)
+        self.assertEqual(F.split_module(str(self.ws), "slow", 100, 5, budget=budget), ["slow"])
+
+    def test_a_slow_file_read_is_stopped_by_the_time_budget(self):
+        for i in range(30):
+            write_lines(self.ws / "sleepy" / f"c{i}" / "m.py", 10)
+        real_count = F._count_lines
+
+        def slow(path):
+            time.sleep(0.02)
+            return real_count(path)
+        started = time.monotonic()
+        with mock.patch.object(F, "_count_lines", slow):
+            result = F.split_module(str(self.ws), "sleepy", 100, 5, budget=F.ScanBudget(max_seconds=0.1))
+        self.assertEqual(result, ["sleepy"])
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_the_settings_refresh_runs_off_the_caller_thread(self):
+        self.home.mkdir()
+        (self.home / "backlog-seed.json").write_text(json.dumps({"filler": {
+            "report_dir": str(self.tmp / "rep"), "repos": {"r": {"workspace": str(self.ws), "modules": []}},
+        }}), encoding="utf-8")
+        real_load = F.load_settings
+
+        def slow_load(config):
+            time.sleep(1.0)
+            return real_load(config)
+        cache = F.WorkCache(self.home)
+        started = time.monotonic()
+        with mock.patch.object(F, "load_settings", slow_load):
+            settings, prs = cache.snapshot()
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(settings.targets, [])
+            cache._thread.join(5)
+        settings, prs = cache.snapshot()
+        self.assertEqual(prs, [])
+        self.assertEqual(len(settings.kinds), 4)
+
+
+def fake_git(ignored):
+    """A stand-in for ``git check-ignore --stdin``: it prints the paths in ``ignored`` that it is given."""
+    def run(cmd, input="", **kwargs):
+        lines = [line for line in input.splitlines() if line in ignored]
+        return subprocess.CompletedProcess(cmd, 0, "\n".join(lines) + ("\n" if lines else ""), "")
+    return run
+
+
+class ExclusionTests(Temp):
+    def test_generated_and_vendored_folders_are_pruned(self):
+        write_lines(self.ws / "pkg" / "real.py", 10)
+        for folder in ("target", "dbt_packages", "build", "dist", ".venv", "node_modules", "__pycache__",
+                       "site-packages", "vendor"):
+            write_lines(self.ws / "pkg" / folder / "generated.py", 500)
+        files = F._module_code_files(self.ws, "pkg", F.ScanBudget(), run=fake_git(set()))
+        self.assertEqual([rel for rel, _ in files], ["pkg/real.py"])
+
+    def test_git_ignored_files_are_dropped_with_one_check_ignore_call(self):
+        write_lines(self.ws / "pkg" / "real.py", 10)
+        write_lines(self.ws / "pkg" / "gen" / "out.py", 10)
+        calls = []
+
+        def run(cmd, input="", **kwargs):
+            calls.append(cmd)
+            return fake_git({"pkg/gen/out.py"})(cmd, input=input)
+        files = F._module_code_files(self.ws, "pkg", F.ScanBudget(), run=run)
+        self.assertEqual([rel for rel, _ in files], ["pkg/real.py"])
+        self.assertEqual(len([c for c in calls if "check-ignore" in c]), 1)
+
+    def test_real_git_ignores_a_file_when_the_workspace_is_a_repo(self):
+        subprocess.run(["git", "-C", str(self.ws), "init", "-q"], check=True)
+        (self.ws / ".gitignore").write_text("gen/\n", encoding="utf-8")
+        write_lines(self.ws / "pkg" / "real.py", 10)
+        write_lines(self.ws / "pkg" / "gen" / "out.py", 10)
+        files = F._module_code_files(self.ws, "pkg", F.ScanBudget())
+        self.assertEqual([rel for rel, _ in files], ["pkg/real.py"])
+
+    def test_a_symlink_leaving_the_workspace_is_rejected_and_one_inside_is_read(self):
+        outside = self.tmp / "outside"
+        write_lines(outside / "secret.py", 10)
+        write_lines(self.ws / "pkg" / "real.py", 10)
+        os.symlink(outside / "secret.py", self.ws / "pkg" / "linked.py")
+        os.symlink(self.ws / "pkg" / "real.py", self.ws / "pkg" / "alias.py")
+        os.symlink(outside, self.ws / "pkg" / "linkdir")
+        files = F._module_code_files(self.ws, "pkg", F.ScanBudget(), run=fake_git(set()))
+        self.assertEqual([rel for rel, _ in files], ["pkg/alias.py", "pkg/real.py"])
+
+    def test_a_module_that_is_a_symlink_outside_the_workspace_yields_no_target(self):
+        outside = self.tmp / "outside"
+        write_lines(outside / "secret.py", 10)
+        os.symlink(outside, self.ws / "linkmod")
+        self.assertEqual(F.split_module(str(self.ws), "linkmod", 4000, 300), [])
+
+
+class SlugCollisionTests(unittest.TestCase):
+    def test_paths_that_share_a_long_prefix_get_different_slugs_and_report_paths(self):
+        shared = "packages/" + "x" * 80
+        a, b = F.module_slug(shared + "/alpha"), F.module_slug(shared + "/beta")
+        self.assertNotEqual(a, b)
+        target_a = F.Target(repo="r", module=shared + "/alpha", workspace="", report_dir="/rep")
+        target_b = F.Target(repo="r", module=shared + "/beta", workspace="", report_dir="/rep")
+        self.assertNotEqual(target_a.report_path("bugs"), target_b.report_path("bugs"))
+        self.assertNotEqual(F.label_slug(target_a), F.label_slug(target_b))
+
+    def test_every_slug_ends_in_an_eight_hex_hash_and_keeps_a_readable_start(self):
+        for text in ("pkg/a", "root", "a" * 200):
+            slug = F.module_slug(text)
+            self.assertRegex(slug, r"-[0-9a-f]{8}$")
+        self.assertTrue(F.module_slug("pkg/a").startswith("pkg-a-"))
+        self.assertEqual(F.module_slug("pkg/a"), F.module_slug("pkg/a"))
+
+
+class IndexSafetyTests(Temp):
+    def test_two_concurrent_appenders_keep_both_findings(self):
+        rep = str(self.tmp / "rep")
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def append(n):
+            try:
+                barrier.wait()
+                F.append_index(rep, f"job {n}", [("high", f"f{n}.py:1", f"title number {n}")], NOW + n)
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+        threads = [threading.Thread(target=append, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(errors, [])
+        text = (self.tmp / "rep" / "filler" / "INDEX.md").read_text(encoding="utf-8")
+        for n in range(8):
+            self.assertIn(f"title number {n}", text)
+        self.assertEqual(sorted(p.name for p in (self.tmp / "rep" / "filler").iterdir() if "tmp" in p.name), [])
+
+    def test_the_rewrite_is_atomic_and_leaves_no_temporary_file_behind(self):
+        rep = str(self.tmp / "rep")
+        F.append_index(rep, "one", [("low", "a.py:1", "first")], NOW)
+        F.append_index(rep, "two", [("low", "b.py:1", "second")], NOW + 1)
+        names = sorted(p.name for p in (self.tmp / "rep" / "filler").iterdir())
+        self.assertEqual(names, ["INDEX.lock", "INDEX.md"])
+
+
+class IndexRetentionTests(Temp):
+    def test_the_index_keeps_only_the_newest_entries_and_archives_the_rest(self):
+        rep = str(self.tmp / "rep")
+        for n in range(5):
+            F.append_index(rep, f"job {n}", [("low", f"f{n}.py:1", f"title {n}")], NOW + n, max_entries=3)
+        text = (self.tmp / "rep" / "filler" / "INDEX.md").read_text(encoding="utf-8")
+        self.assertEqual(text.count("- **low**"), 3)
+        self.assertIn("title 4", text)
+        self.assertNotIn("title 0", text)
+        archive = (self.tmp / "rep" / "filler" / f"INDEX-{time.strftime('%Y-%m', time.gmtime(NOW))}.md")
+        archived = archive.read_text(encoding="utf-8")
+        self.assertIn("title 0", archived)
+        self.assertIn("title 1", archived)
+
+    def test_entries_from_an_older_month_go_to_their_own_archive(self):
+        rep = str(self.tmp / "rep")
+        F.append_index(rep, "january", [("low", "a.py:1", "old one")], NOW, max_entries=1)
+        F.append_index(rep, "february", [("low", "b.py:1", "new one")], NOW + 40 * 86400, max_entries=1)
+        index = (self.tmp / "rep" / "filler" / "INDEX.md").read_text(encoding="utf-8")
+        self.assertIn("new one", index)
+        self.assertNotIn("old one", index)
+        self.assertIn("old one", (self.tmp / "rep" / "filler" / "INDEX-2027-01.md").read_text(encoding="utf-8"))
+
+    def test_the_default_retention_is_two_thousand_entries(self):
+        self.assertEqual(F.INDEX_MAX_ENTRIES, 2000)
 
 
 if __name__ == "__main__":

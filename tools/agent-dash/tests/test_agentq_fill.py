@@ -498,10 +498,10 @@ class FillerTargetTests(unittest.TestCase):
 
     def test_report_path_and_labels_follow_the_spec(self):
         target = Fl.load_targets(self.config(modules=["pkg/a"]))[0][0]
-        self.assertEqual(target.report_path("bugs"),
-                         str(self.tmp.resolve() / "reports" / "filler" / "alpha" / "bugs" / "pkg-a.md"))
-        self.assertEqual(Fl.label_slug(target), "backlog-filler-bugs-alpha-pkg-a")
-        self.assertTrue(Fl.is_filler_label("hub-exec-backlog-filler-bugs-alpha-pkg-a"))
+        self.assertEqual(target.report_path("bugs"), str(
+            self.tmp.resolve() / "reports" / "filler" / "alpha" / "bugs" / f"{Fl.module_slug('pkg/a')}.md"))
+        self.assertEqual(Fl.label_slug(target), f"backlog-filler-bugs-{Fl.module_slug('alpha')}-{Fl.module_slug('pkg/a')}")
+        self.assertTrue(Fl.is_filler_label("hub-exec-" + Fl.label_slug(target)))
         self.assertFalse(Fl.is_filler_label("hub-exec-backlog-nightly"))
 
     def test_rotation_skips_unchanged_modules_and_open_jobs(self):
@@ -587,7 +587,7 @@ class BrokerWiringTest(unittest.TestCase):
     def broker(self):
         gauges = mock.Mock(read=lambda: H.Headroom(90.0, 0.1, 0.1, None))
         broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: self.status,
-                          gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler)
+                          gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler, work_synchronous=True)
         return broker
 
     def tick(self, broker):
@@ -609,10 +609,11 @@ class BrokerWiringTest(unittest.TestCase):
         self.set_billed(1_000_000)
         self.tick(self.broker())
         labels = sorted(job["label"] for job in self.filler_jobs())
-        self.assertEqual(labels, [
-            "hub-exec-backlog-filler-bugs-alpha-pkg-a", "hub-exec-backlog-filler-bugs-alpha-pkg-b",
-            "hub-exec-backlog-filler-tests-alpha-pkg-a", "hub-exec-backlog-filler-tests-alpha-pkg-b",
-        ])
+        def label(kind, module):
+            return "hub-exec-" + Fl.label_slug(Fl.Target(repo="alpha", module=module, workspace="", report_dir=""), kind)
+        self.assertEqual(labels, sorted([
+            label("bugs", "pkg/a"), label("bugs", "pkg/b"), label("tests", "pkg/a"), label("tests", "pkg/b"),
+        ]))
         job = self.filler_jobs()[0]
         self.assertEqual((job["lane"], job["kind"], job["res"], job["session"]), ("backlog", "read", "light", "backlog"))
         self.assertIn("filler alpha/pkg/a#bugs submitted", self.log_text())

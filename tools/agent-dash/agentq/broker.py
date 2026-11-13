@@ -60,7 +60,6 @@ from agentq import backlog as backlog_lib
 from agentq import db
 from agentq import fill as fill_lib
 from agentq import filler as filler_lib
-from agentq import pr_source
 from agentq import headroom as headroom_lib
 
 TICK_S = 2.0
@@ -109,7 +108,6 @@ RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IG
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
 CONTROLLER_STATE_KEY = "fill_controller"
-PR_REFRESH_S = 1800.0
 MEASURE_REFRESH_S = 600.0
 PROCESS_REFRESH_S = 30.0
 OPEN = db.OPEN_STATES
@@ -738,7 +736,7 @@ class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
     def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
-                 labeler=None):
+                 labeler=None, work_synchronous=False):
         self.home = Path(home)
         self.launcher = launcher or run_worker_launcher
         self.labeler = labeler or label_for
@@ -758,8 +756,7 @@ class Broker:
         self._fill_key: str | None = None
         self._ps: tuple[float, str | None] | None = None
         self._measured: tuple[float, int | None] | None = None
-        self._filler_cache: tuple[float, filler_lib.Settings] | None = None
-        self._pr_cache: tuple[float, list] | None = None
+        self._work = filler_lib.WorkCache(self.home, now=self.now, synchronous=work_synchronous, log=self.log)
         self._filler_retry = 0.0
 
     def log(self, message: str) -> None:
@@ -1028,44 +1025,8 @@ class Broker:
         return self._ps[1]
 
     def _filler_settings(self) -> filler_lib.Settings:
-        """The filler's settings from backlog-seed.json, re-read when the file changes.
-        A malformed section logs once and yields no work."""
-        path = self.home / filler_lib.CONFIG_NAME
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = None
-        if self._filler_cache is not None and self._filler_cache[0] == mtime:
-            return self._filler_cache[1]
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if mtime is not None else {}
-            result = filler_lib.load_settings(data)
-        except (OSError, ValueError) as exc:
-            self.log(f"filler config refused: {exc}")
-            result = filler_lib.load_settings({})
-        self._filler_cache = (mtime, result)
-        return result
-
-    def _pr_candidates(self, now: float, settings: filler_lib.Settings) -> list[dict]:
-        """Merged PRs in the review window across the configured repos, newest first. One ``gh`` call per repo, at
-        most every PR_REFRESH_S. A repo whose call fails is logged and skipped until the next refresh."""
-        if self._pr_cache is not None and now - self._pr_cache[0] < PR_REFRESH_S:
-            return self._pr_cache[1]
-        found: list[dict] = []
-        for repo in settings.pr_repos:
-            try:
-                rows = pr_source.merged_prs(repo.slug, pr_source.since_date(now, settings.pr_window_h))
-            except pr_source.PRSourceError as exc:
-                self.log(f"filler PR source {repo.repo}: {exc}")
-                continue
-            window_start = now - settings.pr_window_h * 3600
-            for row in rows:
-                if pr_source.merged_epoch(row) >= window_start:
-                    found.append({**row, "repo": repo.repo, "slug": repo.slug, "workspace": repo.workspace,
-                                  "report_dir": settings.report_dir})
-        found.sort(key=lambda row: pr_source.merged_epoch(row), reverse=True)
-        self._pr_cache = (now, found)
-        return found
+        """The filler's settings from the background work cache. Never blocks the tick."""
+        return self._work.snapshot()[0]
 
     def _log_fill(self, plan: fill_lib.FillPlan) -> None:
         """Log the controller's reason once per change of reason, not once per tick."""
@@ -1108,21 +1069,20 @@ class Broker:
             self._saved_controller = state
         if decision.plan.submit <= 0 or now < self._filler_retry:
             return []
-        settings = self._filler_settings()
         submitted = []
         for _ in range(decision.plan.submit):
-            job_id = self._filler_job(conn, now, settings)
+            job_id = self._filler_job(conn, now)
             if job_id is None:
                 break
             submitted.append(job_id)
         return submitted
 
-    def _filler_job(self, conn, now: float, settings: filler_lib.Settings) -> str | None:
+    def _filler_job(self, conn, now: float) -> str | None:
         """Queue the next filler job: an unreviewed merged PR, else a due target and kind. Returns the job id, or
         None when nothing is due or the label is refused."""
+        settings, prs = self._work.snapshot()
         work = filler_lib.next_work(
-            conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head,
-            prs=self._pr_candidates(now, settings),
+            conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head, prs=prs,
         )
         if work is None:
             return None

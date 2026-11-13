@@ -155,8 +155,14 @@ instead of letting it swing between idle and burst.
   (`owner/name`) for merged-PR reviews.
 - Splitting. A module whose code (`.py`, `.sql`, `.sh`) is over `max_target_lines` is
   split into its child packages, and a child still over the limit into its files of at
-  least `min_target_lines`. A module with no code stays whole. Targets are read when the
-  seed file changes.
+  least `min_target_lines`. A module with no code stays whole. Only regular files are
+  read (no FIFOs or devices). Generated and vendored folders (`target/`, `dbt_packages/`,
+  `build/`, `dist/`, `.venv/`, `node_modules/`, `__pycache__/`, `site-packages/`, hidden
+  folders) and git-ignored files are left out. A symlink whose resolved path leaves the
+  workspace is rejected. Each module scan has a budget of 20,000 files, 200 MB and 5
+  seconds; a scan over budget keeps the module whole. Scans and the GitHub calls run on a
+  background thread that refreshes the target list and the merged PRs every 30 minutes
+  (or when the seed file changes), so the broker tick only reads the last complete result.
 - Audit kinds. `bugs` (correctness defects and dead code), `tests` (risky paths with no
   test, with the test cases described, not written), `docs` (docstrings, runbooks and
   AGENTS.md text that no longer matches the code), `risk` (security issues and expensive
@@ -170,12 +176,18 @@ instead of letting it swing between idle and burst.
   every 30 minutes (at most 50 PRs per call). Reviewed PRs are recorded in `filler_prs`,
   and a PR is reviewed once. Reports go to `<report_dir>/filler/<repo>/pr/<number>.md`.
 - Findings index. After each filler job, its top findings (at most five, most severe
-  first) are added to `<report_dir>/filler/INDEX.md`, newest first. Each finding is one
+  first) are added to `<report_dir>/filler/INDEX.md`, newest first. Writes take an
+  exclusive lock on `filler/INDEX.lock` and replace the file atomically. The index keeps
+  the newest 2000 findings; older job blocks move to `INDEX-<YYYY-MM>.md` archives, which
+  are only appended to. Deduplication runs against the retained window. Each finding is one
   bullet, ``- **high** `file:line` — title``, and a finding whose file:line and title are
   already in the index is skipped.
 - Each job is a single step: the next unreviewed PR first, then the next due pair. The
   cursor rotates the targets, and an open job for a pair blocks it until it ends. Labels
-  come from `label make` as `hub-exec-backlog-filler-<kind>-<repo>-<module>`.
+  come from `label make` as `hub-exec-backlog-filler-<kind>-<repo>-<module>`. Report
+  paths and labels use a readable slug plus an 8-character hash of the full path
+  (`pkg-a-<hash>`), so long paths that share a prefix never collide. Reports written
+  under the earlier unhashed names stay where they are.
 - Dry run: `python3 -m agentq.filler --home <copy of the agentq home>` prints the targets,
   the due target and kind pairs by kind, and the merged PRs due for review. It runs the
   store migration, so point it at a copy of the store.
