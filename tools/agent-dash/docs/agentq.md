@@ -139,7 +139,10 @@ instead of letting it swing between idle and burst.
   in the Limited-by headline and the broker log, when:
   - the proxy status is missing or empty ("proxy status unavailable");
   - DeepSeek requests are blocked at the proxy;
-  - a DeepSeek 429 came in the last `gate_429_window_s` (120 s);
+  - a DeepSeek 429 came in the last `gate_429_window_s` (120 s); output 429s are included,
+    since the proxy records 429s per budget in its log, not in its status;
+  - the DeepSeek output budget's current-minute use is at or above `output_hold_frac`
+    (0.85) of its target (its 70k limit times `target_frac`); the reason names the output budget;
   - the in-flight limit is binding ("Morph slow: in-flight limit N reached"; the
     shadow mode says so). A limit at its maximum never holds filler here;
   - the laptop is past the filler bars: CPU busy over `fill_max_cpu_busy`, memory free
@@ -192,6 +195,12 @@ instead of letting it swing between idle and burst.
   retained window. Each finding is one
   bullet, ``- **high** `file:line` — title``, and a finding whose file:line and title are
   already in the index is skipped.
+- Briefs are output-lean. Every audit and PR-review brief asks for at most 10 findings,
+  most severe first, each on one line (severity, `file:line`, title, and one sentence of
+  why), a report under 60 lines, no code block longer than 5 lines, and no restating of the
+  diff. The line form still parses into the index. A test caps each brief's length.
+  There is no per-job `max_tokens`: the launcher sets none, and the proxy's
+  `max_tokens_cap` applies to every DeepSeek job, not only filler.
 - One submission path. The fill controller decides how many filler jobs to submit (its
   step, refill or level). The generator fills that number, and only that number, from one
   priority-ordered due list: unreviewed merged PRs first, then target and kind pairs, with

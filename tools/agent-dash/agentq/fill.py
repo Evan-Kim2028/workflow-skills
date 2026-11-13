@@ -59,6 +59,7 @@ DEFAULT_FILL = {
     "step_workers": 4,
     "step_interval_s": 120.0,
     "gate_429_window_s": 120.0,
+    "output_hold_frac": 0.85,
 }
 DEFAULT_PACING = {
     "enabled": True,
@@ -149,12 +150,32 @@ def inflight_gate(status: dict) -> str | None:
     return None
 
 
+def output_gate(status: dict | None, fill: dict) -> str | None:
+    """Hold filler while the DeepSeek output budget's current-minute use is at or above ``output_hold_frac`` of its
+    target (its limit times target_frac). Reports name the output budget. None when the budget is unreadable or clear."""
+    budget = ((status or {}).get("budgets") or {}).get("output") if isinstance(status, dict) else None
+    if not isinstance(budget, dict):
+        return None
+    used, limit = budget.get("used_60s"), budget.get("limit")
+    frac = budget.get("target_frac", 1.0)
+    if not isinstance(used, (int, float)) or not isinstance(limit, (int, float)) or not isinstance(frac, (int, float)):
+        return None
+    cap = limit * frac
+    threshold = fill["output_hold_frac"] * cap
+    if cap <= 0 or used < threshold:
+        return None
+    return (f"Morph gate: output budget at {used:,.0f} output tokens this minute, at or above "
+            f"{threshold:,.0f} ({fill['output_hold_frac']:.0%} of its {cap:,.0f} target)")
+
+
 def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headroom | None, laptop_cfg: dict,
                 fill: dict) -> str | None:
     """Why filler must wait now, or None. Any one of these holds filler: the proxy status is unavailable,
-    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window, the DeepSeek in-flight limit
-    reached, or the laptop past the filler bars (CPU busy, memory free or swap used; stricter than the
-    real-work bars so filler never pushes real work out). An unreadable measure does not hold on its own."""
+    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window (output 429s included: the
+    proxy's per-budget 429 record is in its log, not its status), the DeepSeek output budget near its target,
+    the DeepSeek in-flight limit reached, or the laptop past the filler bars (CPU busy, memory free or swap used;
+    stricter than the real-work bars so filler never pushes real work out). An unreadable measure does not hold
+    on its own."""
     if not proxy_available(status):
         return "proxy status unavailable; filler held"
     blocked = ds_blocked(status)
@@ -162,6 +183,9 @@ def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headr
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
     if recent_429 > 0:
         return f"Morph gate: {recent_429} DeepSeek 429s in the last {int(fill['gate_429_window_s'])} s"
+    output = output_gate(status, fill)
+    if output is not None:
+        return output
     slow = inflight_gate(status)
     if slow is not None:
         return slow
