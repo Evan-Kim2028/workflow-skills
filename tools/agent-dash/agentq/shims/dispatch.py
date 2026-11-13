@@ -19,6 +19,10 @@ Environment: ``AGENTQ_SHIMS=0`` turns the shims off for pi (set by
 ``launch_pi.py``). ``AGENTQ_SLOT_HELD`` lists the slot kinds this process tree
 already holds, so a pytest started inside a held pytest does not wait for its
 parent's slot. ``AGENTQ_MEMCAPPED`` marks a process already under the memory cap.
+``AGENTQ_PYTEST_SLOT_HELD`` is set to 1 for the child of a held pytest slot, and the
+pytest plugin (``agentq/pyplugin/agentq_pytest_slot.py``) honours it, so a run that
+the shim already gated takes no second slot. A plugin-held run sets it too, so the
+shim treats a pytest started under it as already held.
 ``AGENTQ_MEMCAP`` overrides the memcap script path (tests use it).
 """
 
@@ -43,6 +47,7 @@ PYTHON_NAMES = ("python", "python3")
 SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
 HELD_ENV = "AGENTQ_SLOT_HELD"
 MEMCAPPED_ENV = "AGENTQ_MEMCAPPED"
+PYTEST_HELD_ENV = "AGENTQ_PYTEST_SLOT_HELD"
 MEMCAP_ENV = "AGENTQ_MEMCAP"
 
 
@@ -153,12 +158,18 @@ def memcap_command(command, environ) -> tuple[list[str], bool]:
 
 
 def _held_kinds(environ) -> set[str]:
-    return {kind for kind in (environ.get(HELD_ENV) or "").split(",") if kind}
+    held = {kind for kind in (environ.get(HELD_ENV) or "").split(",") if kind}
+    if (environ.get(PYTEST_HELD_ENV) or "").strip():
+        held.add("pytest")
+    return held
 
 
 def _child_env(environ, held: set[str], kind: str | None, capped: bool) -> dict:
     env = dict(environ)
-    env[HELD_ENV] = ",".join(sorted(held | ({kind} if kind else set())))
+    held = held | ({kind} if kind else set())
+    env[HELD_ENV] = ",".join(sorted(held))
+    if "pytest" in held:
+        env[PYTEST_HELD_ENV] = "1"
     if capped:
         env[MEMCAPPED_ENV] = "1"
     return env
