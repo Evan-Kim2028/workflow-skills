@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 from agentq import backlog as backlog_lib  # noqa: E402
 from agentq import backlog_seed  # noqa: E402
 from agentq import broker as B  # noqa: E402
+from agentq import headroom as H  # noqa: E402
 from agentq import cli, db  # noqa: E402
 
 
@@ -100,7 +101,7 @@ class BacklogTestCase(unittest.TestCase):
 
     def broker(self, labeler=None, pool=None, proxy=None):
         return B.Broker(self.home, launcher=mock.Mock(), now=self.clock, proxy=proxy or (lambda: None),
-                        gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)),
+                        gauges=mock.Mock(read=lambda: H.Headroom(90.0, 0.1, 0.1, None)),
                         launch_pool=pool or NeverPool(), labeler=labeler or FakeLabeler())
 
     def conn(self):

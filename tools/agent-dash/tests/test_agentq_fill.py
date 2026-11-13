@@ -20,6 +20,15 @@ from agentq import broker as B  # noqa: E402
 from agentq import cli, db  # noqa: E402
 from agentq import fill as F  # noqa: E402
 from agentq import filler as Fl  # noqa: E402
+from agentq import headroom as H  # noqa: E402
+
+LAPTOP = B.DEFAULT_LAPTOP
+CALM = H.Headroom(90.0, 0.2, 0.1, 0.2)
+
+
+def reading(free=90.0, cpu=0.2, swap=0.1, load=0.2):
+    """A headroom reading with calm values for anything not named."""
+    return H.Headroom(free, cpu, swap, load)
 
 DS_MODEL = "morph-dsv41flash-1017"
 NOW = 100000.0
@@ -63,6 +72,18 @@ def seeded(per_worker=175_000.0, active=8, ceiling=None, now=NOW):
     for k in range(1, 4):
         ctl.samples.append((now - 60 * k, per_worker * active, active))
     return ctl
+
+
+class LaptopGateTests(unittest.TestCase):
+    def test_laptop_cpu_memory_and_swap_hold_at_the_filler_bars(self):
+        self.assertIn("memory free 10% < 20%", F.gate_reason(status_doc(), 0, reading(free=10.0), LAPTOP, FILL))
+        self.assertIn("cpu 80% busy >= 75%", F.gate_reason(status_doc(), 0, reading(cpu=0.80), LAPTOP, FILL))
+        self.assertIn("swap 88% used >= 85%", F.gate_reason(status_doc(), 0, reading(swap=0.88), LAPTOP, FILL))
+
+    def test_readings_inside_the_filler_bars_and_unreadable_gauges_do_not_hold(self):
+        self.assertIsNone(F.gate_reason(status_doc(), 0, reading(cpu=0.74, swap=0.84), LAPTOP, FILL))
+        self.assertIsNone(F.gate_reason(status_doc(), 0, reading(None, None, None, 9.0), LAPTOP, FILL))
+        self.assertIsNone(F.gate_reason(status_doc(), 0, None, LAPTOP, FILL))
 
 
 class ControllerTests(unittest.TestCase):
@@ -299,7 +320,7 @@ class ProxyUnavailableTests(unittest.TestCase):
 
     def test_filler_is_held_with_the_proxy_unavailable_reason(self):
         for status in (None, {}):
-            self.assertEqual(F.gate_reason(status, 0, (90.0, 0.1), FILL), "proxy status unavailable; filler held")
+            self.assertEqual(F.gate_reason(status, 0, CALM, LAPTOP, FILL), "proxy status unavailable; filler held")
 
 
 class PacingTests(unittest.TestCase):
@@ -452,7 +473,7 @@ class StoreTest(unittest.TestCase):
         status = {"budgets": {"uncached_ds": {"used_60s": 100_000}}}
         decision = F.decide(
             self.conn, NOW, controller=F.FillController(), fill=FILL, pacing=PACING, status=status, ps_text="",
-            laptop=(90.0, 0.2), paused=False, measured=None,
+            laptop=CALM, laptop_cfg=LAPTOP, paused=False, measured=None,
         )
         self.assertEqual((decision.plan.submit, decision.plan.key), (4, "bootstrap"))
         self.assertEqual(decision.billed_avg, 20_000)
@@ -584,7 +605,7 @@ class BrokerWiringTest(unittest.TestCase):
         self.conn.execute("UPDATE proxy_minutes SET cache_read = ?", (per_minute,))
 
     def broker(self):
-        gauges = mock.Mock(read=lambda ttl: (90.0, 0.1))
+        gauges = mock.Mock(read=lambda: H.Headroom(90.0, 0.1, 0.1, None))
         broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: self.status,
                           gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler)
         broker._controller = F.FillController()

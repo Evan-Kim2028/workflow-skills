@@ -23,10 +23,13 @@ SHIMS = ROOT / "agentq" / "shims"
 sys.path.insert(0, str(ROOT))
 
 from agentq import cli, slots  # noqa: E402
+from agentq import headroom as H  # noqa: E402
 from agentq.shims import dispatch  # noqa: E402
 
+GAUGE_SETTINGS = {"memory_ttl_s": 15.0, "sample_s": 10.0, "tau_s": 60.0}
 LIMITS = slots.Limits(
-    ssh=8, pytest=16, adaptive=True, floor=4, min_free_pct=35.0, max_load_per_cpu=1.0, gauge_ttl_s=15.0
+    ssh=8, pytest=16, adaptive=True, floor=4, min_free_pct=35.0, max_cpu_busy=0.80, max_swap_frac=0.90,
+    gauge_settings=GAUGE_SETTINGS,
 )
 
 
@@ -46,16 +49,17 @@ class FakeClock:
 
 
 class FakeGauges:
-    """Injected memory and load readings; counts reads."""
+    """Injected headroom readings; counts reads."""
 
-    def __init__(self, free, load):
+    def __init__(self, free, cpu, swap=0.1):
         self.free = free
-        self.load = load
+        self.cpu = cpu
+        self.swap = swap
         self.reads = 0
 
     def read(self):
         self.reads += 1
-        return self.free, self.load
+        return H.Headroom(self.free, self.cpu, self.swap, None)
 
 
 class Base(unittest.TestCase):
@@ -173,35 +177,39 @@ class SemaphoreTests(Base):
 
 
 class PytestAdmissionTests(Base):
-    def admit(self, free, load, limits=LIMITS):
-        gauges = FakeGauges(free, load)
+    def admit(self, free, cpu, swap=0.1, limits=LIMITS):
+        gauges = FakeGauges(free, cpu, swap)
         return slots.pytest_admission(limits, gauges), gauges
 
     def test_below_the_floor_admits_without_reading_gauges(self):
-        admit, gauges = self.admit(1, 9.0)
+        admit, gauges = self.admit(1, 0.99, 0.99)
         self.assertTrue(admit(3))
         self.assertEqual(gauges.reads, 0)
 
-    def test_at_the_floor_needs_memory_and_load(self):
-        admit, _ = self.admit(50.0, 0.5)
-        self.assertTrue(admit(4))
+    def test_at_the_floor_needs_memory_cpu_and_swap(self):
+        self.assertTrue(self.admit(50.0, 0.5)[0](4))
         self.assertFalse(self.admit(20.0, 0.5)[0](4))
-        self.assertFalse(self.admit(50.0, 1.2)[0](4))
+        self.assertFalse(self.admit(50.0, 0.85)[0](4))
+        self.assertFalse(self.admit(50.0, 0.3, 0.95)[0](4))
         self.assertFalse(self.admit(34.9, 0.1)[0](4))
-        self.assertTrue(self.admit(35.0, 0.99)[0](4))
+        self.assertTrue(self.admit(35.0, 0.79)[0](4))
+
+    def test_load_per_cpu_is_not_a_gate(self):
+        admit, _ = self.admit(60.0, 0.3)
+        self.assertTrue(admit(6))
 
     def test_ceiling_refuses_even_with_headroom(self):
         admit, _ = self.admit(90.0, 0.1)
         self.assertFalse(admit(16))
 
     def test_unreadable_gauges_add_no_gate(self):
-        self.assertTrue(self.admit(None, 0.2)[0](6))
-        self.assertTrue(self.admit(60.0, None)[0](6))
+        self.assertTrue(self.admit(None, 0.2, None)[0](6))
+        self.assertTrue(self.admit(60.0, None, None)[0](6))
 
     def test_adaptive_off_keeps_only_the_ceiling(self):
         limits = slots.Limits(ssh=8, pytest=16, adaptive=False, floor=4, min_free_pct=35.0,
-                              max_load_per_cpu=1.0, gauge_ttl_s=15.0)
-        admit, gauges = self.admit(1.0, 9.0, limits)
+                              max_cpu_busy=0.80, max_swap_frac=0.90, gauge_settings=GAUGE_SETTINGS)
+        admit, gauges = self.admit(1.0, 0.99, 0.99, limits)
         self.assertTrue(admit(10))
         self.assertFalse(admit(16))
         self.assertEqual(gauges.reads, 0)
@@ -214,10 +222,10 @@ class PytestAdmissionTests(Base):
             calls.append(clock.now)
             return 42.0
 
-        gauges = slots.Gauges(self.home, ttl_s=15.0, memory=memory, loadavg=lambda: (0.8, 0.0, 0.0),
-                              cpus=lambda: 4, clock=clock)
-        self.assertEqual(gauges.read(), (42.0, 0.2))
-        self.assertEqual(gauges.read(), (42.0, 0.2))
+        gauges = slots.Gauges(self.home, settings=GAUGE_SETTINGS, memory=memory, ticks=lambda: None,
+                              swap=lambda: 0.1, clock=clock)
+        self.assertEqual(gauges.read().free_pct, 42.0)
+        self.assertEqual(gauges.read().free_pct, 42.0)
         self.assertEqual(len(calls), 1)
         clock.now += 16
         gauges.read()
@@ -232,6 +240,8 @@ class PytestAdmissionTests(Base):
         limits = slots.load_limits(self.home)
         self.assertEqual((limits.pytest, limits.ssh, limits.floor), (10, 4, 2))
         self.assertEqual(limits.min_free_pct, 35.0)
+        self.assertEqual(limits.max_cpu_busy, 0.80)
+        self.assertEqual(limits.max_swap_frac, 0.90)
 
 
 class HostParsingTests(unittest.TestCase):

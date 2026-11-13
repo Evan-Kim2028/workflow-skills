@@ -34,6 +34,7 @@ from pathlib import Path
 
 from agentq import db
 from agentq import filler as filler_lib
+from agentq import headroom as headroom_lib
 
 DS_FAMILY = "morph-dsv41flash"
 DS_TIER = "pi-deepseek-flash"
@@ -63,8 +64,6 @@ DEFAULT_FILL = {
     "rate_min": 10_000.0,
     "bootstrap_rate": 150_000.0,
     "gate_429_window_s": 120.0,
-    "laptop_min_free_pct": 20.0,
-    "laptop_max_load_per_cpu": 1.0,
 }
 DEFAULT_PACING = {
     "enabled": True,
@@ -135,10 +134,12 @@ def proxy_available(status: dict | None) -> bool:
     return isinstance(status, dict) and bool(status.get("budgets")) and isinstance(status.get("budgets"), dict)
 
 
-def gate_reason(status: dict | None, recent_429: int, laptop: tuple, fill: dict) -> str | None:
+def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headroom | None, laptop_cfg: dict,
+                fill: dict) -> str | None:
     """Why filler must wait now, or None. Any one of these holds filler: the proxy status is unavailable,
-    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window, or the laptop short of
-    memory or CPU. An unreadable gauge does not hold on its own."""
+    DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window, or the laptop past the
+    filler bars (CPU busy, memory free or swap used; stricter than the real-work bars so filler never pushes
+    real work out). An unreadable measure does not hold on its own."""
     if not proxy_available(status):
         return "proxy status unavailable; filler held"
     blocked = ds_blocked(status)
@@ -146,12 +147,13 @@ def gate_reason(status: dict | None, recent_429: int, laptop: tuple, fill: dict)
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
     if recent_429 > 0:
         return f"Morph gate: {recent_429} DeepSeek 429s in the last {int(fill['gate_429_window_s'])} s"
-    free, load = laptop
-    if free is not None and free < fill["laptop_min_free_pct"]:
-        return f"laptop gate: memory {free:.0f}% free"
-    if load is not None and load >= fill["laptop_max_load_per_cpu"]:
-        return f"laptop gate: load {load:.2f} per CPU"
-    return None
+    if laptop is None:
+        return None
+    breach = headroom_lib.pressure(
+        laptop, max_cpu_busy=laptop_cfg["fill_max_cpu_busy"], min_free_pct=laptop_cfg["fill_min_free_pct"],
+        max_swap_frac=laptop_cfg["fill_max_swap_frac"],
+    )
+    return f"laptop gate: {breach[1]}" if breach else None
 
 
 @dataclass(frozen=True)
@@ -376,7 +378,8 @@ class Decision:
 
 def decide(
     conn, now: float, *, controller: FillController, fill: dict, pacing: dict, status: dict | None,
-    ps_text: str | None, laptop: tuple, paused: bool, measured: int | None,
+    ps_text: str | None, laptop: headroom_lib.Headroom | None, laptop_cfg: dict, paused: bool,
+    measured: int | None,
 ) -> Decision:
     """Read the store and return what the controller and pacing would do now. The controller keeps its
     own history; nothing else is written."""
@@ -385,7 +388,7 @@ def decide(
     active = counts["running_ds"] + (direct or 0)
     billed_avg = sum(row["billed"] for row in minute_rows(conn, now, WINDOW_MINUTES).values()) / WINDOW_MINUTES
     recent = recent_429(conn, now, fill["gate_429_window_s"])
-    gate = gate_reason(status, recent, laptop, fill)
+    gate = gate_reason(status, recent, laptop, laptop_cfg, fill)
     if fill["enabled"] and direct is None and gate is None:
         gate = "worker count unknown (ps failed); filler waits"
     plan = controller.tick(
@@ -593,7 +596,9 @@ def main(argv=None, out=None) -> int:
         measured = measured_first_request(conn, now, pacing) if pacing["measure_first_request"] else None
         decision = decide(
             conn, now, controller=FillController(), fill=fill, pacing=pacing, status=broker_lib.proxy_status(),
-            ps_text=process_table(), laptop=broker_lib.Gauges().read(15.0), paused=filler_lib.paused(conn),
+            ps_text=process_table(),
+            laptop=headroom_lib.reading_from_state(headroom_lib.load_state(home), now),
+            laptop_cfg=broker_lib.load_config(home)["laptop"], paused=filler_lib.paused(conn),
             measured=measured,
         )
         due = filler_lib.next_target(conn, targets, head_of=filler_lib.module_head)

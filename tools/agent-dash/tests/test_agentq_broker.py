@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from agentq import broker as B  # noqa: E402
 from agentq import cli, db  # noqa: E402
+from agentq import headroom as H  # noqa: E402
 
 
 class Clock:
@@ -104,16 +105,18 @@ def run_cli(env, argv, now=None):
 
 
 class FakeGauges:
-    """Laptop gauges with fixed readings; counts reads so tests can see caching."""
+    """Laptop headroom with fixed readings; counts reads so tests can see caching."""
 
-    def __init__(self, free=90.0, load=0.2):
+    def __init__(self, free=90.0, cpu=0.2, swap=0.1, load=0.2):
         self.free = free
+        self.cpu = cpu
+        self.swap = swap
         self.load = load
         self.reads = 0
 
-    def read(self, ttl_s):
+    def read(self):
         self.reads += 1
-        return self.free, self.load
+        return H.Headroom(self.free, self.cpu, self.swap, self.load)
 
 
 def proxy_doc(total=0, output=0, uncached=0, saturated=False):
@@ -903,29 +906,43 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         self.assertEqual(gauges.reads, 1)
         self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: memory free 31% < 35%")
 
-    def test_tests_jobs_wait_on_load_per_cpu_above_the_floor(self):
+    def test_tests_jobs_wait_on_cpu_busy_above_the_floor(self):
         write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
         jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
-        launched = self.broker(gauges=FakeGauges(free=90.0, load=1.2)).tick()
+        launched = self.broker(gauges=FakeGauges(free=90.0, cpu=0.84)).tick()
         self.assertEqual(launched, jobs[:4])
-        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: load 1.20 per cpu >= 1")
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: cpu 84% busy >= 80%")
+
+    def test_tests_jobs_wait_on_swap_above_the_floor(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
+        launched = self.broker(gauges=FakeGauges(free=90.0, cpu=0.3, swap=0.92)).tick()
+        self.assertEqual(launched, jobs[:4])
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: swap 92% used >= 90%")
+
+    def test_load_per_cpu_holds_nothing(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
+        self.assertEqual(self.broker(gauges=FakeGauges(free=90.0, cpu=0.3, load=9.0)).tick(), jobs[:5])
 
     def test_tests_ceiling_is_the_fixed_slot_count(self):
         write_config(self.home, slots={"light": 40, "tests": 2, "ssh": 8})
         jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(3)]
         self.assertEqual(self.broker(gauges=FakeGauges(free=90.0, load=0.2)).tick(), jobs[:2])
 
-    def test_light_jobs_wait_only_below_twenty_percent_memory(self):
+    def test_light_jobs_wait_on_memory_below_twenty_percent_or_cpu_at_ninety_two(self):
         light = submit(self.env, self.prompt, label="light")
         ssh = submit(self.env, self.prompt, "--res", "ssh", label="ssh")
-        self.assertEqual(self.broker(gauges=FakeGauges(free=15.0, load=9.0)).tick(), [ssh])
+        self.assertEqual(self.broker(gauges=FakeGauges(free=15.0, cpu=0.1)).tick(), [ssh])
         self.assertEqual(row(self.home, light)["detail"], "hold light: memory free 15% < 20%")
-        self.assertEqual(self.broker(gauges=FakeGauges(free=25.0, load=9.0)).tick(), [light])
+        self.assertEqual(self.broker(gauges=FakeGauges(free=25.0, cpu=0.95)).tick(), [])
+        self.assertEqual(row(self.home, light)["detail"], "hold light: cpu 95% busy >= 92%")
+        self.assertEqual(self.broker(gauges=FakeGauges(free=25.0, cpu=0.5)).tick(), [light])
 
     def test_unreadable_gauges_fall_back_to_the_fixed_caps(self):
         write_config(self.home, slots={"light": 40, "tests": 3, "ssh": 8})
         jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(4)]
-        self.assertEqual(self.broker(gauges=FakeGauges(free=None, load=None)).tick(), jobs[:3])
+        self.assertEqual(self.broker(gauges=FakeGauges(free=None, cpu=None, swap=None)).tick(), jobs[:3])
 
     def test_disabled_adaptive_restores_fixed_caps(self):
         self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8},
@@ -936,7 +953,7 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         t3 = submit(self.env, self.prompt, "--res", "tests", label="t3")
         backlog = submit(self.env, self.prompt, "--backlog", label="backlog")
         broker = self.broker(proxy=lambda: proxy_doc(total=50, saturated=True),
-                             gauges=FakeGauges(free=5.0, load=9.0))
+                             gauges=FakeGauges(free=5.0, cpu=0.99))
         self.assertEqual(sorted(broker.tick()), sorted([normal, t1, t2]))
         self.assertEqual(row(self.home, t3)["detail"], "hold tests: slots full")
         self.assertEqual(row(self.home, backlog)["detail"], "hold pi-deepseek-flash: proxy saturated")
@@ -952,8 +969,22 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         adaptive = B.load_config(self.home)["adaptive"]
         self.assertIs(adaptive["enabled"], False)
         self.assertEqual(adaptive["tests_floor"], 2.0)
-        self.assertEqual(adaptive["light_min_free_pct"], 20)
         self.assertNotIn("bogus", adaptive)
+        self.assertNotIn("tests_min_free_pct", adaptive)
+        self.assertNotIn("light_min_free_pct", adaptive)
+
+    def test_laptop_section_defaults_and_overrides(self):
+        laptop = B.load_config(self.home)["laptop"]
+        self.assertEqual(laptop["tests_max_cpu_busy"], 0.80)
+        self.assertEqual(laptop["light_max_cpu_busy"], 0.92)
+        self.assertEqual(laptop["max_swap_frac"], 0.90)
+        self.assertEqual(laptop["fill_max_cpu_busy"], 0.75)
+        self.assertEqual(laptop["fill_max_swap_frac"], 0.85)
+        self.write_broker_json({"laptop": {"tests_max_cpu_busy": 0.7, "bogus": 1, "ewma_s": "x"}})
+        laptop = B.load_config(self.home)["laptop"]
+        self.assertEqual(laptop["tests_max_cpu_busy"], 0.7)
+        self.assertEqual(laptop["ewma_s"], 60.0)
+        self.assertNotIn("bogus", laptop)
 
     def test_memory_is_read_at_most_once_per_ttl(self):
         clock = Clock(0.0)
@@ -963,25 +994,26 @@ class AdaptiveAdmissionTests(ProcessCleanup):
             calls.append(1)
             return 42.0
 
-        gauges = B.Gauges(memory=memory, loadavg=lambda: (1.5, 0.0, 0.0), cpus=lambda: 15, clock=clock)
-        self.assertEqual(gauges.read(15.0), (42.0, 0.1))
+        gauges = H.Gauges(settings={"memory_ttl_s": 15.0}, memory=memory, ticks=lambda: None,
+                          swap=lambda: 0.0, clock=clock)
+        self.assertEqual(gauges.read().free_pct, 42.0)
         clock.t = 5.0
-        gauges.read(15.0)
+        gauges.read()
         self.assertEqual(len(calls), 1)
         clock.t = 15.0
-        gauges.read(15.0)
+        gauges.read()
         self.assertEqual(len(calls), 2)
 
     def test_memory_free_percent_is_parsed_from_memory_pressure(self):
         from types import SimpleNamespace
 
         out = "The system has...\nSystem-wide memory free percentage: 31%\n"
-        self.assertEqual(B.memory_free_pct(run=lambda *a, **k: SimpleNamespace(stdout=out)), 31.0)
+        self.assertEqual(B.memory_free_pct(run=lambda *a, **k: SimpleNamespace(stdout=out), platform="darwin"), 31.0)
 
         def missing(*args, **kwargs):
             raise OSError("no memory_pressure")
 
-        self.assertIsNone(B.memory_free_pct(run=missing))
+        self.assertIsNone(B.memory_free_pct(run=missing, platform="darwin"))
 
     def test_hold_reason_is_logged_and_written_only_when_it_changes(self):
         job = submit(self.env, self.prompt, label="held")
@@ -999,28 +1031,28 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         self.assertEqual(broker.tick(), [job])
         self.assertIsNone(row(self.home, job)["detail"])
 
-    def test_hold_logs_once_while_the_load_reading_moves(self):
+    def test_hold_logs_once_while_the_cpu_reading_moves(self):
         write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
         jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
-        gauges = FakeGauges(free=90.0, load=1.05)
+        gauges = FakeGauges(free=90.0, cpu=0.85)
         broker = self.broker(gauges=gauges, clock=Clock(1000.0))
         self.assertEqual(broker.tick(), jobs[:4])
-        for load in (1.04, 1.02, 1.01):
-            gauges.load = load
+        for cpu in (0.84, 0.83, 0.81):
+            gauges.cpu = cpu
             self.assertEqual(broker.tick(), [])
         log_path = self.home / "logs" / "broker.log"
         self.assertEqual(log_path.read_text().count("hold tests"), 1)
         self.assertEqual(row(self.home, jobs[4])["state"], "queued")
-        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: load 1.05 per cpu >= 1")
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: cpu 85% busy >= 80%")
 
-    def test_hold_logs_again_when_the_gate_changes_from_load_to_memory(self):
+    def test_hold_logs_again_when_the_gate_changes_from_cpu_to_memory(self):
         write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
         jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
-        gauges = FakeGauges(free=90.0, load=1.2)
+        gauges = FakeGauges(free=90.0, cpu=0.9)
         broker = self.broker(gauges=gauges, clock=Clock(1000.0))
         broker.tick()
         gauges.free = 31.0
-        gauges.load = 0.2
+        gauges.cpu = 0.2
         broker.tick()
         log_path = self.home / "logs" / "broker.log"
         self.assertEqual(log_path.read_text().count("hold tests"), 2)
