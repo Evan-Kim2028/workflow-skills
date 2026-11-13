@@ -1,4 +1,5 @@
 import calendar
+from collections import Counter
 import io
 import re
 import hashlib
@@ -1570,7 +1571,7 @@ class BudgetRateLimitLogTest(unittest.TestCase):
                 f"{this}:31Z agentq-proxy calib minute={this} budget=None sec=31.0\n",
                 encoding="utf-8",
             )
-            found = dash.budget_429_minutes(home, UNTIL)
+            found = dash.budget_429_minutes(dash.read_calib_429s(home), UNTIL)
         self.assertEqual(found, {"total": {UNTIL - 60}})
 
     def test_a_calib_429_written_just_before_a_rotation_is_still_counted(self) -> None:
@@ -1588,8 +1589,8 @@ class BudgetRateLimitLogTest(unittest.TestCase):
             os.replace(live, live.with_name(live.name + ".1"))
             live.write_text("", encoding="utf-8")
             read = dash.read_calib_429s(home)
-            found = dash.budget_429_minutes(home, UNTIL)
-        self.assertEqual(read["events"], [("uncached_ds", UNTIL - 60)])
+            found = dash.budget_429_minutes(dash.read_calib_429s(home), UNTIL)
+        self.assertEqual(read["counts"], Counter({("uncached_ds", UNTIL - 60): 1}))
         self.assertEqual(found, {"uncached_ds": {UNTIL - 60}})
 
     def test_the_live_file_is_read_after_the_backup(self) -> None:
@@ -1610,7 +1611,7 @@ class BudgetRateLimitLogTest(unittest.TestCase):
                 encoding="utf-8",
             )
             read = dash.read_calib_429s(home)
-        self.assertEqual(read["events"], [("total", UNTIL - 180), ("uncached_ds", UNTIL - 60)])
+        self.assertEqual(read["counts"], Counter({("total", UNTIL - 180): 1, ("uncached_ds", UNTIL - 60): 1}))
         self.assertTrue(read["truncated"], "the older backups were not read, so the window is partial")
 
 
@@ -1766,12 +1767,12 @@ class RejectionAndPerMinuteValuesTest(unittest.TestCase):
         self.assertEqual(rejected, {"count": 2, "partial": False})
 
     def test_no_stated_budget_lines_means_rejections_are_not_recorded(self) -> None:
-        self.assertEqual(dash.budget_rejections({"events": [], "truncated": False}, "uncached_ds", 0, UNTIL),
+        self.assertEqual(dash.budget_rejections({"counts": Counter(), "truncated": False}, "uncached_ds", 0, UNTIL),
                          {"count": None, "partial": False})
         self.assertEqual(dash.budget_rejections(None, "uncached_ds", 0, UNTIL), {"count": None, "partial": False})
 
     def test_truncated_log_tail_marks_the_count_partial(self) -> None:
-        read = {"events": [("uncached_ds", UNTIL - 60)], "truncated": True}
+        read = {"counts": Counter({("uncached_ds", UNTIL - 60): 1}), "truncated": True}
         self.assertEqual(dash.budget_rejections(read, "uncached_ds", UNTIL - 3600, UNTIL),
                          {"count": 1, "partial": True})
 
@@ -2110,7 +2111,7 @@ class BlockedReaderTest(unittest.TestCase):
         self.assertLess(elapsed, 1.0, elapsed)
         self.assertIsNone(json.loads(body)["live"])
 
-    def test_request_gets_a_db_only_partial_while_agentq_db_is_locked(self) -> None:
+    def test_request_returns_within_its_wait_while_agentq_db_is_locked(self) -> None:
         self.release = threading.Event()
         self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy)
         lock = sqlite3.connect(self.home / "agentq.db", isolation_level=None, timeout=5)
@@ -2119,11 +2120,14 @@ class BlockedReaderTest(unittest.TestCase):
             started = time.monotonic()
             body, _ = self.cache.get(6)
             elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.5, elapsed)
+            first = json.loads(body)
+            self.assertTrue(first.get("warming_up") or first["partial"])
+            self.cache.wait_for_computes(10)
+            summary = json.loads(self.cache.get(6)[0])
         finally:
             lock.execute("ROLLBACK")
             lock.close()
-        self.assertLess(elapsed, 1.5, elapsed)
-        summary = json.loads(body)
         self.assertTrue(summary["partial"])
         self.assertTrue(any("time budget" in message for message in summary["errors"].values()), summary["errors"])
         self.assertEqual(summary["hours"], 6)
@@ -2134,14 +2138,165 @@ class BlockedReaderTest(unittest.TestCase):
         lock = sqlite3.connect(self.home / "agentq.db", isolation_level=None, timeout=5)
         lock.execute("BEGIN EXCLUSIVE")
         try:
-            partial, _ = self.cache.get(6)
+            self.cache.get(6)
+            self.cache.wait_for_computes(10)
+            partial = json.loads(self.cache.get(6)[0])
         finally:
             lock.execute("ROLLBACK")
             lock.close()
-        self.assertTrue(json.loads(partial)["partial"])
+        self.assertTrue(partial["partial"])
         self.cache._start_compute(6)
         self.cache.wait_for_computes()
         self.assertFalse(json.loads(self.cache.get(6)[0])["partial"])
+
+
+class CalibReadTimingTest(unittest.TestCase):
+    """The 429 reader on 200k calib lines across the live log and its backup: cold, incremental, rotated, replaced."""
+
+    @staticmethod
+    def calib_line(i: int) -> str:
+        minute = dash.minute_stamp(UNTIL - 60 * (i % 120))
+        budget = "uncached_ds" if i % 2 == 0 else "None"
+        return f"2026-11-13T09:00:{i % 60:02d}Z agentq-proxy calib minute={minute} budget={budget} sec=30.0\n"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.home = Path(cls.tmp.name)
+        logs = cls.home / "logs"
+        logs.mkdir()
+        (logs / "proxy.err.log.1").write_text("".join(cls.calib_line(i) for i in range(100_000)), encoding="utf-8")
+        (logs / "proxy.err.log").write_text("".join(cls.calib_line(i) for i in range(100_000, 200_000)), encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.tmp.cleanup()
+
+    def setUp(self) -> None:
+        dash._CALIB_FILES.clear()
+
+    def test_cold_read_of_200k_lines_across_live_and_backup_is_under_half_a_second(self) -> None:
+        started = time.perf_counter()
+        read = dash.read_calib_429s(self.home)
+        elapsed = time.perf_counter() - started
+        self.assertIsNotNone(read)
+        self.assertGreater(sum(read["counts"].values()), 0)
+        self.assertLess(elapsed, 0.5, f"cold read took {elapsed:.3f} s")
+
+    def test_incremental_read_after_appends_is_under_twenty_milliseconds(self) -> None:
+        dash.read_calib_429s(self.home)
+        logs = self.home / "logs"
+        before = sum(dash.read_calib_429s(self.home)["counts"].values())
+        with open(logs / "proxy.err.log", "a", encoding="utf-8") as handle:
+            handle.write("".join(self.calib_line(200_000 + i) for i in range(100)))
+        started = time.perf_counter()
+        after = dash.read_calib_429s(self.home)
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 0.02, f"incremental read took {elapsed * 1000:.1f} ms")
+        self.assertEqual(sum(after["counts"].values()) - before, 50)
+
+    def test_only_appended_bytes_are_parsed_after_the_first_read(self) -> None:
+        dash.read_calib_429s(self.home)
+        appended = "".join(self.calib_line(300_000 + i) for i in range(10))
+        with open(self.home / "logs" / "proxy.err.log", "a", encoding="utf-8") as handle:
+            handle.write(appended)
+        with mock.patch.object(dash, "_parse_calib", wraps=dash._parse_calib) as parse:
+            dash.read_calib_429s(self.home)
+        self.assertEqual(sum(len(call.args[1]) for call in parse.call_args_list), len(appended.encode("utf-8")))
+
+    def test_a_rotated_file_keeps_its_counts_without_being_read_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "logs").mkdir()
+            live = home / "logs" / "proxy.err.log"
+            live.write_text("".join(self.calib_line(i) for i in range(1000)), encoding="utf-8")
+            before = dash.read_calib_429s(home)["counts"].copy()
+            os.replace(live, live.with_name(live.name + ".1"))
+            fresh = "".join(self.calib_line(i) for i in range(1000, 1010))
+            live.write_text(fresh, encoding="utf-8")
+            with mock.patch.object(dash, "_parse_calib", wraps=dash._parse_calib) as parse:
+                after = dash.read_calib_429s(home)["counts"]
+        self.assertEqual(sum(after.values()), sum(before.values()) + 5)
+        self.assertEqual(sum(len(call.args[1]) for call in parse.call_args_list), len(fresh.encode("utf-8")))
+
+    def test_a_file_replaced_under_the_same_path_is_parsed_afresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "logs").mkdir()
+            live = home / "logs" / "proxy.err.log"
+            minute = dash.minute_stamp(UNTIL - 60)
+            live.write_text(f"{minute}:30Z agentq-proxy calib minute={minute} budget=total sec=1\n" * 3, encoding="utf-8")
+            self.assertEqual(sum(dash.read_calib_429s(home)["counts"].values()), 3)
+            live.unlink()
+            live.write_text(f"{minute}:30Z agentq-proxy calib minute={minute} budget=total sec=1\n" * 5, encoding="utf-8")
+            self.assertEqual(sum(dash.read_calib_429s(home)["counts"].values()), 5)
+
+
+class WarmingPageTest(unittest.TestCase):
+    def test_the_page_shows_updating_for_a_warming_body_and_keeps_the_last_figures(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn("if (data.warming_up) {", html)
+        self.assertIn("state.warming = true;", html)
+        self.assertIn('"updating…"', html)
+
+
+class RequestWaitTest(unittest.TestCase):
+    """A request for a range with no body waits at most REQUEST_WAIT_S, then gets the warming body while a build runs."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        self.gate = threading.Event()
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy)
+
+    def tearDown(self) -> None:
+        self.gate.set()
+        self.cache.stop()
+        self.cache.wait_for_computes(10)
+        self.tmp.cleanup()
+
+    def test_a_request_during_a_running_build_returns_the_warming_body_within_the_wait(self) -> None:
+        real_build = dash.build_summary
+
+        def slow(*args, **kwargs):
+            self.gate.wait(20)
+            return real_build(*args, **kwargs)
+
+        with mock.patch.object(dash, "build_summary", side_effect=slow):
+            self.cache._start_compute(6)
+            started = time.monotonic()
+            body, _ = self.cache.get(6)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, dash.REQUEST_WAIT_S + 0.5, elapsed)
+        warming = json.loads(body)
+        self.assertTrue(warming["warming_up"])
+        self.assertIsNone(warming["generated_at"])
+        self.gate.set()
+        self.cache.wait_for_computes(10)
+        self.assertNotIn("warming_up", json.loads(self.cache.get(6)[0]))
+
+    def test_a_request_skips_the_proxy_log_so_its_build_never_parses_it(self) -> None:
+        with mock.patch.object(dash, "read_calib_429s", side_effect=AssertionError("log read on a request build")):
+            body, _ = self.cache.get(6)
+            self.cache.wait_for_computes(10)
+        summary = json.loads(self.cache.get(6)[0])
+        self.assertTrue(summary["partial"])
+        first = json.loads(body)
+        self.assertTrue(first.get("warming_up") or first["partial"])
+
+    def test_a_range_never_has_two_builds_at_once(self) -> None:
+        real_build = dash.build_summary
+
+        def slow(*args, **kwargs):
+            self.gate.wait(20)
+            return real_build(*args, **kwargs)
+
+        with mock.patch.object(dash, "build_summary", side_effect=slow):
+            self.assertTrue(self.cache._start_compute(6, request=True))
+            self.assertFalse(self.cache._start_compute(6))
+            self.assertFalse(self.cache._start_compute(6, force=True))
+            self.gate.set()
+            self.cache.wait_for_computes(10)
 
 
 class WatchdogTest(unittest.TestCase):
@@ -2360,6 +2515,36 @@ class FaulthandlerTest(unittest.TestCase):
         register.assert_called_once()
         self.assertEqual(register.call_args.args[0], signal_module.SIGUSR1)
         self.assertTrue(register.call_args.kwargs.get("all_threads"))
+
+
+class ListenBacklogTest(unittest.TestCase):
+    def test_a_burst_of_concurrent_connections_is_all_accepted(self) -> None:
+        self.assertGreaterEqual(dash.DashServer.request_queue_size, 32)
+        with tempfile.TemporaryDirectory() as tmp:
+            server = dash.make_server(make_home(Path(tmp)), 0, fetch_live=no_proxy)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            statuses, errors = [], []
+
+            def fetch():
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+                    conn.request("GET", "/api/summary?hours=1")
+                    statuses.append(conn.getresponse().status)
+                    conn.close()
+                except OSError as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=fetch) for _ in range(16)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(30)
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses, [200] * 16)
 
 
 class ClientGoneTest(unittest.TestCase):

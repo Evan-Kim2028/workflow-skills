@@ -36,9 +36,21 @@ A source that fails shows as null or empty in the JSON and is named under
   and serves the stored JSON. Cadence: 1 h and 6 h every 5 s, 24 h every 15 s,
   7 d every 60 s. A range nobody has requested for two minutes is not
   recomputed. No request waits for a compute, a reader or the proxy.
-- A request with no stored body gets a DB-only partial summary, built with
-  every SQLite wait cut to a 0.8 s budget (`partial: true`, with the cut
-  sources named under `errors`). The full compute replaces it.
+- A request with no stored body starts one request build for that range and
+  waits at most 0.5 s for it. The build is DB-only (no proxy log, so its 429
+  budgets are not counted), with every SQLite wait cut to a 0.8 s budget
+  (`partial: true`, with the cut sources named under `errors`). If it has not
+  stored a body in time, the request gets a `warming_up` body and the page
+  shows "updating…" while the last figures stay on screen. The full compute
+  replaces the partial. A range never has two builds at once.
+- The 429 budgets (rejections and the five-minute limit flags) come from the
+  proxy log's `calib` lines. The live file and its `.1` backup are parsed
+  incrementally and cached by inode: each read parses only the bytes appended
+  since the last one, and a rotated file keeps its counts. A cold read covers
+  at most 5 MB of each file. `proxy_calib` in `agentq.db` records only a
+  per-minute 429 count, not the budget, so it cannot replace the log.
+- The server accepts up to 64 queued connections (`request_queue_size`), so a
+  page that opens several requests at once is not refused.
 - A watchdog checks each range's data age. Past 3 times its cadence the server
   logs once and starts a fresh compute thread for that range. The page shows the
   age in amber past twice the cadence ("data 48 s old").
