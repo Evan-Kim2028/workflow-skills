@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -166,10 +169,10 @@ class GaugesTests(unittest.TestCase):
             reader = self.gauges([(100, 300)], Clock(20.0), home=home)
             self.assertAlmostEqual(reader.read().cpu_busy, writer_reading.cpu_busy + (1.0 - math.exp(-10 / 60.0)) * (0.5 - writer_reading.cpu_busy))
 
-    def test_from_state_drops_measures_older_than_the_limit(self):
-        state = {"free": 40.0, "free_at": 990.0, "cpu_busy": 0.7, "cpu_at": 900.0, "swap": 0.3, "swap_at": 995.0}
-        reading = H.from_state(state, 1000.0, 60.0)
-        self.assertEqual(reading, H.Headroom(40.0, None, 0.3, None))
+    def test_reading_from_state_drops_each_measure_past_its_until_time(self):
+        state = {"free": 40.0, "free_until": 1005.0, "cpu_busy": 0.7, "cpu_until": 900.0,
+                 "swap": 0.3, "swap_until": 1000.0}
+        self.assertEqual(H.reading_from_state(state, 1000.0), H.Headroom(40.0, None, None, None))
 
     def test_settings_come_from_the_broker_config_shape(self):
         cfg = {"adaptive": {"gauge_ttl_s": 15.0}, "laptop": {"sample_s": 5.0, "ewma_s": 30.0}}
@@ -179,6 +182,112 @@ class GaugesTests(unittest.TestCase):
         self.assertIsNone(H.read_cpu_ticks("freebsd14"))
         self.assertIsNone(H.read_swap_frac(platform="freebsd14"))
         self.assertIsNone(H.memory_free_pct(platform="freebsd14"))
+
+
+SETTINGS = {"memory_ttl_s": 15.0, "sample_s": 10.0, "tau_s": 60.0}
+
+
+def gauges_for(home, clock, *, ticks, memory=lambda: 50.0, swap=lambda: 0.1):
+    return H.Gauges(home, settings=SETTINGS, memory=memory, ticks=ticks, swap=swap,
+                    loadavg=lambda: (0.0, 0.0, 0.0), cpus=lambda: 15, clock=clock)
+
+
+class LockedSamplingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.state_path = self.home / H.GAUGE_FILE
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_reader_whose_clock_is_older_never_overwrites_a_newer_sample(self):
+        Clock11 = Clock(11.0)
+        gauges_for(self.home, Clock11, ticks=lambda: (0, 100)).read()
+        before = self.state_path.read_text()
+        calls = []
+        older = gauges_for(self.home, Clock(10.0), ticks=lambda: calls.append(1) or (5, 100),
+                           memory=lambda: calls.append(2) or 1.0, swap=lambda: calls.append(3) or 0.9)
+        older.read()
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state_path.read_text(), before)
+
+    def test_a_busy_lock_returns_the_saved_state_without_sampling_or_writing(self):
+        gauges_for(self.home, Clock(0.0), ticks=lambda: (0, 100)).read()
+        before = self.state_path.read_text()
+        held = H._try_lock(self.home)
+        self.assertIsNotNone(held)
+        try:
+            calls = []
+            reading = gauges_for(self.home, Clock(40.0), ticks=lambda: calls.append(1) or (9, 100),
+                                 memory=lambda: calls.append(2) or 1.0).read()
+        finally:
+            os.close(held)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state_path.read_text(), before)
+        self.assertIsNone(reading.free_pct)
+
+    def test_two_concurrent_readers_the_newer_sample_survives(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_memory():
+            entered.set()
+            release.wait(5)
+            return 40.0
+
+        newer = gauges_for(self.home, Clock(11.0), ticks=lambda: (0, 100), memory=slow_memory, swap=lambda: 0.1)
+        older = gauges_for(self.home, Clock(10.0), ticks=lambda: (5, 100), memory=lambda: 99.0, swap=lambda: 0.9)
+        worker = threading.Thread(target=newer.read)
+        worker.start()
+        self.assertTrue(entered.wait(5))
+        older_reading = older.read()
+        self.assertIsNone(older_reading.swap_frac)
+        release.set()
+        worker.join(5)
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual((saved["free"], saved["swap"]), (40.0, 0.1))
+        older.read()
+        self.assertEqual(json.loads(self.state_path.read_text(encoding="utf-8"))["swap"], 0.1)
+
+    def test_a_failed_cpu_sample_does_not_refresh_an_old_high_reading(self):
+        readings = iter([(0, 100), (90, 200), None, None, None])
+        clock = Clock(0.0)
+        gauges = gauges_for(self.home, clock, ticks=lambda: next(readings))
+        gauges.read()
+        clock.t = 10.0
+        self.assertAlmostEqual(gauges.read().cpu_busy, 0.9)
+        clock.t = 20.0
+        self.assertAlmostEqual(gauges.read().cpu_busy, 0.9)
+        clock.t = 30.0
+        gauges.read()
+        clock.t = 45.0
+        reading = gauges.read()
+        self.assertIsNone(reading.cpu_busy)
+        self.assertIsNone(H.pressure(reading, max_cpu_busy=0.80, min_free_pct=35.0, max_swap_frac=0.9))
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["cpu_at"], 10.0)
+        self.assertEqual(saved["cpu_until"], 40.0)
+
+
+class SysctlPathTests(unittest.TestCase):
+    def test_absolute_path_is_used_on_macos(self):
+        with mock.patch.object(H.os.path, "exists", lambda path: path == H.SYSCTL_DARWIN):
+            self.assertEqual(H.sysctl_path(), H.SYSCTL_DARWIN)
+
+    def test_falls_back_to_a_path_lookup_elsewhere(self):
+        with mock.patch.object(H.os.path, "exists", lambda path: False), \
+                mock.patch.object(H.shutil, "which", lambda name: "/opt/bin/sysctl"):
+            self.assertEqual(H.sysctl_path(), "/opt/bin/sysctl")
+
+
+@unittest.skipUnless(sys.platform == "darwin", "runs the macOS sysctl")
+class LiveSwapUnderRestrictedPathTests(unittest.TestCase):
+    def test_swap_is_read_under_a_path_without_usr_sbin(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            swap = H.read_swap_frac()
+        self.assertIsInstance(swap, float)
+        self.assertGreaterEqual(swap, 0.0)
+        self.assertLessEqual(swap, 1.0)
 
 
 @unittest.skipUnless(sys.platform == "darwin", "reads the macOS host_processor_info counters")

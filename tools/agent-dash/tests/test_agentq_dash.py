@@ -1180,27 +1180,43 @@ class LimitedByTest(unittest.TestCase):
                              ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
         self.assertEqual(result["key"], "morph_slow")
 
-    def test_laptop_when_cpu_busy_is_over_the_tests_bar(self) -> None:
-        result = verdict_for(five_minutes(total=1_000_000), laptop=HOT)
-        self.assertEqual(result["key"], "laptop")
+    def test_laptop_pressure_without_a_broker_hold_is_context_not_the_headline(self) -> None:
+        busy = dict(CALM, cpu_busy=0.95)
+        result = verdict_for(five_minutes(total=1_000_000), laptop=busy)
+        self.assertEqual(result["key"], "headroom")
         self.assertEqual(
-            result["text"],
-            "The laptop is the bottleneck: CPU 90% busy, 60% memory free, swap 10% used.",
+            result["secondary"],
+            "Laptop pressure, not holding DeepSeek jobs: CPU 95% busy against the 92% light bar.",
         )
 
-    def test_load_per_cpu_alone_is_not_the_laptop_verdict(self) -> None:
-        busy_load = dict(CALM, load1=44.0, load_per_cpu=44.0 / 15)
-        self.assertNotEqual(verdict_for(five_minutes(total=1_000_000), laptop=busy_load)["key"], "laptop")
+    def test_the_laptop_verdict_needs_a_broker_hold_on_a_ready_deepseek_job(self) -> None:
+        result = dash.verdict(
+            five_minutes(total=1_000_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold light: cpu 95% busy >= 92%"],
+        )
+        self.assertEqual(result["key"], "held_laptop")
+        self.assertEqual(result["chip"], "Laptop")
+        self.assertEqual(
+            result["text"],
+            "1 DeepSeek jobs held for laptop headroom: 1 light job (CPU 95% busy, limit 92%).",
+        )
 
-    def test_laptop_when_memory_free_is_under_the_tests_bar(self) -> None:
-        low_memory = dict(CALM, memory_free_pct=30.0)
-        self.assertEqual(verdict_for(five_minutes(total=1_000_000), laptop=low_memory)["key"], "laptop")
+    def test_a_ready_job_held_on_a_proxy_budget_is_not_a_laptop_verdict_even_under_pressure(self) -> None:
+        result = dash.verdict(
+            five_minutes(total=1_000_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=dict(CALM, cpu_busy=0.99), ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold pi-deepseek-flash: proxy total waiting 9 > 8"],
+        )
+        self.assertNotEqual(result["key"], "held_laptop")
+        self.assertIn("CPU 99% busy", result["secondary"])
 
-    def test_laptop_when_swap_used_is_at_the_bar(self) -> None:
-        swapping = dict(CALM, swap_frac=0.90)
-        result = verdict_for(five_minutes(total=1_000_000), laptop=swapping)
-        self.assertEqual(result["key"], "laptop")
-        self.assertIn("swap 90% used", result["text"])
+    def test_memory_and_swap_pressure_are_context_against_the_light_bars(self) -> None:
+        low_memory = verdict_for(five_minutes(total=1_000_000), laptop=dict(CALM, memory_free_pct=15.0))
+        self.assertIn("15% memory free against the 20% light floor", low_memory["secondary"])
+        swapping = verdict_for(five_minutes(total=1_000_000), laptop=dict(CALM, swap_frac=0.90))
+        self.assertIn("swap 90% used against the 90% bar", swapping["secondary"])
+        self.assertNotEqual(swapping["key"], "laptop")
 
     def test_laptop_bars_default_to_the_brokers_and_read_broker_json(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1219,14 +1235,14 @@ class LimitedByTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / "slots").mkdir()
-            state = {"free": 44.0, "free_at": NOW - 5, "cpu_busy": 0.66, "cpu_at": NOW - 5,
-                     "swap": 0.2, "swap_at": NOW - 300}
+            state = {"free": 44.0, "free_until": NOW + 10, "cpu_busy": 0.66, "cpu_until": NOW + 25,
+                     "swap": 0.2, "swap_until": NOW - 1}
             (home / "slots" / "gauge.json").write_text(json.dumps(state), encoding="utf-8")
             reading = dash.laptop_reading(home, NOW, memory=lambda now: 99.0)
             self.assertEqual(reading["memory_free_pct"], 44.0)
             self.assertEqual(reading["cpu_busy"], 0.66)
             self.assertIsNone(reading["swap_frac"])
-            state["free_at"] = NOW - 300
+            state["free_until"] = NOW - 1
             (home / "slots" / "gauge.json").write_text(json.dumps(state), encoding="utf-8")
             self.assertEqual(dash.laptop_reading(home, NOW, memory=lambda now: 99.0)["memory_free_pct"], 99.0)
 

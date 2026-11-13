@@ -12,18 +12,23 @@ hot. ``Gauges`` reads the three measures that track real pressure:
 - Swap used: used / total swap (macOS ``sysctl vm.swapusage``, Linux ``/proc/meminfo``).
 
 State lives in ``<home>/slots/gauge.json`` so the broker, the fill controller, the pytest
-shims and the dashboard read one set of samples. Every reader that finds the state stale
-takes a new sample; the counters are cumulative, so readers that interleave still agree.
-Load per CPU is kept on ``Headroom`` for reporting only. Stdlib only.
+shims and the dashboard read one set of samples. A reader that finds a measure due takes the
+interprocess lock ``slots/gauge.lock``, samples, and writes the state back under that lock. A
+reader that finds the lock busy returns the saved state without sampling. Each measure carries
+an "until" time: past it, the measure is unknown and never holds work. A failed CPU sample
+therefore cannot keep an old reading alive. Load per CPU is kept on ``Headroom`` for reporting
+only. Stdlib only.
 """
 
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -32,7 +37,9 @@ from pathlib import Path
 from typing import Callable, Mapping, NamedTuple, Optional
 
 GAUGE_FILE = Path("slots") / "gauge.json"
-STATE_MAX_AGE_S = 60.0
+LOCK_FILE = Path("slots") / "gauge.lock"
+SYSCTL_DARWIN = "/usr/sbin/sysctl"
+EXPIRY_SAMPLES = 3
 DEFAULT_SETTINGS = {"memory_ttl_s": 15.0, "sample_s": 10.0, "tau_s": 60.0}
 MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 SWAP_USAGE = re.compile(r"\b(total|used)\s*=\s*([\d.]+)([MG])")
@@ -215,12 +222,19 @@ def swap_frac_from_meminfo(fields: dict[str, float]) -> Optional[float]:
     return min(1.0, (total - free) / total)
 
 
+def sysctl_path() -> str:
+    """``/usr/sbin/sysctl`` by absolute path when it exists, else a PATH lookup. Workers run with a PATH that omits /usr/sbin."""
+    if os.path.exists(SYSCTL_DARWIN):
+        return SYSCTL_DARWIN
+    return shutil.which("sysctl") or "sysctl"
+
+
 def read_swap_frac(run=subprocess.run, platform: str | None = None) -> Optional[float]:
     """Used fraction of swap, or None when unreadable."""
     platform = sys.platform if platform is None else platform
     try:
         if platform == "darwin":
-            return parse_swapusage(run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout or "")
+            return parse_swapusage(run([sysctl_path(), "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout or "")
         if platform.startswith("linux"):
             return swap_frac_from_meminfo(parse_meminfo(Path("/proc/meminfo").read_text(encoding="utf-8")))
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -251,18 +265,16 @@ def memory_free_from_meminfo(fields: dict[str, float]) -> Optional[float]:
     return 100.0 * available / total
 
 
-def from_state(state: Mapping, now: float, max_age_s: float) -> Headroom:
-    """The reading a saved state holds, leaving out any measure older than ``max_age_s``. Reads nothing new."""
-    def fresh(value_key: str, at_key: str) -> Optional[float]:
-        value, at = state.get(value_key), state.get(at_key)
-        if isinstance(value, (int, float)) and isinstance(at, (int, float)) and 0 <= now - at <= max_age_s:
-            return float(value)
-        return None
+def reading_from_state(state: Mapping, now: float) -> Headroom:
+    """The reading a saved state holds at ``now``: each measure counts only before its "until" time. Reads nothing new."""
+    def live(value_key: str, until_key: str) -> Optional[float]:
+        value, until = _number(state.get(value_key)), _number(state.get(until_key))
+        return value if value is not None and until is not None and now < until else None
 
     return Headroom(
-        free_pct=fresh("free", "free_at"),
-        cpu_busy=fresh("cpu_busy", "cpu_at"),
-        swap_frac=fresh("swap", "swap_at"),
+        free_pct=live("free", "free_until"),
+        cpu_busy=live("cpu_busy", "cpu_until"),
+        swap_frac=live("swap", "swap_until"),
         load_per_cpu=None,
     )
 
@@ -274,6 +286,30 @@ def load_state(home) -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _try_lock(home) -> Optional[int]:
+    """Descriptor holding the exclusive gauge lock, or None when another reader holds it (or it cannot be taken).
+
+    Close the descriptor to release the lock.
+    """
+    path = Path(home) / LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _due(state: Mapping, until_key: str, now: float) -> bool:
+    until = _number(state.get(until_key))
+    return until is None or now >= until
 
 
 def _save_state(home, state: dict) -> None:
@@ -289,9 +325,11 @@ def _save_state(home, state: dict) -> None:
 
 
 class Gauges:
-    """Samples the laptop's headroom, at most one CPU and swap sample per ``sample_s`` and memory per ``memory_ttl_s``.
+    """Samples the laptop's headroom: memory at most once per ``memory_ttl_s``, CPU and swap once per ``sample_s``.
 
-    With ``home`` the state persists in ``slots/gauge.json``; without it the state stays in memory,
+    With ``home`` the state persists in ``slots/gauge.json`` and sampling is serialized by the
+    lock in ``slots/gauge.lock``. A reader that cannot take the lock returns the saved state
+    as it stands, with no sample and no write. Without ``home`` the state stays in memory,
     which is how the tests run. Cadence settings are read when the object is built; thresholds
     are the caller's to apply with ``pressure``. ``ticks``, ``swap``, ``memory``, ``loadavg``,
     ``cpus`` and ``clock`` are injectable for tests.
@@ -310,51 +348,55 @@ class Gauges:
         self.loadavg = loadavg
         self.cpus = cpus
         self.clock = clock
-        self._state: dict = load_state(home) if home is not None else {}
+        self._state: dict = {}
 
     def read(self) -> Headroom:
-        """Current headroom. Samples only what is stale; a state that is not saved is still used in memory."""
+        """Current headroom, sampling whatever is due. Never raises on an unreadable measure."""
+        if self.home is None:
+            self._state, now = self._refresh(self._state)
+            return self._reading(self._state, now)
+        fd = _try_lock(self.home)
+        if fd is None:
+            return self._reading(load_state(self.home), self.clock())
+        try:
+            state, now = self._refresh(load_state(self.home))
+            _save_state(self.home, state)
+            return self._reading(state, now)
+        finally:
+            os.close(fd)
+
+    def _refresh(self, saved: Mapping) -> tuple[dict, float]:
+        """The saved state with every due measure sampled. Reads the clock here, after any lock is held,
+        so a reader never reasons from a time older than the state it found."""
+        state = dict(saved)
         now = self.clock()
-        state = self._load()
-        changed = False
-        if not _fresh(state, "free_at", now, self.settings["memory_ttl_s"]):
-            state["free"], state["free_at"] = self.memory(), now
-            changed = True
-        if not _fresh(state, "cpu_at", now, self.settings["sample_s"]):
+        expiry = EXPIRY_SAMPLES * self.settings["sample_s"]
+        if _due(state, "free_until", now):
+            state["free"] = self.memory()
+            state["free_until"] = now + self.settings["memory_ttl_s"]
+        if _due(state, "cpu_next", now):
             ticks = self.ticks()
             sample = cpu_fraction(_pair(state.get("ticks")), ticks)
-            if sample is not None:
-                state["cpu_busy"] = smooth(state.get("cpu_busy"), state.get("cpu_at"), sample, now, self.settings["tau_s"])
+            state["cpu_next"] = now + self.settings["sample_s"]
             if ticks is not None:
                 state["ticks"] = list(ticks)
-            state["cpu_at"] = now
-            state["swap"], state["swap_at"] = self.swap(), now
-            changed = True
-        if changed and self.home is not None:
-            _save_state(self.home, state)
-        self._state = state
-        return Headroom(
-            free_pct=_number(state.get("free")),
-            cpu_busy=_number(state.get("cpu_busy")),
-            swap_frac=_number(state.get("swap")),
-            load_per_cpu=self._load_per_cpu(),
-        )
+            if sample is not None:
+                state["cpu_busy"] = smooth(_number(state.get("cpu_busy")), _number(state.get("cpu_at")),
+                                           sample, now, self.settings["tau_s"])
+                state["cpu_at"] = now
+                state["cpu_until"] = now + expiry
+            state["swap"] = self.swap()
+            state["swap_until"] = now + expiry
+        return state, now
 
-    def _load(self) -> dict:
-        if self.home is None:
-            return dict(self._state)
-        return load_state(self.home)
+    def _reading(self, state: Mapping, now: float) -> Headroom:
+        return reading_from_state(state, now)._replace(load_per_cpu=self._load_per_cpu())
 
     def _load_per_cpu(self) -> Optional[float]:
         try:
             return self.loadavg()[0] / (self.cpus() or 1)
         except (OSError, IndexError):
             return None
-
-
-def _fresh(state: Mapping, at_key: str, now: float, ttl_s: float) -> bool:
-    at = state.get(at_key)
-    return isinstance(at, (int, float)) and 0 <= now - at < ttl_s
 
 
 def _number(value) -> Optional[float]:
