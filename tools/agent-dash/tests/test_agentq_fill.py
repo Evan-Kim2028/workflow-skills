@@ -140,10 +140,9 @@ class MinutePressureTests(unittest.TestCase):
         self.assertIn("last minute 90,000", reason)
         self.assertIsNone(F.minute_gate(self.budget(used=3_000, to_reset=57), last_minute={"output": 30_000}))
 
-    def test_a_projection_over_the_allowance_holds(self):
-        reason = F.minute_gate(self.budget(used=30_000, to_reset=40))
-        self.assertIsNotNone(reason)
-        self.assertIn("projected 90,000", reason)
+    def test_a_projection_over_the_allowance_does_not_hold(self):
+        """The projection counts in-flight reservations and overstates the minute, so it never holds filler."""
+        self.assertIsNone(F.minute_gate(self.budget(used=30_000, to_reset=40)))
 
     def test_a_projection_under_the_allowance_does_not_hold(self):
         self.assertIsNone(F.minute_gate(self.budget(used=20_000, to_reset=40)))
@@ -216,7 +215,8 @@ class LiveSignalTests(unittest.TestCase):
         self.assertEqual(seen[-1][1], "stepping")
         self.assertLessEqual(seen[-1][0], 17)
 
-    def test_a_burst_above_the_high_mark_stops_steps_in_the_same_minute(self):
+    def test_a_projected_burst_does_not_stop_filling_the_window_decides(self):
+        """A projection above the high mark is not trusted (it includes reservations); the window average still decides."""
         ctl = F.FillController()
         first = ctl.tick(NOW, fill=FILL, paused=False, billed_avg=5_000_000, active=10, filler_busy=0, ready_real=0,
                          queued_filler=0, gate=None, live_rate=None)
@@ -224,7 +224,7 @@ class LiveSignalTests(unittest.TestCase):
         burst = ctl.tick(NOW + 20, fill=FILL, paused=False, billed_avg=5_000_000, active=14, filler_busy=4,
                          ready_real=0, queued_filler=0, gate=None,
                          live_rate=F.live_projection(total_status(9_000_000, 40), FILL))
-        self.assertEqual((burst.submit, burst.key), (0, "high-mark"))
+        self.assertNotEqual(burst.key, "high-mark")
 
     def test_the_window_average_alone_decides_before_any_projection(self):
         ctl = F.FillController()
