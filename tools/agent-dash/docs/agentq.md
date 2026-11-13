@@ -135,6 +135,13 @@ instead of letting it swing between idle and burst.
   never exceeds `max_workers` (64), and nothing is killed. No gain is judged and no
   ceiling is learned. The level and the step timer are saved in `filler_state`, so a
   broker restart keeps the step interval.
+- Speed. The fill controller reads two rates. The window average is the DeepSeek billed rate over
+  `window_minutes` complete minutes (default 2, previously a fixed 5). The live projection is this
+  calendar minute's DeepSeek usage in the proxy's total budget (`used_by_family`), scaled to a full
+  minute, once at least 15 seconds of the minute have passed. When the projection is below the low
+  mark, filling starts at once; when it is at or above the high mark, growth stops at once. Inside the
+  marks, or with no projection yet, the window average decides. Gates and steps are unchanged.
+  The proxy status now reports `used_by_family` for every budget.
 - Gates, all checked each tick (`gate_reason`). Filler is held, with the reason shown
   in the Limited-by headline and the broker log, when:
   - the proxy status is missing or empty ("proxy status unavailable");

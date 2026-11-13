@@ -1064,6 +1064,7 @@ class Entry:
     lane: str
     done: bool = False
     wall_at: float = 0.0
+    family: str = OTHER_FAMILY
 
 
 @dataclass(eq=False)
@@ -1689,7 +1690,8 @@ class Governor:
         ticket.admitted_minute = minute_stamp(wall)
         for name, estimate in ticket.estimates.items():
             budget = self.budgets[name]
-            entry = Entry(at=now, amount=estimate, lane=ticket.lane, wall_at=wall)
+            entry = Entry(at=now, amount=estimate, lane=ticket.lane, wall_at=wall,
+                          family=family_of(ticket.model))
             budget.entries.append(entry)
             ticket.holds.append((budget, entry))
             self.sync_reserve(budget)
@@ -2209,10 +2211,15 @@ class Governor:
                     queued_by_family[family] += 1
                     if ticket.blocking_budget(now) == name:
                         blocked_by_family[family] += 1
+            used_now = self._used(budget)
+            used_by_family = dict.fromkeys(FAMILY_KEYS, 0)
+            for entry in budget.entries:
+                used_by_family[entry.family] = used_by_family.get(entry.family, 0) + entry.amount
             budgets[name] = {
                 "limit": budget.limit,
                 "target_frac": round(budget.target, 4),
-                "used_60s": self._used(budget),
+                "used_60s": used_now,
+                "used_by_family": used_by_family,
                 "free": round(budget.cap()),
                 "queued": per_lane,
                 "queued_by_family": queued_by_family,
