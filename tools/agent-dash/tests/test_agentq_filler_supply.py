@@ -294,7 +294,7 @@ class MigrationTests(Temp):
         conn.close()
         conn = db.connect(self.home)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
         row = conn.execute("SELECT last_commit FROM filler_audits WHERE target = 'r/pkg' AND kind = 'bugs'").fetchone()
         self.assertEqual(row[0], "c9")
         self.assertIsNotNone(conn.execute("SELECT name FROM sqlite_master WHERE name = 'filler_prs'").fetchone())
@@ -321,31 +321,231 @@ class DryRunTests(Temp):
 
 
 class BrokerFindingsTest(Temp):
-    def test_a_finished_filler_job_adds_its_top_findings_to_the_index(self):
-        (self.home).mkdir()
-        (self.home / "backlog-seed.json").write_text(json.dumps({"filler": {
-            "report_dir": str(self.tmp / "rep"), "repos": {"r": {"workspace": str(self.ws), "modules": ["x"]}},
-        }}), encoding="utf-8")
+    """A finished filler job is indexed from the report location recorded at submission, even when the live
+    settings are not loaded (a cold start, or a restart that adopts the job)."""
+
+    def finished_job(self, conn, report_dir):
         write_lines(self.ws / "x" / "a.py", 3)
-        broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: None,
-                          gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)), launch_pool=mock.Mock(),
-                          labeler=lambda kind, slug: f"hub-exec-{slug}", work_synchronous=True)
-        conn = db.connect(self.home)
-        self.addCleanup(conn.close)
-        run_dir = self.home / "run"
-        run_dir.mkdir()
         db.insert_job(conn, {
             "id": "fj", "lane": "backlog", "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
             "label": "hub-exec-backlog-filler-bugs-r-x", "workspace": str(self.ws), "session": "backlog",
             "harness": "backlog", "prompt_path": "/p",
         }, NOW)
-        conn.execute("UPDATE jobs SET state = 'running', run_dir = ?, started_at = ? WHERE id = 'fj'",
-                     (str(run_dir), NOW))
-        job = db.get_job(conn, "fj")
+        work = F.Work(kind="bugs", repo="r", workspace=str(self.ws), module="x", commit="c", report_path="",
+                      slug="s", key="r/x#bugs", report_dir=report_dir)
+        F.record_filler_job(conn, "fj", work)
+        run_dir = self.tmp / "run"
+        run_dir.mkdir(exist_ok=True)
+        conn.execute("UPDATE jobs SET state = 'running', started_at = ?, run_dir = ? WHERE id = 'fj'",
+                     (NOW, str(run_dir)))
+        return db.get_job(conn, "fj")
+
+    def broker(self):
+        return B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: None,
+                        gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)), launch_pool=mock.Mock(),
+                        labeler=lambda kind, slug: f"hub-exec-{slug}")
+
+    def test_a_finished_job_is_indexed_when_the_live_settings_are_not_loaded(self):
+        self.home.mkdir()
+        conn = db.connect(self.home)
+        self.addCleanup(conn.close)
+        rep = str(self.tmp / "rep")
+        job = self.finished_job(conn, rep)
+        broker = self.broker()
+        self.assertEqual(broker._filler_settings().targets, [])
         broker._finish(conn, job, "- **high** `x/a.py:2` — bad thing\nVERDICT: PASS\n", NOW + 5)
         index = (self.tmp / "rep" / "filler" / "INDEX.md").read_text(encoding="utf-8")
         self.assertIn("hub-exec-backlog-filler-bugs-r-x", index)
         self.assertIn("`x/a.py:2` — bad thing", index)
+        self.assertIsNotNone(conn.execute("SELECT indexed_at FROM filler_jobs WHERE job_id = 'fj'").fetchone()[0])
+
+    def test_a_failed_index_is_recorded_and_retried_by_a_later_tick(self):
+        self.home.mkdir()
+        conn = db.connect(self.home)
+        self.addCleanup(conn.close)
+        rep = self.tmp / "rep"
+        (rep / "filler" / "INDEX.md").mkdir(parents=True)
+        job = self.finished_job(conn, str(rep))
+        broker = self.broker()
+        broker._finish(conn, job, "- **high** `x/a.py:2` — bad thing\nVERDICT: PASS\n", NOW + 5)
+        row = conn.execute("SELECT indexed_at, index_error FROM filler_jobs WHERE job_id = 'fj'").fetchone()
+        self.assertIsNone(row["indexed_at"])
+        self.assertIn("IsADirectoryError", row["index_error"])
+        self.assertEqual(F.pending_index(conn), ["fj"])
+        (rep / "filler" / "INDEX.md").rmdir()
+        broker._retry_indexing(conn, NOW + 5 + B.INDEX_RETRY_S + 1)
+        self.assertEqual(F.pending_index(conn), [])
+        self.assertIn("bad thing", (rep / "filler" / "INDEX.md").read_text(encoding="utf-8"))
+
+
+class ArchiveSafetyTests(Temp):
+    def fill(self, rep, count, max_entries=2):
+        for n in range(count):
+            F.append_index(rep, f"job {n}", [("low", f"f{n}.py:1", f"title {n}")], NOW + n, max_entries=max_entries,
+                           job_id=f"id{n}")
+
+    def test_an_archive_failure_leaves_the_index_unchanged_and_loses_nothing(self):
+        rep = str(self.tmp / "rep")
+        self.fill(rep, 2)
+        index = self.tmp / "rep" / "filler" / "INDEX.md"
+        before = index.read_bytes()
+        archive = self.tmp / "rep" / "filler" / f"INDEX-{time.strftime('%Y-%m', time.gmtime(NOW))}.md"
+        archive.mkdir()
+        with self.assertRaises(OSError):
+            F.append_index(rep, "job 2", [("low", "f2.py:1", "title 2")], NOW + 2, max_entries=2, job_id="id2")
+        self.assertEqual(index.read_bytes(), before)
+        archive.rmdir()
+        F.append_index(rep, "job 2", [("low", "f2.py:1", "title 2")], NOW + 2, max_entries=2, job_id="id2")
+        held = (self.tmp / "rep" / "filler" / f"INDEX-{time.strftime('%Y-%m', time.gmtime(NOW))}.md").read_text(
+            encoding="utf-8")
+        live = index.read_text(encoding="utf-8")
+        self.assertIn("title 0", held)
+        self.assertIn("title 2", live)
+        self.assertNotIn("title 0", live)
+
+    def test_a_crash_between_archive_and_replace_does_not_duplicate_on_retry(self):
+        rep = str(self.tmp / "rep")
+        self.fill(rep, 2)
+        index = self.tmp / "rep" / "filler" / "INDEX.md"
+        before = index.read_text(encoding="utf-8")
+        F.append_index(rep, "job 2", [("low", "f2.py:1", "title 2")], NOW + 2, max_entries=2, job_id="id2")
+        index.write_text(before, encoding="utf-8")
+        F.append_index(rep, "job 2", [("low", "f2.py:1", "title 2")], NOW + 2, max_entries=2, job_id="id2")
+        archive = (self.tmp / "rep" / "filler" / f"INDEX-{time.strftime('%Y-%m', time.gmtime(NOW))}.md").read_text(
+            encoding="utf-8")
+        self.assertEqual(archive.count("title 0"), 1)
+        self.assertNotIn("title 1", archive)
+        self.assertNotIn("title 2", archive)
+
+
+class RefreshGuardTests(Temp):
+    def seed(self, **filler):
+        self.home.mkdir(exist_ok=True)
+        base = {"report_dir": str(self.tmp / "rep"), "repos": {"r": {"workspace": str(self.ws), "modules": ["pkg"]}}}
+        base.update(filler)
+        path = self.home / "backlog-seed.json"
+        path.write_text(json.dumps({"filler": base}), encoding="utf-8")
+        stamp = time.time() + self.bump
+        self.bump += 10
+        os.utime(path, (stamp, stamp))
+
+    def setUp(self):
+        super().setUp()
+        self.bump = 0
+        write_lines(self.ws / "pkg" / "a.py", 10)
+        self.logged = []
+
+    def cache(self, now):
+        return F.WorkCache(self.home, now=lambda: now[0], synchronous=True, log=self.logged.append)
+
+    def test_the_reviewers_one_e308_window_is_refused_logged_and_keeps_the_snapshot(self):
+        self.seed()
+        now = [NOW]
+        cache = self.cache(now)
+        settings, _ = cache.snapshot()
+        self.assertEqual([t.module for t in settings.targets], ["pkg"])
+        self.seed(pr_window_h=1e308)
+        now[0] = NOW + 10
+        settings, prs = cache.snapshot()
+        self.assertEqual([t.module for t in settings.targets], ["pkg"])
+        self.assertEqual(len(self.logged), 1)
+        self.assertIn("filler refresh failed: ValueError", self.logged[0])
+        self.assertIn("pr_window_h", self.logged[0])
+
+    def test_an_unexpected_error_is_logged_and_does_not_escape_the_refresh(self):
+        self.seed()
+        now = [NOW]
+        cache = self.cache(now)
+        with mock.patch.object(F, "load_settings", side_effect=OverflowError("boom")):
+            now[0] = NOW + 5
+            cache._refresh(now[0])
+        self.assertEqual(self.logged, ["filler refresh failed: OverflowError: boom"])
+
+    def test_failures_back_off_from_sixty_seconds_doubling_to_thirty_minutes(self):
+        self.seed()
+        now = [NOW]
+        cache = self.cache(now)
+        now[0] = NOW + 2 * F.PR_REFRESH_S
+        calls = []
+
+        def failing(config):
+            calls.append(now[0])
+            raise RuntimeError("down")
+        with mock.patch.object(F, "load_settings", failing):
+            for _ in range(12):
+                now[0] = cache._next_attempt_at or now[0]
+                cache.snapshot()
+        gaps = [b - a for a, b in zip(calls, calls[1:])]
+        self.assertEqual(gaps[:5], [60.0, 120.0, 240.0, 480.0, 960.0])
+        self.assertEqual(max(gaps), F.REFRESH_BACKOFF_MAX_S)
+
+    def test_no_retry_happens_inside_the_backoff_window_but_a_seed_change_retries_at_once(self):
+        self.seed()
+        now = [NOW]
+        cache = self.cache(now)
+        cache.snapshot()
+        calls = []
+
+        def failing(config):
+            calls.append(now[0])
+            raise RuntimeError("down")
+        with mock.patch.object(F, "load_settings", failing):
+            self.seed(scan_max_files=20000)
+            now[0] = NOW + 5
+            cache.snapshot()
+            now[0] = NOW + 30
+            cache.snapshot()
+            self.assertEqual(len(calls), 1)
+            self.seed(scan_max_files=19999)
+            now[0] = NOW + 31
+            cache.snapshot()
+            self.assertEqual(len(calls), 2)
+
+    def test_the_same_error_is_logged_once_and_a_new_one_is_logged_again(self):
+        self.seed()
+        now = [NOW]
+        cache = self.cache(now)
+        cache.snapshot()
+        messages = iter(["one", "one", "two"])
+
+        def failing(config):
+            raise RuntimeError(next(messages))
+        now[0] = NOW + 2 * F.PR_REFRESH_S
+        with mock.patch.object(F, "load_settings", failing):
+            for _ in range(3):
+                now[0] = (cache._next_attempt_at or now[0]) + 1
+                cache.snapshot()
+        self.assertEqual(self.logged, ["filler refresh failed: RuntimeError: one",
+                                       "filler refresh failed: RuntimeError: two"])
+
+
+class ConfigBoundsTests(unittest.TestCase):
+    def config(self, **filler):
+        return {"filler": {"report_dir": "/tmp/rep", "repos": {"r": {"workspace": "/tmp", "modules": []}}, **filler}}
+
+    def test_a_pr_window_beyond_720_hours_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "pr_window_h"):
+            F.load_settings(self.config(pr_window_h=721))
+        self.assertEqual(F.load_settings(self.config(pr_window_h=720)).pr_window_h, 720.0)
+
+    def test_scan_budgets_must_be_positive_and_within_their_ceilings(self):
+        with self.assertRaisesRegex(ValueError, "scan_max_files"):
+            F.load_settings(self.config(scan_max_files=0))
+        with self.assertRaisesRegex(ValueError, "scan_max_mb"):
+            F.load_settings(self.config(scan_max_mb=-1))
+        with self.assertRaisesRegex(ValueError, "scan_max_seconds"):
+            F.load_settings(self.config(scan_max_seconds=1e9))
+
+    def test_non_finite_numbers_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            F.load_settings(self.config(pr_window_h=float("nan")))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            F.load_settings(self.config(scan_max_seconds=float("inf")))
+
+    def test_the_configured_budgets_reach_the_settings(self):
+        settings = F.load_settings(self.config(scan_max_files=500, scan_max_mb=2, scan_max_seconds=1.5))
+        self.assertEqual((settings.scan_max_files, settings.scan_max_bytes, settings.scan_max_seconds),
+                         (500, 2 * 2**20, 1.5))
 
 
 class PrSourceUnitTests(unittest.TestCase):

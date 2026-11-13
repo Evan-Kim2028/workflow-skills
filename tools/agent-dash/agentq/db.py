@@ -18,7 +18,7 @@ import time
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
@@ -72,6 +72,16 @@ FILLER_PRS_TABLE = """CREATE TABLE IF NOT EXISTS filler_prs (
     reviewed_at REAL,
     last_job TEXT,
     PRIMARY KEY (repo, number)
+)"""
+
+FILLER_JOBS_TABLE = """CREATE TABLE IF NOT EXISTS filler_jobs (
+    job_id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    report_dir TEXT NOT NULL,
+    indexed_at REAL,
+    index_error TEXT
 )"""
 
 FILLER_AUDIT_MIGRATION = (
@@ -133,6 +143,7 @@ _STATEMENTS = (
     FILLER_STATE_TABLE,
     FILLER_AUDITS_TABLE,
     FILLER_PRS_TABLE,
+    FILLER_JOBS_TABLE,
 )
 
 # Each step upgrades a store from the version it names to the next one.
@@ -144,6 +155,7 @@ _UPGRADES = {
     2: (BACKLOG_TABLE.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),),
     3: (FILLER_TARGETS_TABLE, FILLER_STATE_TABLE),
     4: (FILLER_AUDITS_TABLE, FILLER_PRS_TABLE) + FILLER_AUDIT_MIGRATION,
+    5: (FILLER_JOBS_TABLE,),
 }
 
 JOB_COLUMNS = frozenset(

@@ -108,6 +108,7 @@ RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IG
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
 CONTROLLER_STATE_KEY = "fill_controller"
+INDEX_RETRY_S = 60.0
 MEASURE_REFRESH_S = 600.0
 PROCESS_REFRESH_S = 30.0
 OPEN = db.OPEN_STATES
@@ -758,6 +759,7 @@ class Broker:
         self._measured: tuple[float, int | None] | None = None
         self._work = filler_lib.WorkCache(self.home, now=self.now, synchronous=work_synchronous, log=self.log)
         self._filler_retry = 0.0
+        self._index_retry_at = 0.0
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
@@ -773,6 +775,7 @@ class Broker:
             launched = self.launch_ready(conn, now, status=status)
             self.submit_backlog(conn, now, status)
             self.submit_filler(conn, now, status)
+            self._retry_indexing(conn, now)
         finally:
             conn.close()
         write_heartbeat(self.home)
@@ -1104,6 +1107,7 @@ class Broker:
         with db.tx(conn):
             db.insert_job(conn, job, now)
             filler_lib.record_work(conn, work, job_id, now)
+            filler_lib.record_filler_job(conn, job_id, work)
         self.log(f"filler {work.key} submitted {job_id} ({label})")
         return job_id
 
@@ -1237,7 +1241,7 @@ class Broker:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
         if is_filler(job):
-            self._index_findings(job, text, now)
+            filler_lib.index_job(conn, job["id"], now, text=text)
         verdict = verdict_of(text)
         note = "; ".join(part for part in (note, worktree_note(job)) if part)
         self._move(
@@ -1246,15 +1250,13 @@ class Broker:
             pi_session=pi_session_of(job["run_dir"], job["label"]) or job["pi_session"],
         )  # fmt: skip
 
-    def _index_findings(self, job: dict, text: str, now: float) -> None:
-        """Add a finished filler job's top findings to the owner's index. Best effort: a failure is logged."""
-        settings = self._filler_settings()
-        if not settings.report_dir:
+    def _retry_indexing(self, conn, now: float) -> None:
+        """Index finished filler jobs whose findings failed to index earlier. Tried at most once a minute."""
+        if now < self._index_retry_at:
             return
-        try:
-            filler_lib.append_index(settings.report_dir, job["label"], filler_lib.top_findings(text, 5), now)
-        except OSError as exc:
-            self.log(f"filler index not updated: {exc}")
+        self._index_retry_at = now + INDEX_RETRY_S
+        for job_id in filler_lib.pending_index(conn):
+            filler_lib.index_job(conn, job_id, now)
 
     def _fail(self, conn, job: dict, now: float, reason: str, attempt: int | None = None) -> None:
         self._move(

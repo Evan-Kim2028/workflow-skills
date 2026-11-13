@@ -38,6 +38,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -72,6 +73,9 @@ DEFAULT_MAX_TARGET_LINES = 4000
 DEFAULT_MIN_TARGET_LINES = 300
 DEFAULT_PR_WINDOW_H = 48.0
 PR_REFRESH_S = 1800.0
+MAX_PR_WINDOW_H = 720.0
+REFRESH_BACKOFF_MIN_S = 60.0
+REFRESH_BACKOFF_MAX_S = 1800.0
 CODE_SUFFIXES = (".py", ".sql", ".sh")
 SLUG_BASE_MAX = 48
 SLUG_HASH_LEN = 8
@@ -130,6 +134,9 @@ class Settings:
     min_target_lines: int
     pr_repos: tuple = field(default_factory=tuple)
     pr_window_h: float = DEFAULT_PR_WINDOW_H
+    scan_max_files: int = SCAN_MAX_FILES
+    scan_max_bytes: int = SCAN_MAX_BYTES
+    scan_max_seconds: float = SCAN_MAX_SECONDS
 
 
 @dataclass(frozen=True)
@@ -148,6 +155,7 @@ class Work:
     pr_title: str = ""
     pr_url: str = ""
     pr_slug: str = ""
+    report_dir: str = ""
 
 
 def module_slug(text: str) -> str:
@@ -366,22 +374,33 @@ def _kinds(spec: dict) -> tuple:
     return tuple(dict.fromkeys(kinds))
 
 
+def _number(spec: dict, name: str, default: float, low: float, high: float) -> float:
+    """A finite number in (low, high] from the config, or ``default`` when the key is absent."""
+    value = spec.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"filler.{name} must be a finite number")
+    if not low < value <= high:
+        raise ValueError(f"filler.{name} must be above {low:g} and at most {high:g}, not {value:g}")
+    return float(value)
+
+
 def load_settings(config: dict) -> Settings:
     """The filler's settings and targets from the seed config. No ``filler`` key means no work.
 
-    Raises ValueError for a malformed section.
+    Raises ValueError for a malformed section or an out-of-range value: a PR window over 720 hours, scan budgets
+    of zero or less or beyond their ceilings, a non-finite number.
     """
     spec = config.get("filler") if isinstance(config, dict) else None
     if not isinstance(spec, dict):
-        return Settings([], DEFAULT_MAX_RUNTIME_S, DEFAULT_KINDS, "", DEFAULT_MAX_TARGET_LINES,
-                        DEFAULT_MIN_TARGET_LINES)
+        return empty_settings()
     report_dir = _folder(spec, "report_dir", "filler")
     max_runtime = backlog_lib.parse_duration(spec["max_runtime"]) if "max_runtime" in spec else DEFAULT_MAX_RUNTIME_S
     max_lines = _positive_int(spec, "max_target_lines", DEFAULT_MAX_TARGET_LINES)
     min_lines = _positive_int(spec, "min_target_lines", DEFAULT_MIN_TARGET_LINES)
-    window = spec.get("pr_window_h", DEFAULT_PR_WINDOW_H)
-    if not isinstance(window, (int, float)) or isinstance(window, bool) or window <= 0:
-        raise ValueError("filler.pr_window_h must be a positive number of hours")
+    window = _number(spec, "pr_window_h", DEFAULT_PR_WINDOW_H, 0.0, MAX_PR_WINDOW_H)
+    max_files = int(_number(spec, "scan_max_files", SCAN_MAX_FILES, 0.0, 1_000_000))
+    max_bytes = int(_number(spec, "scan_max_mb", SCAN_MAX_BYTES / 2**20, 0.0, 10_000) * 2**20)
+    max_seconds = _number(spec, "scan_max_seconds", SCAN_MAX_SECONDS, 0.0, 600.0)
     repos = spec.get("repos")
     if not isinstance(repos, dict) or not repos:
         raise ValueError("filler.repos must name at least one repo")
@@ -402,7 +421,8 @@ def load_settings(config: dict) -> Settings:
             raise ValueError(f"{where} needs modules or roots")
         pieces = set()
         for module in {m.strip().strip("/") for m in modules}:
-            pieces.update(split_module(workspace, module, max_lines, min_lines))
+            budget = ScanBudget(max_files=max_files, max_bytes=max_bytes, max_seconds=max_seconds)
+            pieces.update(split_module(workspace, module, max_lines, min_lines, budget=budget))
         for piece in sorted(pieces):
             targets.append(Target(repo=repo, module=piece, workspace=workspace, report_dir=report_dir))
         slug = folders.get("github")
@@ -412,7 +432,7 @@ def load_settings(config: dict) -> Settings:
     return Settings(
         targets=targets, max_runtime=max_runtime, kinds=_kinds(spec), report_dir=report_dir,
         max_target_lines=max_lines, min_target_lines=min_lines, pr_repos=tuple(pr_repos),
-        pr_window_h=float(window),
+        pr_window_h=window, scan_max_files=max_files, scan_max_bytes=max_bytes, scan_max_seconds=max_seconds,
     )
 
 
@@ -496,6 +516,7 @@ def pr_work(candidate: dict) -> Work:
         report_path=str(Path(candidate["report_dir"]) / "filler" / repo / "pr" / f"{number}.md"),
         slug=f"pr-{module_slug(repo)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
         pr_title=candidate.get("title", ""), pr_url=candidate.get("url", ""), pr_slug=candidate.get("slug", ""),
+        report_dir=candidate["report_dir"],
     )
 
 
@@ -503,6 +524,7 @@ def audit_work(target: Target, kind: str, head: str) -> Work:
     return Work(
         kind=kind, repo=target.repo, workspace=target.workspace, module=target.module, commit=head,
         report_path=target.report_path(kind), slug=label_slug(target, kind), key=f"{target.key}#{kind}",
+        report_dir=target.report_dir,
     )
 
 
@@ -606,8 +628,11 @@ def index_path(report_dir: str) -> Path:
     return Path(report_dir) / "filler" / "INDEX.md"
 
 
+KEY_MARK = re.compile(r"^<!-- key: (\S+) -->$", re.MULTILINE)
+
+
 def _index_blocks(text: str) -> tuple[str, list[str]]:
-    """Split the index into its header and its job blocks (each starts at a line that begins ``## ``)."""
+    """Split an index or archive into its header and job blocks (each starts at a line that begins ``## ``)."""
     lines = text.splitlines(keepends=True)
     starts = [i for i, line in enumerate(lines) if line.startswith("## ")]
     if not starts:
@@ -615,6 +640,12 @@ def _index_blocks(text: str) -> tuple[str, list[str]]:
     header = "".join(lines[: starts[0]])
     bounds = starts + [len(lines)]
     return header, ["".join(lines[bounds[k]: bounds[k + 1]]) for k in range(len(starts))]
+
+
+def _block_key(block: str) -> str:
+    """The job id a block was written for, or a digest of its text for blocks written before keys existed."""
+    match = KEY_MARK.search(block)
+    return match.group(1) if match else hashlib.sha1(block.encode("utf-8")).hexdigest()[:16]
 
 
 def _block_bullets(block: str) -> list[tuple[str, str, str]]:
@@ -630,25 +661,26 @@ def _block_month(block: str) -> str:
 
 
 def append_index(report_dir: str, heading: str, findings, now: float,
-                 max_entries: int = INDEX_MAX_ENTRIES) -> int:
+                 max_entries: int = INDEX_MAX_ENTRIES, job_id: str | None = None) -> int:
     """Add the findings not already in the index as a new block at the top. Returns how many were added.
 
     Safe for concurrent appenders: the index is read, changed and rewritten under an exclusive lock on
-    ``filler/INDEX.lock``, and the rewrite goes to a temporary file that replaces the index in one step.
-    The index keeps the newest ``max_entries`` findings. Older job blocks move to ``INDEX-<YYYY-MM>.md`` archives,
-    which are appended to and never reread. Deduplication is against the retained window.
+    ``filler/INDEX.lock``. The index keeps the newest ``max_entries`` findings. Blocks that fall out of it are
+    written to ``INDEX-<YYYY-MM>.md`` first, flushed and fsynced; only then is ``INDEX.md`` replaced, atomically. So
+    a failed archive write leaves the index unchanged, and a crash between the two steps repeats the archive step
+    harmlessly: a block whose key the archive already holds is not written again. An error propagates to the caller.
     """
     base = Path(report_dir) / "filler"
     base.mkdir(parents=True, exist_ok=True)
     with open(base / INDEX_LOCK, "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            return _append_locked(base, heading, findings, now, max_entries)
+            return _append_locked(base, heading, findings, now, max_entries, job_id)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _append_locked(base: Path, heading: str, findings, now: float, max_entries: int) -> int:
+def _append_locked(base: Path, heading: str, findings, now: float, max_entries: int, job_id: str | None) -> int:
     path = base / "INDEX.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     header, blocks = _index_blocks(existing)
@@ -662,36 +694,114 @@ def _append_locked(base: Path, heading: str, findings, now: float, max_entries: 
     if not fresh:
         return 0
     stamp = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-    new_block = f"## {stamp} — {heading}\n" + "".join(f"- **{s}** `{loc}` — {t}\n" for s, loc, t in fresh) + "\n"
+    body = f"## {stamp} — {heading}\n" + "".join(f"- **{s}** `{loc}` — {t}\n" for s, loc, t in fresh) + "\n"
+    key = job_id or hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
+    new_block = body.replace("\n", f"\n<!-- key: {key} -->\n", 1)
     blocks.insert(0, new_block)
     counts = [len(_block_bullets(block)) for block in blocks]
     retained, total = len(blocks), sum(counts)
     while retained > 1 and total > max_entries:
         retained -= 1
         total -= counts[retained]
-    moved = blocks[retained:]
-    kept = blocks[:retained]
+    moved, kept = blocks[retained:], blocks[:retained]
+    _archive(base, moved)
     if not header.strip():
         header = INDEX_HEADER
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
-    tmp.write_text(header + "".join(kept), encoding="utf-8")
-    os.replace(tmp, path)
+    _replace_atomically(path, header + "".join(kept))
+    return len(fresh)
+
+
+def _archive(base: Path, blocks: list[str]) -> None:
+    """Append blocks to their month's archive, skipping any key the archive already holds. Fsynced before returning."""
     by_month: dict[str, list[str]] = {}
-    for block in moved:
+    for block in blocks:
         by_month.setdefault(_block_month(block), []).append(block)
     for month, group in by_month.items():
-        with open(base / f"INDEX-{month}.md", "a", encoding="utf-8") as archive:
-            archive.write("".join(group))
-    return len(fresh)
+        archive = base / f"INDEX-{month}.md"
+        held = set()
+        if archive.exists():
+            _, old = _index_blocks(archive.read_text(encoding="utf-8"))
+            held = {_block_key(block) for block in old}
+        todo = [block for block in group if _block_key(block) not in held]
+        if not todo:
+            continue
+        with open(archive, "a", encoding="utf-8") as fh:
+            fh.write("".join(todo))
+            fh.flush()
+            os.fsync(fh.fileno())
+
+
+def _replace_atomically(path: Path, text: str) -> None:
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def record_filler_job(conn, job_id: str, work: Work) -> None:
+    """Persist where a filler job's report belongs, so its findings can be indexed without the live settings.
+    Call inside ``db.tx`` at submission."""
+    conn.execute(
+        """INSERT INTO filler_jobs (job_id, repo, kind, slug, report_dir, indexed_at, index_error)
+           VALUES (?, ?, ?, ?, ?, NULL, NULL)""",
+        (job_id, work.repo, work.kind, work.slug, work.report_dir),
+    )
+
+
+def index_job(conn, job_id: str, now: float, text: str | None = None) -> bool:
+    """Index one finished filler job's top findings into the index recorded for it. Returns True when it is indexed
+    (or there is nothing to index). A failure is recorded on the job's row and returns False; ``pending_index``
+    lists it again for a later attempt."""
+    row = conn.execute("SELECT report_dir, indexed_at FROM filler_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if row is None:
+        return True
+    if row["indexed_at"] is not None:
+        return True
+    job = db.get_job(conn, job_id)
+    if job is None:
+        return True
+    if text is None:
+        try:
+            text = Path(job["report_path"]).read_text(encoding="utf-8") if job["report_path"] else ""
+        except OSError as exc:
+            _record_index_error(conn, job_id, f"{type(exc).__name__}: {exc}")
+            return False
+    try:
+        append_index(row["report_dir"], job["label"], top_findings(text, 5), now, job_id=job_id)
+    except (OSError, ValueError) as exc:
+        _record_index_error(conn, job_id, f"{type(exc).__name__}: {exc}")
+        return False
+    conn.execute("UPDATE filler_jobs SET indexed_at = ?, index_error = NULL WHERE job_id = ?", (now, job_id))
+    return True
+
+
+def _record_index_error(conn, job_id: str, message: str) -> None:
+    conn.execute("UPDATE filler_jobs SET index_error = ? WHERE job_id = ?", (message[:300], job_id))
+
+
+def pending_index(conn, limit: int = 20) -> list[str]:
+    """Finished filler jobs whose findings are not in the index yet, oldest first."""
+    rows = conn.execute(
+        """SELECT f.job_id FROM filler_jobs f JOIN jobs j ON j.id = f.job_id
+           WHERE f.indexed_at IS NULL AND j.state = 'done' ORDER BY j.finished_at, j.rowid LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def empty_settings() -> Settings:
+    return Settings([], DEFAULT_MAX_RUNTIME_S, DEFAULT_KINDS, "", DEFAULT_MAX_TARGET_LINES, DEFAULT_MIN_TARGET_LINES)
 
 
 class WorkCache:
     """The filler's settings and merged PRs, read off the caller's thread.
 
     ``snapshot()`` never blocks. It returns the last complete read (empty before the first) and starts a background
-    refresh when that read is older than ``refresh_s`` or the seed file changed. The scan of the repos and the GitHub
-    calls run in that thread, so a slow tree or a slow ``gh`` cannot hold the broker tick. ``synchronous=True`` runs
-    the refresh inline (tests).
+    refresh when that read is older than ``refresh_s``, or the seed file changed. A failed refresh keeps the previous
+    snapshot, logs once per distinct error through ``log``, and backs off: the next attempt waits 60 s, then doubles,
+    up to 30 minutes. A change to the seed file retries at once. ``synchronous=True`` runs the refresh inline (tests).
     """
 
     def __init__(self, home, *, now=time.time, synchronous: bool = False, refresh_s: float = PR_REFRESH_S,
@@ -707,6 +817,10 @@ class WorkCache:
         self._prs: list[dict] = []
         self._built_at: float | None = None
         self._built_mtime: float | None = None
+        self._attempt_mtime: float | None = None
+        self._next_attempt_at: float | None = None
+        self._failures = 0
+        self._last_error: str | None = None
         self._thread: threading.Thread | None = None
 
     def _mtime(self) -> float | None:
@@ -721,8 +835,12 @@ class WorkCache:
         with self._lock:
             stale = (self._built_at is None or now - self._built_at >= self.refresh_s
                      or mtime != self._built_mtime)
+            due = self._next_attempt_at is None or now >= self._next_attempt_at or mtime != self._attempt_mtime
             busy = self._thread is not None and self._thread.is_alive()
-        if stale and not busy:
+            start = stale and due and not busy
+            if start:
+                self._attempt_mtime = mtime
+        if start:
             if self.synchronous:
                 self._refresh(now)
             else:
@@ -734,33 +852,46 @@ class WorkCache:
             return (self._settings or empty_settings(), list(self._prs))
 
     def _refresh(self, now: float) -> None:
-        mtime = self._mtime()
+        """One refresh. Never raises: any failure is recorded and the previous snapshot is kept."""
         try:
+            mtime = self._mtime()
             data = json.loads(self.path.read_text(encoding="utf-8")) if mtime is not None else {}
             settings = load_settings(data)
-        except (OSError, ValueError) as exc:
-            self.log(f"filler config refused: {exc}")
-            settings = empty_settings()
-        prs: list[dict] = []
-        window_start = now - settings.pr_window_h * 3600
-        for repo in settings.pr_repos:
-            try:
-                rows = pr_source.merged_prs(repo.slug, pr_source.since_date(now, settings.pr_window_h), run=self.run)
-            except pr_source.PRSourceError as exc:
-                self.log(f"filler PR source {repo.repo}: {exc}")
-                continue
-            for row in rows:
-                if pr_source.merged_epoch(row) >= window_start:
-                    prs.append({**row, "repo": repo.repo, "slug": repo.slug, "workspace": repo.workspace,
-                                "report_dir": settings.report_dir})
-        prs.sort(key=pr_source.merged_epoch, reverse=True)
+            prs: list[dict] = []
+            window_start = now - settings.pr_window_h * 3600
+            for repo in settings.pr_repos:
+                try:
+                    rows = pr_source.merged_prs(repo.slug, pr_source.since_date(now, settings.pr_window_h),
+                                                run=self.run)
+                except pr_source.PRSourceError as exc:
+                    self.log(f"filler PR source {repo.repo}: {exc}")
+                    continue
+                for row in rows:
+                    if pr_source.merged_epoch(row) >= window_start:
+                        prs.append({**row, "repo": repo.repo, "slug": repo.slug, "workspace": repo.workspace,
+                                    "report_dir": settings.report_dir})
+            prs.sort(key=pr_source.merged_epoch, reverse=True)
+        except Exception as exc:  # the thread must never die silently, whatever failed
+            self._record_failure(now, exc)
+            return
         with self._lock:
             self._settings, self._prs = settings, prs
             self._built_at, self._built_mtime = now, mtime
+            self._failures, self._next_attempt_at, self._last_error = 0, None, None
 
-
-def empty_settings() -> Settings:
-    return Settings([], DEFAULT_MAX_RUNTIME_S, DEFAULT_KINDS, "", DEFAULT_MAX_TARGET_LINES, DEFAULT_MIN_TARGET_LINES)
+    def _record_failure(self, now: float, exc: BaseException) -> None:
+        message = f"filler refresh failed: {type(exc).__name__}: {exc}"
+        with self._lock:
+            self._failures += 1
+            delay = min(REFRESH_BACKOFF_MAX_S, REFRESH_BACKOFF_MIN_S * 2 ** (self._failures - 1))
+            self._next_attempt_at = now + delay
+            changed = message != self._last_error
+            self._last_error = message
+        if changed:
+            try:
+                self.log(message)
+            except Exception:  # a broken log callback must not kill the refresh
+                pass
 
 
 def main(argv=None, out=None, run_pr=pr_source.merged_prs, now=None, head_of=None) -> int:

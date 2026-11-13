@@ -159,10 +159,15 @@ instead of letting it swing between idle and burst.
   read (no FIFOs or devices). Generated and vendored folders (`target/`, `dbt_packages/`,
   `build/`, `dist/`, `.venv/`, `node_modules/`, `__pycache__/`, `site-packages/`, hidden
   folders) and git-ignored files are left out. A symlink whose resolved path leaves the
-  workspace is rejected. Each module scan has a budget of 20,000 files, 200 MB and 5
-  seconds; a scan over budget keeps the module whole. Scans and the GitHub calls run on a
+  workspace is rejected. Each module scan has a budget (`scan_max_files` 20000,
+  `scan_max_mb` 200, `scan_max_seconds` 5; each must be positive and within a ceiling);
+  a scan over budget keeps the module whole. Scans and the GitHub calls run on a
   background thread that refreshes the target list and the merged PRs every 30 minutes
   (or when the seed file changes), so the broker tick only reads the last complete result.
+  A failed refresh keeps the previous result, logs `filler refresh failed: <type>: <message>`
+  once per distinct error, and retries after 60 s, doubling to 30 minutes; a change to the
+  seed file retries at once. Out-of-range values (`pr_window_h` above 720, a non-finite
+  number) are refused at validation.
 - Audit kinds. `bugs` (correctness defects and dead code), `tests` (risky paths with no
   test, with the test cases described, not written), `docs` (docstrings, runbooks and
   AGENTS.md text that no longer matches the code), `risk` (security issues and expensive
@@ -175,11 +180,16 @@ instead of letting it swing between idle and burst.
   whether its tests cover it. It is read through one bounded `gh pr list` call per repo
   every 30 minutes (at most 50 PRs per call). Reviewed PRs are recorded in `filler_prs`,
   and a PR is reviewed once. Reports go to `<report_dir>/filler/<repo>/pr/<number>.md`.
-- Findings index. After each filler job, its top findings (at most five, most severe
-  first) are added to `<report_dir>/filler/INDEX.md`, newest first. Writes take an
-  exclusive lock on `filler/INDEX.lock` and replace the file atomically. The index keeps
-  the newest 2000 findings; older job blocks move to `INDEX-<YYYY-MM>.md` archives, which
-  are only appended to. Deduplication runs against the retained window. Each finding is one
+- Findings index. Each filler job records where its report belongs (`filler_jobs`,
+  schema v6) when it is submitted, so its findings are indexed without the live settings.
+  At finish, its top findings (at most five, most severe first) are added to
+  `<report_dir>/filler/INDEX.md`, newest first. A failed write is recorded on the job
+  (`index_error`) and retried each minute until it succeeds. Writes take an exclusive lock on
+  `filler/INDEX.lock`. The index keeps the newest 2000 findings. Blocks that fall out are
+  appended to `INDEX-<YYYY-MM>.md` first (flushed and fsynced); only then is `INDEX.md`
+  replaced atomically. A block whose job id the archive already holds is not written again,
+  so a crash between the two steps cannot duplicate it. Deduplication runs against the
+  retained window. Each finding is one
   bullet, ``- **high** `file:line` — title``, and a finding whose file:line and title are
   already in the index is skipped.
 - Each job is a single step: the next unreviewed PR first, then the next due pair. The
