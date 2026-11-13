@@ -393,7 +393,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         <div class="kpi head"><div class="label">Total pool, 5 min avg</div><div class="value sm" id="cap-used">—</div><div class="note" id="cap-binding">—</div></div>
         <div class="kpi"><div class="label">DeepSeek uncached, 5 min avg</div><div class="value sm" id="cap-ds-unc">—</div><div class="note" id="cap-ds-unc-note">—</div></div>
         <div class="kpi"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
-        <div class="kpi"><div class="label">In flight / limit</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered; limit is the DeepSeek cap (shadow: the cap it would set)</div></div>
+        <div class="kpi"><div class="label">DeepSeek in flight / limit</div><div class="value sm" id="p-inflight">—</div><div class="note">sent upstream, not yet answered; limit is the DeepSeek cap (shadow: the cap it would set)</div></div>
         <div class="kpi"><div class="label">Morph response p50 / p95</div><div class="value sm" id="p-morph">—</div><div class="note">per request, last 15 min; p95 is the worst minute</div></div>
       </div>
     </section>
@@ -1168,7 +1168,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   function renderPerf(d) {
     var pk = d.perf_kpis || {};
     setText("p-morph", seconds(pk.upstream_response_p50_ms) + " / " + seconds(pk.upstream_response_p95_ms));
-    setTileList("p-inflight", pk.inflight_limit == null ? [pk.in_flight_now] : [pk.in_flight_now, pk.inflight_limit]);
+    if (pk.ds_in_flight_now == null) { $("p-inflight").textContent = "—"; }
+    else { setTileList("p-inflight", pk.inflight_limit == null ? [pk.ds_in_flight_now] : [pk.ds_in_flight_now, pk.inflight_limit]); }
   }
 
   function renderRange(d) {
@@ -2434,6 +2435,7 @@ def perf_kpis(raw: dict[int, dict], until: int, runs: list[dict], now: float, li
         "upstream_response_p95_ms": max(upstream_p95s) if upstream_p95s else None,
         "in_flight_now": in_flight_total(live),
         "inflight_limit": live_inflight_limit(live),
+        "ds_in_flight_now": (live or {}).get("inflight_in_flight"),
         "inflight_mode": (live or {}).get("inflight_mode"),
         "upstream_median_ms": median_or_none(upstream),
         "r429_rate_60m": window_sum(raw, until, RATE_WINDOW_MINUTES, "r429") / req_60m if req_60m else None,

@@ -301,7 +301,10 @@ def cmd_slots(args, ctx: Context) -> int:
 def cmd_inflight_report(args, ctx: Context) -> int:
     from agentq import inflight as inflight_lib
 
-    text, summary = inflight_lib.report(db.db_path(ctx.home), args.hours, now=ctx.now())
+    from agentq import proxy as proxy_lib
+
+    limiter = proxy_lib.InflightLimiter(proxy_lib.load_config(ctx.home)["inflight"], now=0.0)
+    text, summary = inflight_lib.report(db.db_path(ctx.home), args.hours, schedule=limiter.arm_at, now=ctx.now())
     ctx.print(text)
     if not summary:
         return answer(ctx, "no DeepSeek minutes recorded in the window", 1)
