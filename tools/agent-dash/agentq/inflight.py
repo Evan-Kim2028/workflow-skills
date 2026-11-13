@@ -84,6 +84,8 @@ def read_traffic(db_path: Path, since: float, until: float) -> dict[str, dict]:
         return {}
     try:
         present = {row["name"] for row in connection.execute("PRAGMA table_info(proxy_minutes)")}
+        if not present:
+            return {}
         rows = connection.execute(
             TRAFFIC_SQL.format(columns=_select_columns(present)), (minute_stamp(since), minute_stamp(until))
         ).fetchall()

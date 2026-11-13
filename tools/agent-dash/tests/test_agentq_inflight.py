@@ -65,6 +65,16 @@ class ReportAccountingTest(StoreMixin, unittest.TestCase):
         self.assertEqual(shadow["req_per_min"], 2.0)
         self.assertEqual(shadow["billed_per_min"], 20)
 
+    def test_a_fresh_idle_proxy_with_records_but_no_traffic_table_reports_idle_minutes(self) -> None:
+        """A fresh proxy writes inflight_minutes before any traffic creates proxy_minutes."""
+        now = T0 + 10 * 60 + 20
+        path = self.store(records=[record(T0 + k * 60, "shadow") for k in range(10)])
+        _, summary = inflight.report(path, 1, now=now)
+        shadow = summary["shadow"]
+        self.assertEqual(shadow["minutes"], 10)
+        self.assertEqual(shadow["active_minutes"], 0)
+        self.assertEqual(shadow["idle_minutes"], 10)
+
     def test_probe_b_a_legacy_store_with_no_records_reports_nothing(self) -> None:
         """A pre-limiter row with arm null, and no records, must not become a shadow experiment."""
         path = self.store([traffic(T0, req=30, arm=None, limit=None)], records=[])
