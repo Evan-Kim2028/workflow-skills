@@ -1,4 +1,5 @@
 import calendar
+import io
 import re
 import hashlib
 import shutil
@@ -11,7 +12,9 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agentq"))
 
@@ -221,6 +224,42 @@ class SamplerTest(unittest.TestCase):
         after = hashlib.sha256((self.home / "agentq.db").read_bytes()).hexdigest()
         self.assertEqual(before, after)
 
+    def test_queued_jobs_are_split_by_tier_in_the_sample(self) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(
+            "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label) "
+            "VALUES (?, 'queued', 'normal', 'pi-kimi', 'review', NULL, ?, NULL, NULL, 'kimi-wait')",
+            ("k" * 12, NOW - 5),
+        )
+        conn.commit()
+        conn.close()
+        row = dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
+        self.assertEqual((row["queued_jobs"], row["ds_queued"], row["kimi_queued"]), (2, 1, 1))
+        conn = sqlite3.connect(self.home / "dash.db")
+        stored = conn.execute("SELECT queued_jobs, ds_queued, kimi_queued FROM samples").fetchall()
+        conn.close()
+        self.assertEqual(stored, [(2, 1, 1)])
+
+    def test_old_samples_without_the_split_stay_unsplit_and_the_table_is_migrated(self) -> None:
+        dash_db = self.home / "dash.db"
+        conn = sqlite3.connect(dash_db)
+        conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
+                     "queue_workers INT, direct_workers INT, queued_jobs INT)")
+        conn.execute("INSERT INTO samples VALUES (?, 1, 0, 0, 0, 3)", (NOW - 600,))
+        conn.commit()
+        conn.close()
+        old = dash.read_samples(dash_db, NOW - 3600)
+        self.assertIsNone(old[0]["ds_queued"])
+        self.assertEqual(old[0]["queued_unsplit"], 3)
+        dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
+        conn = sqlite3.connect(dash_db)
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(samples)")]
+        conn.close()
+        self.assertIn("ds_queued", columns)
+        new = dash.read_samples(dash_db, NOW - 3600)
+        self.assertEqual([s["queued_unsplit"] for s in new], [3, None])
+        self.assertEqual(new[1]["ds_queued"], 1)
+
     def test_samples_older_than_seven_days_are_pruned(self) -> None:
         dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW - dash.SAMPLE_KEEP_S - 100)
         dash.sample_once(self.home, ps_runner=lambda: PS_FIXTURE, now=NOW)
@@ -286,7 +325,7 @@ class ServerTest(unittest.TestCase):
             "Active runs over time, with caps",
             "Tokens billed per 5 min",
             "Runs",
-            "Top consumers today",
+            "Top consumers, ",
             "Morph 429s",
             "Proxy wait p95",
             "Recent jobs",
@@ -301,8 +340,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(ctype, "application/json")
         data = json.loads(body)
-        self.assertEqual(sorted(data["recent"]), ["ds_uncached_rejections", "minutes", "window"])
-        self.assertEqual(data["recent"]["window"]["end"] - data["recent"]["window"]["start"], 3600)
+        self.assertEqual(sorted(data["source_age_s"]), ["laptop", "live"])
         for key in (
             "live", "limits", "capacity", "minutes", "token_mix", "jobs", "workers", "caps", "runs",
             "run_kpis", "perf_kpis", "top_consumers", "errors", "r429_60m", "window",
@@ -335,13 +373,12 @@ class PlistAndPageTest(unittest.TestCase):
         self.assertIn("visibilitychange", dash.PAGE_HTML)
         self.assertIn("api/summary", dash.PAGE_HTML)
 
-    def test_poll_interval_is_thirty_seconds_in_the_served_html(self) -> None:
-        self.assertIn("var POLL_MS = 30000;", dash.PAGE_HTML)
-        self.assertNotIn("POLL_MS = 15000", dash.PAGE_HTML)
+    def test_poll_interval_follows_the_range_in_the_served_html(self) -> None:
+        self.assertIn("var POLL_MS_BY_HOURS = { 1: 5000, 6: 5000, 24: 15000, 168: 60000 };", dash.PAGE_HTML)
+        self.assertNotIn("POLL_MS = 30000", dash.PAGE_HTML)
 
 
-DAY_START = dash.day_start(NOW)
-RUN_TODAY = max(NOW - 30, DAY_START)
+RUN_LAST_TS = NOW - 30
 
 
 def make_runs_home(tmp: Path, *, proxy_jobs=True) -> Path:
@@ -365,7 +402,7 @@ def make_runs_home(tmp: Path, *, proxy_jobs=True) -> Path:
         conn.executemany(
             "INSERT INTO proxy_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
-                ("a" * 12, "morph-dsv41flash-1017", NOW - 600, RUN_TODAY, 4, 4, 1, 1000, 3000, 500, 800, 4000),
+                ("a" * 12, "morph-dsv41flash-1017", NOW - 600, RUN_LAST_TS, 4, 4, 1, 1000, 3000, 500, 800, 4000),
                 ("b" * 12, "morph-kimik31", NOW - 900, NOW - 100, 10, 10, 2, 5000, 0, 200, 2000, 20000),
                 ("c" * 12, "morph-dsv41flash-1017", NOW - 300, NOW - 200, 1, 1, 0, 100, 0, 50, 10, 200),
                 ("none", "morph-dsv41flash-1017", NOW - 60, NOW - 50, 2, 2, 0, 300, 0, 100, 40, 1000),
@@ -402,7 +439,7 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(run["cache_read_pct"], 0.75)
         self.assertEqual(run["avg_wait_s"], 0.2)
         self.assertEqual(run["avg_upstream_s"], 1.0)
-        self.assertEqual(run["duration_s"], RUN_TODAY - (NOW - 600))
+        self.assertEqual(run["duration_s"], RUN_LAST_TS - (NOW - 600))
 
     def test_direct_launch_keeps_its_job_string_and_active_state(self) -> None:
         run = self.runs["none"]
@@ -431,17 +468,17 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(kpis["cap_deepseek"], 64)
         self.assertEqual(kpis["cap_kimi"], 2)
 
-    def test_runs_seen_today_are_distinct_jobs_with_activity_today(self) -> None:
+    def test_runs_active_in_window_are_distinct_jobs_with_activity_in_range(self) -> None:
         kpis = self.summary["run_kpis"]
-        self.assertEqual(kpis["seen_today"], 4)
-        self.assertEqual(kpis["tokens_today"], 4500 + 5200 + 150 + 400)
+        self.assertEqual(kpis["active_in_window"], 4)
+        self.assertEqual(kpis["active_lifetime_tokens"], 4500 + 5200 + 150 + 400)
         self.assertEqual(kpis["median_tokens_per_run"], (400 + 4500) / 2)
         self.assertEqual(kpis["median_requests_per_run"], 3.0)
 
-    def test_finished_today_counts_queue_verdicts_on_the_local_day(self) -> None:
-        self.assertEqual(self.summary["run_kpis"]["finished_today"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
+    def test_finished_counts_queue_verdicts_in_the_selected_range(self) -> None:
+        self.assertEqual(self.summary["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
 
-    def test_top_consumers_rank_today_runs_with_share_of_today(self) -> None:
+    def test_top_consumers_rank_range_runs_with_share_of_range(self) -> None:
         top = self.summary["top_consumers"]
         self.assertEqual([row["job"] for row in top], ["b" * 12, "a" * 12, "none", "c" * 12])
         self.assertAlmostEqual(top[0]["share"], 5200 / (4500 + 5200 + 150 + 400))
@@ -502,8 +539,8 @@ class MissingRunsTableTest(unittest.TestCase):
             self.assertNotIn("jobs", summary["errors"])
             self.assertEqual(summary["runs"], [])
             self.assertEqual(summary["top_consumers"], [])
-            self.assertEqual(summary["run_kpis"]["seen_today"], 0)
-            self.assertEqual(summary["run_kpis"]["finished_today"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
+            self.assertEqual(summary["run_kpis"]["active_in_window"], 0)
+            self.assertEqual(summary["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 1})
             self.assertIsNone(summary["perf_kpis"]["upstream_median_ms"])
             self.assertEqual(summary["jobs"]["by_state"], {"queued": 1, "running": 1, "done": 3})
             self.assertTrue(summary["minutes"])
@@ -1081,7 +1118,7 @@ class EnforcedLimitsChartTest(unittest.TestCase):
 
 LIMITS_NOW = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
 CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.30, "swap_frac": 0.10}
-HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.90, "swap_frac": 0.10}
+HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.95, "swap_frac": 0.10}
 def live_queued(total=0, output=0, uncached=0, uncached_ds=0) -> dict:
     """A proxy status whose budgets hold the given number of waiting requests each, all in the normal lane."""
     waits = {"total": total, "output": output, "uncached": uncached, "uncached_ds": uncached_ds}
@@ -1392,6 +1429,18 @@ class RoomForWorkersTest(unittest.TestCase):
         self.assertEqual(result["workers"], 0)
         self.assertEqual(result["text"], "No room; adding workers will only queue (bounded by laptop CPU).")
 
+    def test_laptop_room_is_the_light_cpu_bar_less_busy_scaled_per_worker(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=100_000)
+        laptop = dict(CALM, cpu_busy=0.50)
+        result = self.room_for(raw, workers=10, laptop=laptop)
+        self.assertEqual(result["candidates"]["laptop"], round((0.92 - 0.50) * 10 / 0.50, 2))
+
+    def test_laptop_room_ignores_load_and_is_absent_without_a_cpu_reading(self) -> None:
+        raw = five_minutes(total=1_000_000, ds_uncached=100_000)
+        high_load = dict(CALM, load1=60.0, cpu_busy=0.30)
+        self.assertNotIn("laptop", self.room_for(raw, workers=10, laptop=dict(high_load, cpu_busy=None))["candidates"])
+        self.assertEqual(self.room_for(raw, workers=10, laptop=high_load)["candidates"]["laptop"], round((0.92 - 0.30) * 10 / 0.30, 2))
+
     def test_no_active_workers_means_room_is_unknown(self) -> None:
         result = self.room_for(five_minutes(total=1_000_000), workers=None)
         self.assertIsNone(result["workers"])
@@ -1508,17 +1557,20 @@ class RunsAxisTest(unittest.TestCase):
 class SmallChartRowTest(unittest.TestCase):
     SMALL = ("c-kimi", "c-dsu", "c-429", "c-wait")
 
-    def test_small_charts_read_the_last_hour_not_the_selected_range(self) -> None:
+    def test_small_charts_read_the_selected_range_not_a_fixed_hour(self) -> None:
         html = dash.PAGE_HTML
-        self.assertIn("var recent = d.recent", html)
-        self.assertIn("recentMinutes", html)
+        self.assertNotIn("var recent = d.recent", html)
+        self.assertNotIn("recentMinutes", html)
         for chart_id in self.SMALL:
             with self.subTest(chart=chart_id):
                 start = html.index(f'registerChart("{chart_id}"')
                 end = html.index("var upPoints", start) if chart_id == "c-wait" else html.index("registerChart(", start + 1)
                 block = html[start:end]
                 self.assertIn("smallChart(", block)
-                self.assertNotIn("minutes", block.replace("recentMinutes", ""))
+                self.assertIn("var smallChart = function", html)
+                self.assertIn("points: minutes", html)
+                self.assertIn("bucket_s: bucket", html)
+                self.assertIn("x0: win.start", html)
 
     def test_small_charts_share_one_plot_layout_and_three_ticks(self) -> None:
         html = dash.PAGE_HTML
@@ -1531,7 +1583,7 @@ class SmallChartRowTest(unittest.TestCase):
         html = dash.PAGE_HTML
         grid = html[html.index('<section class="grid3">'):html.index('aria-labelledby="h-upstream"')]
         self.assertNotIn('class="legend"', grid)
-        self.assertIn("Morph rejections on this limit, last 60 min: ", html)
+        self.assertIn("Morph rejections on this limit, ", html)
 
 
 class CapacityPairTest(unittest.TestCase):
@@ -1561,7 +1613,7 @@ class CapacityPairTest(unittest.TestCase):
         self.assertLess(html.index('id="c-kimi"'), html.index('id="c-dsu"'))
         self.assertIn('id="dsu-sub"', html)
         self.assertIn("rejections not recorded", html)
-        self.assertIn("Morph rejections on this limit, last 60 min: ", html)
+        self.assertIn("Morph rejections on this limit, ", html)
 
     def test_response_time_chart_sits_below_the_small_charts_and_above_runs(self) -> None:
         html = dash.PAGE_HTML
@@ -1653,3 +1705,339 @@ class FillerHeadlineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fill = dash.read_fill(Path(tmp))
         self.assertEqual(fill, {"enabled": False, "target_billed_per_min": 8_000_000.0, "low_frac": 0.9})
+RANGE_AGES = (30 * 60, 2 * 3600, 10 * 3600, 3 * 24 * 3600)
+
+
+def range_fixture(tmp: Path) -> Path:
+    """Proxy minutes and queue verdicts at four ages, so each range step adds new minutes and new verdicts."""
+    home = tmp / "agentq"
+    home.mkdir()
+    conn = sqlite3.connect(home / "agentq.db")
+    conn.execute(PROXY_MINUTES_DDL)
+    conn.executemany(f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+        (minute_at(age), "morph-dsv41flash-1017", 1, 1, index + 1, 2_000_000 * (index + 1), 0, 0, 0, 100 * (index + 1), 1000 * (index + 1), 0.9)
+        for index, age in enumerate(RANGE_AGES)
+    ])
+    conn.execute(JOB_DDL)
+    jobs = []
+    for index, age in enumerate(RANGE_AGES):
+        for verdict in VERDICTS:
+            jobs.append((f"{index}{verdict}".ljust(12, "x")[:12], "done", "normal", "pi-deepseek-flash", "read", verdict,
+                         NOW - age - 60, NOW - age - 50, NOW - age - 10, verdict.lower()))
+    conn.executemany(
+        "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)", jobs,
+    )
+    conn.commit()
+    conn.close()
+    return home
+
+
+VERDICTS = ("PASS", "PARTIAL", "FAIL")
+
+
+class QueuedSplitChartTest(unittest.TestCase):
+    def test_worker_chart_plots_queued_per_tier_dashed_in_the_tier_hue(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-workers"')
+        block = html[start:html.index("var mix = d.token_mix", start)]
+        self.assertIn('{ key: "dsq", name: "DeepSeek queued", color: COLORS.s1, dash: "4 3" }', block)
+        self.assertIn('{ key: "kimiq", name: "Kimi queued", color: COLORS.s2, dash: "4 3" }', block)
+        self.assertIn('key: "unsplit"', block)
+        self.assertIn("dsq: w.ds_queued", html)
+        self.assertIn('{ key: "ds", name: "DeepSeek runs", color: COLORS.s1 }', block)
+        self.assertIn('{ key: "kimi", name: "Kimi runs", color: COLORS.s2 }', block)
+        self.assertNotIn("Queued jobs", block)
+        self.assertIn("stroke-dasharray", html)
+
+    def test_old_format_store_still_draws_runs_across_the_whole_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            conn = sqlite3.connect(home / "dash.db")
+            conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
+                         "queue_workers INT, direct_workers INT, queued_jobs INT)")
+            conn.executemany("INSERT INTO samples VALUES (?, 3, 1, 0, 0, 2)",
+                             [(NOW - age,) for age in range(3500, 0, -60)])
+            conn.commit()
+            conn.close()
+            workers = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)["workers"]
+        self.assertEqual(len(workers), 59)
+        self.assertTrue(all(w["ds_workers"] == 3 and w["kimi_workers"] == 1 for w in workers))
+        self.assertTrue(all(w["queued_unsplit"] == 2 and w["ds_queued"] is None for w in workers))
+
+    def test_summary_workers_follow_the_selected_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            conn = sqlite3.connect(home / "dash.db")
+            conn.execute(dash.SAMPLES_DDL)
+            conn.executemany(
+                "INSERT INTO samples (ts, ds_workers, kimi_workers, queue_workers, direct_workers, queued_jobs, ds_queued, kimi_queued) "
+                "VALUES (?, 1, 0, 0, 0, 2, 1, 1)",
+                [(NOW - 2 * 3600,), (NOW - 600,)],
+            )
+            conn.commit()
+            conn.close()
+            one = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)["workers"]
+            six = dash.build_summary(home, 6, now=NOW, fetch_live=no_proxy)["workers"]
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(six), 2)
+
+
+class RangeConsistencyTest(unittest.TestCase):
+    """Every field the page labels with the selected range must move when the range moves, and the Now fields must not."""
+
+    RANGE_FIELDS = {
+        "tokens_total": lambda s: s["range_totals"]["tokens"]["total"],
+        "r429": lambda s: s["range_totals"]["r429"],
+        "requests": lambda s: s["range_totals"]["requests"],
+        "finished_pass": lambda s: s["range_totals"]["finished"]["PASS"],
+        "finished_fail": lambda s: s["range_totals"]["finished"]["FAIL"],
+        "finished_partial": lambda s: s["range_totals"]["finished"]["PARTIAL"],
+        "total_pool_range_avg": lambda s: s["limits"]["total"]["range_avg_frac"],
+        "ds_uncached_range_avg": lambda s: s["limits"]["uncached_ds"]["range_avg_frac"],
+        "morph_wait_p95": lambda s: s["perf_kpis"]["wait_p95_ms"],
+        "morph_wait_p50": lambda s: s["perf_kpis"]["wait_p50_ms"],
+        "minute_rows": lambda s: len(s["minutes"]),
+    }
+    NOW_FIELDS = {
+        "tokens_5m": lambda s: s["activity"]["tokens_5m"]["tokens"],
+        "tokens_15m": lambda s: s["activity"]["tokens_15m"]["tokens"],
+        "verdict": lambda s: s["verdict"]["key"],
+        "waiting_now": lambda s: s["capacity"]["waiting_now"],
+    }
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = range_fixture(Path(self.tmp.name))
+        self.summaries = {
+            hours: dash.build_summary(self.home, hours, now=NOW, fetch_live=proxy_status, laptop=CALM)
+            for hours in dash.RANGE_HOURS
+        }
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_every_range_bound_field_changes_with_the_range(self) -> None:
+        for name, field in self.RANGE_FIELDS.items():
+            values = [field(self.summaries[hours]) for hours in dash.RANGE_HOURS]
+            with self.subTest(field=name):
+                self.assertGreater(len(set(map(repr, values))), 1, values)
+                self.assertNotEqual(values[0], values[-1], values)
+
+    def test_now_fields_do_not_follow_the_range(self) -> None:
+        for name, field in self.NOW_FIELDS.items():
+            values = {repr(field(self.summaries[hours])) for hours in dash.RANGE_HOURS}
+            with self.subTest(field=name):
+                self.assertEqual(len(values), 1, values)
+
+    def test_one_hour_range_counts_only_the_last_hour(self) -> None:
+        one = self.summaries[1]
+        self.assertEqual(one["range_totals"]["tokens"]["total"], 2_000_000)
+        self.assertEqual(one["range_totals"]["finished"], {"PASS": 1, "PARTIAL": 1, "FAIL": 1})
+        self.assertEqual(one["bucket_s"], dash.BUCKET_S[1])
+        self.assertEqual(self.summaries[168]["range_totals"]["tokens"]["total"], 2_000_000 * (1 + 2 + 3 + 4))
+        self.assertEqual(self.summaries[168]["range_totals"]["finished"], {verdict: 4 for verdict in VERDICTS})
+
+    def test_range_average_counts_from_the_first_recorded_minute(self) -> None:
+        one = self.summaries[1]
+        self.assertEqual(one["limits"]["total"]["range_avg_frac"], round(2_000_000 / 30 / dash.LIMITS["total"], 4))
+        self.assertEqual(one["limits"]["total"]["avg_5m_frac"], 0.0)
+
+
+class SummaryCacheTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        self.now = 1000.0
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: self.now)
+
+    def tearDown(self) -> None:
+        self.cache.stop()
+        self.tmp.cleanup()
+
+    def counting_build(self):
+        return mock.patch.object(dash, "build_summary", wraps=dash.build_summary)
+
+    def test_first_request_computes_and_later_requests_serve_the_stored_bytes(self) -> None:
+        with self.counting_build() as build:
+            first, generated = self.cache.get(1)
+            second, generated_again = self.cache.get(1)
+        self.assertEqual(build.call_count, 1)
+        self.assertIs(first, second)
+        self.assertEqual(generated, generated_again)
+        self.assertEqual(json.loads(first)["generated_at"], generated)
+        self.assertEqual(json.loads(first)["source_age_s"], {"live": None, "laptop": None})
+
+    def test_worker_recomputes_each_range_on_its_cadence_while_active(self) -> None:
+        with self.counting_build() as build:
+            self.cache.touch()
+            self.cache.tick()
+            self.assertEqual(build.call_count, 4)
+            self.now += 4
+            self.cache.tick()
+            self.assertEqual(build.call_count, 4)
+            self.now += 1
+            self.cache.tick()
+            self.assertEqual(build.call_count, 6)
+            self.now += 10
+            self.cache.touch()
+            self.cache.tick()
+            self.assertEqual(build.call_count, 9)
+
+    def test_worker_is_idle_once_nobody_has_asked_for_IDLE_AFTER_S(self) -> None:
+        with self.counting_build() as build:
+            self.cache.touch()
+            self.cache.tick()
+            before = build.call_count
+            self.now += dash.IDLE_AFTER_S + 1
+            self.cache.tick()
+            self.cache.tick()
+            self.assertEqual(build.call_count, before)
+            self.assertFalse(self.cache.active())
+
+    def test_a_request_after_idle_serves_the_stored_bytes_at_once(self) -> None:
+        with self.counting_build() as build:
+            self.cache.touch()
+            self.cache.tick()
+            self.now += 10 * 3600
+            body, generated = self.cache.get(1)
+        self.assertEqual(build.call_count, 4)
+        self.assertLess(generated, self.now)
+        self.assertIsNotNone(body)
+
+    def test_a_slow_reader_serves_its_last_value_with_its_age(self) -> None:
+        reader = dash.BackgroundReader("probe", lambda: {"ok": True}, lambda: True, clock=lambda: self.now)
+        self.assertIsNone(reader.latest())
+        reader.refresh()
+        self.now += 7
+        self.assertEqual(reader.latest(), {"ok": True})
+        self.assertEqual(reader.age(self.now), 7.0)
+
+
+class ClientGoneTest(unittest.TestCase):
+    def test_hang_ups_are_logged_at_most_once_a_minute(self) -> None:
+        class Server:
+            gone_logged_at = float("-inf")
+
+        server = Server()
+        with mock.patch.object(dash.time, "time", return_value=1000.0), \
+                mock.patch.object(dash.sys, "stderr", new=io.StringIO()) as err:
+            dash.note_client_gone(server)
+            dash.note_client_gone(server)
+        self.assertEqual(err.getvalue().count("client closed the connection early"), 1)
+
+    def test_broken_pipe_during_a_request_does_not_escape_the_handler(self) -> None:
+        handler = dash.Handler.__new__(dash.Handler)
+        handler.server = mock.Mock(gone_logged_at=float("-inf"))
+        with mock.patch.object(dash.BaseHTTPRequestHandler, "handle_one_request", side_effect=BrokenPipeError), \
+                mock.patch.object(dash.sys, "stderr", new=io.StringIO()):
+            handler.handle_one_request()
+        self.assertTrue(handler.close_connection)
+
+
+class LifetimeRunTokensTest(unittest.TestCase):
+    """proxy_jobs keeps lifetime totals per job, so runs in a window are shown with lifetime tokens and labelled so."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(PROXY_JOBS_DDL)
+        conn.executemany(
+            "INSERT INTO proxy_jobs (job, model, first_ts, last_ts, req, ok, r429, input, cache_read, output, wait_ms_total, upstream_ms_total) "
+            "VALUES (?, 'morph-dsv41flash-1017', ?, ?, 10, 10, 0, 700000, 0, 0, 0, 0)",
+            [("1" * 12, NOW - 3 * 24 * 3600, NOW - 1800), ("2" * 12, NOW - 5 * 24 * 3600, NOW - 3 * 24 * 3600)],
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_a_run_active_in_the_hour_shows_its_lifetime_tokens_and_an_old_run_is_absent(self) -> None:
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=no_proxy)
+        jobs = {row["job"]: row for row in summary["top_consumers"]}
+        self.assertIn("1" * 12, jobs)
+        self.assertEqual(jobs["1" * 12]["total_tokens"], 700000)
+        self.assertNotIn("2" * 12, jobs)
+        self.assertEqual(summary["run_kpis"]["active_in_window"], 1)
+        self.assertEqual(summary["run_kpis"]["active_lifetime_tokens"], 700000)
+
+    def test_the_page_labels_top_consumers_as_lifetime_tokens(self) -> None:
+        self.assertIn("Lifetime tokens of the ", dash.PAGE_HTML)
+        self.assertIn("runs active ", dash.PAGE_HTML)
+
+
+class SmallChartRateTest(unittest.TestCase):
+    """Per-minute values must stay per minute at every bucket size: the 429 chart plots a mean, not a sum."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name), minutes=False, jobs=False)
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(PROXY_MINUTES_DDL)
+        conn.executemany(
+            f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(minute_at(60 * k), "morph-dsv41flash-1017", 1, 1, 1, 100, 0, 0, 0, 0, 500, 0.9) for k in range(1, 121)],
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_429_rate_is_one_per_minute_at_24h_and_7d_buckets(self) -> None:
+        for hours, bucket in ((24, 300), (168, 1800)):
+            with self.subTest(hours=hours):
+                summary = dash.build_summary(self.home, hours, now=NOW, fetch_live=no_proxy)
+                self.assertEqual(summary["bucket_s"], bucket)
+                full = [m for m in summary["minutes"] if m["minutes"] == bucket // 60]
+                self.assertTrue(full)
+                self.assertTrue(all(m["r429_per_min"] == 1.0 for m in summary["minutes"]), summary["minutes"][:3])
+                self.assertTrue(all(m["r429"] == m["minutes"] for m in full))
+
+    def test_429_chart_plots_the_per_minute_rate_and_says_so(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index('registerChart("c-429"')
+        block = html[start:html.index("registerChart(", start + 1)]
+        self.assertIn('key: "r429_per_min"', block)
+        self.assertIn("429s per minute", block)
+
+    def test_wait_p95_stays_a_worst_minute_at_7d(self) -> None:
+        summary = dash.build_summary(self.home, 168, now=NOW, fetch_live=no_proxy)
+        self.assertTrue(all(m["wait_p95_ms"] == 500 for m in summary["minutes"] if m["wait_p95_ms"] is not None))
+
+
+class ConcurrentMigrationTest(unittest.TestCase):
+    def test_writers_on_an_old_schema_db_lose_no_samples(self) -> None:
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dash_db = Path(tmp) / "dash.db"
+            conn = sqlite3.connect(dash_db)
+            conn.execute("CREATE TABLE samples (ts REAL PRIMARY KEY, ds_workers INT, kimi_workers INT, "
+                         "queue_workers INT, direct_workers INT, queued_jobs INT)")
+            conn.commit()
+            conn.close()
+            rows = [
+                {"ts": NOW + i, "ds_workers": 1, "kimi_workers": 0, "queue_workers": 0, "direct_workers": 0,
+                 "queued_jobs": 0, "ds_queued": 0, "kimi_queued": 0}
+                for i in range(12)
+            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+                list(pool.map(lambda row: dash.write_sample(dash_db, row), rows))
+            conn = sqlite3.connect(dash_db)
+            count = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(samples)")]
+            conn.close()
+        self.assertEqual(count, 12)
+        self.assertIn("ds_queued", columns)
+        self.assertIn("kimi_queued", columns)
+
+
+class LogPollingTest(unittest.TestCase):
+    def test_refresh_log_stamps_its_fetch_so_the_fifteen_second_throttle_applies(self) -> None:
+        html = dash.PAGE_HTML
+        start = html.index("function refreshLog()")
+        self.assertIn("log.fetchedAt = Date.now();", html[start:start + 200])
+        self.assertIn("if (Date.now() - log.fetchedAt >= LOG_POLL_MS) refreshLog();", html)
