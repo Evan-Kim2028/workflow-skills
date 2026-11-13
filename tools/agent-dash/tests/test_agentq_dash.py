@@ -1803,7 +1803,10 @@ class SmallChartRowTest(unittest.TestCase):
         html = dash.PAGE_HTML
         self.assertIn("var smallLayout = { height: 200, margin: { l: 48, r: 12, t: 26, b: 24 } };", html)
         self.assertIn("xSteps: 2", html)
-        self.assertIn('{ v: 1, label: "limit" }', html)
+        self.assertIn("{ v: 1 }", html)
+        self.assertNotIn('label: "limit"', html)
+        self.assertIn('id="kimi-limit"', html)
+        self.assertIn('id="dsu-limit"', html)
         self.assertIn("var smallPctAxis = { min: 0, max: 2, clip: 2, ticks: [0, 1, 2], fmt: pctFmt };", html)
 
     def test_small_cards_have_no_legend_and_the_rejection_subtitle_is_short(self) -> None:

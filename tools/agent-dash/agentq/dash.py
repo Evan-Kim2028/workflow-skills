@@ -492,12 +492,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   <section class="grid3">
     <div class="card" aria-labelledby="h-kimi">
       <div class="card-head"><h2 id="h-kimi">Kimi uncached (est.)</h2></div>
-      <div class="note-line"><span class="rng">last 6 h</span></div>
+      <div class="note-line"><span class="rng">last 6 h</span> · <span id="kimi-limit">limit: 100% = —</span></div>
       <div class="chart" id="c-kimi"></div>
     </div>
     <div class="card" aria-labelledby="h-dsu">
       <div class="card-head"><h2 id="h-dsu">DeepSeek uncached (est.)</h2></div>
-      <div class="note-line" id="dsu-sub">—</div>
+      <div class="note-line"><span id="dsu-limit">limit: 100% = —</span> · <span id="dsu-sub">—</span></div>
       <div class="chart" id="c-dsu"></div>
     </div>
     <div class="card" aria-labelledby="h-429">
@@ -922,7 +922,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         }, svg).textContent = r.label;
       }
     });
-    var refPlaced = refs.filter(function (r) { return !r.end; }).map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
+    var refPlaced = refs.filter(function (r) { return !r.end && r.label; }).map(function (r) { return { text: r.label, y: Y(r.v) - 5 }; })
       .sort(function (a, b) { return a.y - b.y; });
     refPlaced.forEach(function (r, i) {
       if (i && r.y - refPlaced[i - 1].y < 13) r.y = refPlaced[i - 1].y + 13;
@@ -1416,9 +1416,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       title: "Kimi uncached, estimated percent of 24,290 per minute",
       series: [{ key: "pct_kimi_uncached", name: "Kimi uncached (estimate)", color: COLORS.s3 }],
       y: labelled(smallPctAxis, "% of 24,290 tokens/min"),
-      refs: [{ v: 1, label: "limit" }],
+      refs: [{ v: 1 }],
       fmt: pctFmt
     }));
+    var kimiCap = ((d.limits || {}).uncached || {}).limit;
+    setText("kimi-limit", kimiCap ? "limit: 100% = " + count(kimiCap) + "/min" : "limit: 100% = —");
+    var dsCap = ((d.limits || {}).uncached_ds || {}).limit;
+    setText("dsu-limit", dsCap ? "limit: 100% = " + count(dsCap) + "/min" : "limit: 100% = —");
     var rej = d.ds_uncached_rejections || {};
     setText("dsu-sub", rej.count === null || rej.count === undefined
       ? "rejections not recorded"
@@ -1427,7 +1431,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       title: "DeepSeek uncached input, estimated percent of 400k per minute",
       series: [{ key: "pct_ds_uncached", name: "DeepSeek uncached (estimate)", color: COLORS.s2 }],
       y: labelled(smallPctAxis, "% of 400k tokens/min"),
-      refs: [{ v: 1, label: "limit" }],
+      refs: [{ v: 1 }],
       fmt: pctFmt
     }));
     registerChart("c-429", smallChart("c-429", {

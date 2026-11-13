@@ -124,7 +124,7 @@ def total_status(used_ds, seconds_to_reset, used_other=0, window_mode="calendar"
 
 class MinutePressureTests(unittest.TestCase):
     """The minute gate reads the worst of this minute's partial count, its projection, and the last complete minute, and
-    holds while a DeepSeek burst reserve is below half."""
+    holds while a DeepSeek burst reserve is below its floor (20% by default)."""
 
     def budget(self, used, free=68_600, to_reset=None, reserve=None):
         entry = {"used_60s": used, "free": free, "limit": 70_000, "target_frac": 0.98, "window_mode": "calendar"}
@@ -151,11 +151,23 @@ class MinutePressureTests(unittest.TestCase):
     def test_no_projection_is_used_before_fifteen_seconds_of_the_minute(self):
         self.assertIsNone(F.minute_gate(self.budget(used=30_000, to_reset=50)))
 
-    def test_a_burst_reserve_below_half_holds_filler(self):
-        reason = F.minute_gate(self.budget(used=1_000, reserve={"level": 90_000, "capacity": 210_000}))
+    def test_a_burst_reserve_below_the_floor_holds_filler(self):
+        reason = F.minute_gate(self.budget(used=1_000, reserve={"level": 30_000, "capacity": 210_000}))
         self.assertIsNotNone(reason)
-        self.assertIn("reserve at 90,000 of 210,000", reason)
-        self.assertIsNone(F.minute_gate(self.budget(used=1_000, reserve={"level": 110_000, "capacity": 210_000})))
+        self.assertIn("reserve at 30,000 of 210,000, below 20%", reason)
+        self.assertIsNone(F.minute_gate(self.budget(used=1_000, reserve={"level": 50_000, "capacity": 210_000})))
+
+    def test_the_reserve_floor_is_configurable_and_defaults_to_twenty_percent(self):
+        self.assertEqual(F.DEFAULT_FILL["reserve_floor_frac"], 0.2)
+        status = self.budget(used=1_000, reserve={"level": 90_000, "capacity": 210_000})
+        self.assertIsNone(F.minute_gate(status))
+        half = F.minute_gate(status, reserve_floor_frac=0.5)
+        self.assertIn("below 50%", half)
+        self.assertIn("reserve at 90,000 of 210,000", half)
+        override = F.section({"enabled": True, "reserve_floor_frac": "0.5"}, F.DEFAULT_FILL)
+        self.assertEqual(override["reserve_floor_frac"], 0.5)
+        reason = F.gate_reason(status, 0, None, LAPTOP, override)
+        self.assertIn("below 50%", reason or "")
 
     def test_the_last_complete_minute_comes_from_the_store(self):
         tmp = tempfile.TemporaryDirectory()

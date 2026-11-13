@@ -64,6 +64,7 @@ DEFAULT_FILL = {
     "step_workers": 4,
     "step_interval_s": 120.0,
     "gate_429_window_s": 120.0,
+    "reserve_floor_frac": 0.2,
 }
 DEFAULT_PACING = {
     "enabled": True,
@@ -196,7 +197,6 @@ def inflight_gate(status: dict) -> str | None:
     return None
 
 
-RESERVE_FLOOR_FRAC = 0.5
 MINUTE_GATE_FIELDS = {"output": "output", UNCACHED_BUDGET: "input"}
 
 
@@ -232,10 +232,12 @@ def last_minute_ds(conn, now: float) -> dict[str, int]:
     return {"output": int(row[0] or 0), "input": int(row[1] or 0)}
 
 
-def minute_gate(status: dict | None, last_minute: dict | None = None) -> str | None:
+def minute_gate(status: dict | None, last_minute: dict | None = None,
+                reserve_floor_frac: float = DEFAULT_FILL["reserve_floor_frac"]) -> str | None:
     """Hold filler while a DeepSeek per-minute budget (output or uncached input) is at or past its free allowance, or
-    while its burst reserve is below half its capacity. Usage past the free allowance drains the reserve, which only real
-    work may spend, so filler waits.
+    while its burst reserve is below ``reserve_floor_frac`` of its capacity (``fill.reserve_floor_frac``, 20% by default).
+    The per-minute allowance already keeps filler from draining the reserve, so the floor only needs to hold filler
+    off the reserve while it is nearly empty.
 
     The pressure on each budget is the largest of this minute's partial count, its live projection (from 15 seconds into
     the minute), and the last complete minute's DeepSeek total from the store. The partial count alone reads low early in a
@@ -269,9 +271,9 @@ def minute_gate(status: dict | None, last_minute: dict | None = None) -> str | N
         if isinstance(reserve, dict):
             level, capacity = reserve.get("level"), reserve.get("capacity")
             if isinstance(level, (int, float)) and isinstance(capacity, (int, float)) and capacity > 0 \
-                    and level < RESERVE_FLOOR_FRAC * capacity:
-                return (f"Morph gate: {name} reserve at {level:,.0f} of {capacity:,.0f}, below half; filler stays "
-                        f"off the reserve")
+                    and level < reserve_floor_frac * capacity:
+                return (f"Morph gate: {name} reserve at {level:,.0f} of {capacity:,.0f}, below {reserve_floor_frac:.0%}; "
+                        f"filler stays off the reserve")
     return None
 
 
@@ -290,7 +292,7 @@ def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headr
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
     if recent_429 > 0:
         return f"Morph gate: {recent_429} DeepSeek 429s in the last {int(fill['gate_429_window_s'])} s"
-    minute = minute_gate(status, last_minute)
+    minute = minute_gate(status, last_minute, fill.get("reserve_floor_frac", DEFAULT_FILL["reserve_floor_frac"]))
     if minute is not None:
         return minute
     slow = inflight_gate(status)

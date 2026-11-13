@@ -142,7 +142,7 @@ instead of letting it swing between idle and burst.
   mark, filling starts at once; when it is at or above the high mark, growth stops at once. Inside the
   marks, or with no projection yet, the window average decides. Gates and steps are unchanged.
   The proxy status now reports `used_by_family` for every budget.
-- Minute gate. Filler holds while a DeepSeek per-minute budget (output, or uncached input) is at or past its free allowance. The pressure is the largest of this minute's partial count, its live projection (from 15 seconds into the minute), and the last complete minute's DeepSeek total from the store, so a partial minute that reads low early cannot hide a heavy last minute. Filler also holds while the output or uncached reserve is below half its capacity: filler must never drain the reserve.
+- Minute gate. Filler holds while a DeepSeek per-minute budget (output, or uncached input) is at or past its free allowance. The pressure is the largest of this minute's partial count, its live projection (from 15 seconds into the minute), and the last complete minute's DeepSeek total from the store, so a partial minute that reads low early cannot hide a heavy last minute. Filler also holds while the output or uncached reserve is below `fill.reserve_floor_frac` (0.2, so 20%) of its capacity. The per-minute allowance already keeps filler from draining the reserve; the floor only keeps filler off a nearly empty reserve, so the pool does not sit idle for minutes after a reserve use.
 - Gates, all checked each tick (`gate_reason`). Filler is held, with the reason shown
   in the Limited-by headline and the broker log, when:
   - the proxy status is missing or empty ("proxy status unavailable");
