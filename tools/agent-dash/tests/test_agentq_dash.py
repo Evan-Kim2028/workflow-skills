@@ -30,7 +30,7 @@ JOB_DDL = """
 CREATE TABLE jobs (
     id TEXT PRIMARY KEY, state TEXT NOT NULL, lane TEXT NOT NULL, tier TEXT NOT NULL,
     kind TEXT NOT NULL, verdict TEXT, submitted_at REAL NOT NULL, started_at REAL, finished_at REAL,
-    label TEXT NOT NULL DEFAULT '', detail TEXT, res TEXT NOT NULL DEFAULT ''
+    label TEXT NOT NULL DEFAULT '', detail TEXT, res TEXT NOT NULL DEFAULT '', pid INTEGER
 )
 """
 PROXY_JOBS_DDL = """
@@ -2646,6 +2646,92 @@ class ListenBacklogTest(unittest.TestCase):
             thread.join(5)
         self.assertEqual(errors, [])
         self.assertEqual(statuses, [200] * 16)
+
+
+class UnlaunchedJobsTest(unittest.TestCase):
+    """Jobs that failed before launching never count and never list; they collapse to one line per reason."""
+
+    BAD_LABEL = "launch failed: STATUS: failed out= err= tier=pi-deepseek-flash reason=bad-label; 3 attempts"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        conn = sqlite3.connect(self.home / "agentq.db")
+        rows = [
+            (f"{n:012x}", "failed", "backlog", "pi-deepseek-flash", "write", None, NOW - 900 + n, None, NOW - 890 + n,
+             f"hub-exec-backlog-filler-{n}", self.BAD_LABEL, None)
+            for n in range(3)
+        ]
+        rows.append(("f" * 12, "failed", "backlog", "pi-deepseek-flash", "write", None, NOW - 500, None, NOW - 490,
+                     "hub-exec-backlog-filler-boom", "launch failed: boom", None))
+        rows.append(("e" * 12, "failed", "normal", "pi-deepseek-flash", "read", "FAIL", NOW - 400, NOW - 390, NOW - 380,
+                     "launched-then-failed", "launch failed: spawn exited", 4242))
+        rows.append(("d" * 12, "failed", "normal", "pi-deepseek-flash", "read", "FAIL", NOW - 300, NOW - 290, NOW - 280,
+                     "ran-and-timed-out", "max runtime 2700s exceeded", 77))
+        conn.executemany(
+            "INSERT INTO jobs (id, state, lane, tier, kind, verdict, submitted_at, started_at, finished_at, label, detail, res, pid) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,'light',?)", rows,
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_launch_failures_are_out_of_the_counts_and_the_recent_list(self) -> None:
+        jobs = dash.read_jobs(self.home / "agentq.db")
+        self.assertEqual(jobs["by_state"]["failed"], 2, "only the two that launched count as failed")
+        recent_ids = {row["id"] for row in jobs["recent"]}
+        self.assertFalse({f"{n:012x}" for n in range(3)} & recent_ids)
+        self.assertNotIn("f" * 12, recent_ids)
+        self.assertIn("d" * 12, recent_ids)
+        self.assertIn("e" * 12, recent_ids, "a job that got a pid launched, so it stays listed")
+
+    def test_launch_failures_group_by_reason_with_the_fix_time(self) -> None:
+        unlaunched = dash.read_jobs(self.home / "agentq.db")["unlaunched"]
+        self.assertEqual(unlaunched["total"], 4)
+        by_key = {group["key"]: group for group in unlaunched["groups"]}
+        self.assertEqual(by_key["bad-label"]["count"], 3)
+        self.assertEqual(by_key["bad-label"]["text"], "bad label")
+        self.assertEqual(by_key["bad-label"]["fixed"], ", fixed 12:32 ET")
+        self.assertEqual(by_key["boom"]["count"], 1)
+        self.assertEqual(by_key["boom"]["fixed"], "")
+        self.assertEqual(unlaunched["groups"][0]["key"], "bad-label", "the biggest group first")
+
+    def test_the_expandable_list_names_each_hidden_job(self) -> None:
+        recent = dash.read_jobs(self.home / "agentq.db")["unlaunched"]["recent"]
+        self.assertEqual(len(recent), 4)
+        self.assertEqual({row["reason"] for row in recent}, {"bad label", "boom"})
+
+    def test_finished_counts_leave_launch_failures_out_even_with_a_verdict(self) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute("UPDATE jobs SET verdict = 'FAIL', finished_at = ? WHERE id = ?", (NOW - 100, f"{0:012x}"))
+        conn.commit()
+        conn.close()
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=no_proxy)
+        self.assertEqual(summary["range_totals"]["finished"]["FAIL"], 2, "the two FAILs from jobs that ran; the launch failure is out")
+
+    def test_launch_failures_do_not_appear_in_the_runs_table(self) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute(PROXY_JOBS_DDL)
+        conn.executemany(
+            "INSERT INTO proxy_jobs (job, model, first_ts, last_ts, req, ok, r429, input, cache_read, output, wait_ms_total, upstream_ms_total) "
+            "VALUES (?, 'morph-dsv41flash-1017', ?, ?, 1, 0, 0, 0, 0, 0, 0, 0)",
+            [(f"{0:012x}", NOW - 300, NOW - 290), ("d" * 12, NOW - 300, NOW - 290)],
+        )
+        conn.commit()
+        conn.close()
+        runs = dash.read_run_rows(self.home / "agentq.db", NOW - 3600)
+        self.assertEqual([row["job"] for row in runs], ["d" * 12])
+
+    def test_the_page_collapses_launch_failures_and_names_backlog_jobs_as_filler(self) -> None:
+        html = dash.PAGE_HTML
+        self.assertIn('<div id="runs-unlaunched" class="unlaunched"></div>', html)
+        self.assertIn('<div id="jobs-unlaunched" class="unlaunched"></div>', html)
+        self.assertIn('" failed to launch ("', html)
+        self.assertIn('\\u2014 hidden', html)
+        self.assertIn('lane === "backlog" ? "backlog filler" : lane', html)
+        self.assertIn("cell: function (r) { return laneLabel(r.lane); }", html)
 
 
 class ClientGoneTest(unittest.TestCase):

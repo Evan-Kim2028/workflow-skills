@@ -187,16 +187,29 @@ FROM proxy_minutes
 WHERE minute >= ? AND minute < ?
 GROUP BY minute
 """
-JOBS_COUNT_SQL = "SELECT state, tier, COUNT(*) AS n FROM jobs GROUP BY state, tier"
+UNLAUNCHED = "state = 'failed' AND pid IS NULL AND detail LIKE 'launch failed:%'"
+JOBS_COUNT_SQL = f"SELECT state, tier, COUNT(*) AS n FROM jobs WHERE NOT ({UNLAUNCHED}) GROUP BY state, tier"
+UNLAUNCHED_GROUPS_SQL = f"""
+SELECT detail, lane, tier, COUNT(*) AS n FROM jobs WHERE {UNLAUNCHED}
+GROUP BY detail, lane, tier
+"""
+UNLAUNCHED_RECENT_SQL = f"""
+SELECT id, lane, tier, label, submitted_at, detail FROM jobs WHERE {UNLAUNCHED}
+ORDER BY submitted_at DESC LIMIT ?
+"""
+UNLAUNCHED_LIST = 200
+# A launch failure that a fix has since removed: the reason key, its text, and the moment the fix merged.
+FIXED_LAUNCH_REASONS = {"bad-label": ("bad label", "2026-11-13T17:32:35Z")}
+LANE_LABELS = {"backlog": "backlog filler"}
 QUEUED_DS_DETAIL_SQL = """
 SELECT detail FROM jobs
 WHERE state = 'queued' AND tier = 'pi-deepseek-flash' AND detail IS NOT NULL AND detail != ''
 """
 RUNNING_BY_RES_SQL = "SELECT res, COUNT(*) AS n FROM jobs WHERE state = 'running' GROUP BY res"
 FILLER_RUNNING_SQL = "SELECT COUNT(*) AS n FROM jobs WHERE state = 'running' AND label LIKE '%-backlog-filler-%'"
-JOBS_RECENT_SQL = """
+JOBS_RECENT_SQL = f"""
 SELECT id, state, lane, tier, kind, verdict, label, submitted_at, started_at, finished_at
-FROM jobs ORDER BY submitted_at DESC LIMIT ?
+FROM jobs WHERE NOT ({UNLAUNCHED}) ORDER BY submitted_at DESC LIMIT ?
 """
 SAMPLE_INSERT_SQL = (
     f"INSERT OR REPLACE INTO samples ({', '.join(SAMPLE_COLUMNS)}) VALUES ({', '.join('?' * len(SAMPLE_COLUMNS))})"
@@ -222,13 +235,13 @@ SELECT p.job AS job,
        j.finished_at AS finished_at
 FROM proxy_jobs AS p
 LEFT JOIN jobs AS j ON j.id = p.job
-WHERE p.last_ts >= ?
+WHERE p.last_ts >= ? AND NOT COALESCE(j.state = 'failed' AND j.pid IS NULL AND j.detail LIKE 'launch failed:%', 0)
 GROUP BY p.job
 ORDER BY MAX(p.last_ts) DESC
 """
-VERDICTS_SQL = """
+VERDICTS_SQL = f"""
 SELECT verdict, COUNT(*) AS n FROM jobs
-WHERE finished_at >= ? AND finished_at < ? AND verdict IS NOT NULL
+WHERE finished_at >= ? AND finished_at < ? AND verdict IS NOT NULL AND NOT ({UNLAUNCHED})
 GROUP BY verdict
 """
 PAGE_HTML = r"""<!DOCTYPE html>
@@ -380,6 +393,11 @@ td.num, th.num { text-align: right; }
 td.wrap { white-space: normal; word-break: break-word; min-width: 36ch; }
 td.wrap .cont { color: var(--ink-3); display: block; }
 .ellipsis-inner { display: block; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.unlaunched { margin: 0 0 8px; font-size: 12px; color: var(--ink-2); }
+.unlaunched-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 3px 0; }
+.unlaunched-line button { border: 1px solid var(--ring); border-radius: 6px; padding: 1px 8px; font-size: 11px; background: none; color: var(--ink-2); }
+.unlaunched-list { margin: 4px 0 6px 12px; max-height: 220px; overflow: auto; }
+.unlaunched-list div { color: var(--ink-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 10px; font-size: 12px; color: var(--ink-2); margin-top: 8px; }
 .pager button { border: 1px solid var(--ring); border-radius: 6px; padding: 3px 10px; font-size: 12px; }
 .pager button:disabled { color: var(--ink-3); cursor: default; }
@@ -508,6 +526,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <h2 id="h-runs">Runs</h2>
       <div class="sub" id="runs-count">Newest activity first; click a header to sort</div>
     </div>
+    <div id="runs-unlaunched" class="unlaunched"></div>
     <div class="tbl-tools">
       <div class="filter"><input type="search" data-filter="runs" placeholder="Filter by run, tier or status" aria-label="Filter runs"></div>
     </div>
@@ -543,6 +562,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       <h2 id="h-jobs">Recent jobs</h2>
       <div class="sub" id="jobs-counts"></div>
     </div>
+    <div id="jobs-unlaunched" class="unlaunched"></div>
     <div class="tbl-tools">
       <div class="filter"><input type="search" data-filter="jobs" placeholder="Filter by id, label, state or tier" aria-label="Filter jobs"></div>
     </div>
@@ -1476,7 +1496,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     { label: "Id", text: true, value: function (r) { return r.id; }, cell: function (r) { return r.id; } },
     { label: "Label", text: true, ellipsis: true, value: function (r) { return r.label; }, cell: function (r) { return r.label || "—"; } },
     { label: "State", text: true, value: function (r) { return r.state; }, cell: function (r) { return r.state; } },
-    { label: "Lane", text: true, value: function (r) { return r.lane; }, cell: function (r) { return r.lane; } },
+    { label: "Lane", text: true, value: function (r) { return r.lane; }, cell: function (r) { return laneLabel(r.lane); } },
     { label: "Tier", text: true, value: function (r) { return r.tier; }, cell: function (r) { return r.tier; } },
     { label: "Kind", text: true, value: function (r) { return r.kind; }, cell: function (r) { return r.kind; } },
     { label: "Verdict", text: true, value: function (r) { return r.verdict; }, cell: function (r) { return r.verdict || "—"; } },
@@ -1621,6 +1641,47 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       "Lifetime tokens of the " + count(rk.active_in_window) + " runs active " + RANGE_LABEL[d.hours] + ": " + tokens(rk.active_lifetime_tokens);
   }
 
+  function laneLabel(lane) { return lane === "backlog" ? "backlog filler" : lane; }
+
+  var unlaunchedOpen = {};
+  function renderUnlaunched(d) {
+    var u = (d.jobs || {}).unlaunched || { total: 0, groups: [], recent: [] };
+    ["runs-unlaunched", "jobs-unlaunched"].forEach(function (id) {
+      var host = $(id);
+      host.innerHTML = "";
+      u.groups.forEach(function (g) {
+        var keyId = g.key + "|" + g.lane + "|" + g.tier;
+        var line = document.createElement("div");
+        line.className = "unlaunched-line";
+        var text = document.createElement("span");
+        var noun = g.lane === "backlog" ? "filler jobs" : "jobs";
+        text.textContent = count(g.count) + " " + noun + " failed to launch (" + g.text + g.fixed + ") \u2014 hidden";
+        line.appendChild(text);
+        var button = document.createElement("button");
+        button.type = "button";
+        var open = !!unlaunchedOpen[keyId];
+        button.textContent = open ? "hide list" : "show list";
+        button.addEventListener("click", function () {
+          unlaunchedOpen[keyId] = !unlaunchedOpen[keyId];
+          renderUnlaunched(state.data || d);
+        });
+        line.appendChild(button);
+        host.appendChild(line);
+        if (open) {
+          var list = document.createElement("div");
+          list.className = "unlaunched-list";
+          u.recent.filter(function (row) { return row.reason === g.text && row.lane === g.lane && row.tier === g.tier; })
+            .forEach(function (row) {
+              var item = document.createElement("div");
+              item.textContent = row.id + "  " + (row.label || "—") + "  submitted " + fullTime(row.submitted_at);
+              list.appendChild(item);
+            });
+          host.appendChild(list);
+        }
+      });
+    });
+  }
+
   function renderRuns(d) {
     var runs = d.runs || [];
     var t = tables.runs;
@@ -1721,6 +1782,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     renderRuns(d);
     renderTop(d);
     renderJobs(d);
+    renderUnlaunched(d);
     renderMinuteTable(d);
     renderStatus();
   }
@@ -2140,12 +2202,57 @@ def live_targets(live: dict | None) -> dict[str, float | None]:
     return targets
 
 
+LAUNCH_REASON = re.compile(r"reason=([\w-]+)")
+
+
+def unlaunched_reason(detail: str) -> tuple[str, str]:
+    """(key, text) for a launch failure's detail: the ``reason=`` word when it has one, else the message after the prefix."""
+    match = LAUNCH_REASON.search(detail or "")
+    if match:
+        return match.group(1), match.group(1).replace("-", " ")
+    message = (detail or "").split("launch failed:", 1)[-1].strip()
+    message = re.sub(r"\s+", " ", message)[:80] or "unknown"
+    return message, message
+
+
+def fixed_note(key: str) -> str:
+    """``, fixed 12:32 ET`` when a fix for this reason has merged, else empty."""
+    fixed = FIXED_LAUNCH_REASONS.get(key)
+    if fixed is None:
+        return ""
+    moment = datetime.fromisoformat(fixed[1].replace("Z", "+00:00")).astimezone(ET)
+    return f", fixed {moment.strftime('%H:%M')} ET"
+
+
+def unlaunched_summary(connection) -> dict:
+    """Jobs that failed before launching, grouped by reason, lane and tier, with the most recent ones to expand.
+
+    A launch failure is a failed job with no pid and a ``launch failed:`` detail. It never ran, so it is kept out
+    of every count and table; the page shows one collapsed line per reason instead.
+    """
+    groups: dict[tuple[str, str, str], dict] = {}
+    for row in connection.execute(UNLAUNCHED_GROUPS_SQL).fetchall():
+        key, text = unlaunched_reason(row["detail"])
+        entry = groups.setdefault((key, row["lane"], row["tier"]), {"key": key, "text": text, "lane": row["lane"], "tier": row["tier"], "count": 0})
+        entry["count"] += row["n"]
+    recent = [dict(row) for row in connection.execute(UNLAUNCHED_RECENT_SQL, (UNLAUNCHED_LIST,)).fetchall()]
+    for row in recent:
+        row["reason"] = unlaunched_reason(row["detail"])[1]
+        row["detail"] = (row["detail"] or "")[:160]
+    ordered = sorted(groups.values(), key=lambda entry: -entry["count"])
+    for entry in ordered:
+        entry["fixed"] = fixed_note(entry["key"])
+    return {"total": sum(entry["count"] for entry in ordered), "groups": ordered, "recent": recent}
+
+
 def read_jobs(agentq_db: Path) -> dict:
-    """Job counts by state and by tier, plus the most recent jobs. Read-only."""
+    """Job counts by state and by tier, plus the most recent jobs. Jobs that failed before launching are counted
+    and listed separately (``unlaunched``), never in the counts or the recent list. Read-only."""
     connection = readonly_connection(agentq_db)
     try:
         counts = connection.execute(JOBS_COUNT_SQL).fetchall()
         recent = connection.execute(JOBS_RECENT_SQL, (RECENT_JOBS,)).fetchall()
+        unlaunched = unlaunched_summary(connection)
         ds_holds = [row["detail"] for row in connection.execute(QUEUED_DS_DETAIL_SQL).fetchall()]
         running = {row["res"]: row["n"] for row in connection.execute(RUNNING_BY_RES_SQL).fetchall()}
         filler_running = int(connection.execute(FILLER_RUNNING_SQL).fetchone()["n"])
@@ -2157,7 +2264,7 @@ def read_jobs(agentq_db: Path) -> dict:
         by_state[row["state"]] = by_state.get(row["state"], 0) + row["n"]
         by_tier.setdefault(row["tier"], {})[row["state"]] = row["n"]
     return {
-        "by_state": by_state, "by_tier": by_tier, "recent": [dict(row) for row in recent],
+        "by_state": by_state, "by_tier": by_tier, "recent": [dict(row) for row in recent], "unlaunched": unlaunched,
         "ds_holds": ds_holds, "running_by_res": running, "filler_running": filler_running,
     }
 
