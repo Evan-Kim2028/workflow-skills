@@ -1143,8 +1143,105 @@ class RangeAverageLineTest(unittest.TestCase):
         self.assertIsNone(dash.range_average_pct([], 600))
 
 
+class HourlyAverageTest(unittest.TestCase):
+    """Hourly averages of the chart's minute points: Eastern hours, idle minutes as zero, the hour in progress."""
+
+    def points(self, start: int, minutes: int, value) -> list[dict]:
+        return [{"t": start + 60 * i, "pct_total": value(i)} for i in range(minutes)]
+
+    def test_hours_start_on_the_eastern_clock_hour_across_both_dst_changes(self) -> None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        start = calendar.timegm((2026, 3, 7, 12, 0, 0))
+        until = start + 96 * 3600
+        rows = dash.hourly_averages(self.points(start, 96 * 60, lambda i: 0.5), until)
+        self.assertEqual(len(rows), 96)
+        eastern = ZoneInfo("America/New_York")
+        for row in rows:
+            moment = datetime.fromtimestamp(row["t"], eastern)
+            self.assertEqual((moment.minute, moment.second), (0, 0), row)
+            self.assertEqual(row["label"], moment.strftime("%H") + " ET")
+        spring_day = [row for row in rows if datetime.fromtimestamp(row["t"], eastern).date().isoformat() == "2026-03-08"]
+        labels = [row["label"] for row in spring_day]
+        self.assertEqual(len(spring_day), 23, "the spring-forward day is 23 Eastern hours long")
+        self.assertNotIn("02 ET", labels)
+        self.assertEqual(labels.count("03 ET"), 1)
+
+    def test_fall_back_repeats_the_01_hour_as_two_distinct_rows(self) -> None:
+        start = calendar.timegm((2026, 11, 1, 4, 0, 0))
+        rows = dash.hourly_averages(self.points(start, 180, lambda i: 0.2), start + 3 * 3600)
+        ones = [row for row in rows if row["label"] == "01 ET"]
+        self.assertEqual(len(ones), 2)
+        self.assertNotEqual(ones[0]["t"], ones[1]["t"])
+
+    def test_the_minute_before_midnight_eastern_belongs_to_the_previous_hour(self) -> None:
+        midnight = calendar.timegm((2026, 11, 13, 5, 0, 0))
+        points = [{"t": midnight - 60, "pct_total": 0.9}, {"t": midnight, "pct_total": 0.1}]
+        rows = dash.hourly_averages(points, midnight + 3600)
+        self.assertEqual([row["label"] for row in rows], ["23 ET", "00 ET"])
+        self.assertEqual((rows[0]["minutes"], rows[0]["avg"]), (1, 0.9))
+        self.assertEqual((rows[1]["minutes"], rows[1]["avg"]), (60, round(0.1 / 60, 4)))
+
+    def test_idle_minutes_inside_a_complete_hour_count_as_zero(self) -> None:
+        hour = calendar.timegm((2026, 11, 13, 15, 0, 0))
+        rows = dash.hourly_averages(self.points(hour, 30, lambda i: 0.6), hour + 3660)
+        self.assertEqual(rows[0]["minutes"], 60)
+        self.assertEqual(rows[0]["avg"], 0.3)
+        self.assertFalse(rows[0]["partial"])
+
+    def test_the_hour_in_progress_averages_the_minutes_so_far_and_is_partial(self) -> None:
+        hour = calendar.timegm((2026, 11, 13, 15, 0, 0))
+        rows = dash.hourly_averages(self.points(hour, 10, lambda i: 0.8), hour + 600)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["partial"])
+        self.assertEqual((rows[0]["minutes"], rows[0]["avg"]), (10, 0.8))
+
+    def test_the_first_hour_counts_from_the_first_recorded_minute(self) -> None:
+        hour = calendar.timegm((2026, 11, 13, 15, 0, 0))
+        rows = dash.hourly_averages(self.points(hour + 1800, 30, lambda i: 0.5), hour + 3600)
+        self.assertEqual((rows[0]["minutes"], rows[0]["avg"]), (30, 0.5))
+
+    def test_an_empty_range_has_no_hours(self) -> None:
+        self.assertEqual(dash.hourly_averages([], 1000), [])
+
+    def test_a_one_hour_range_has_at_most_two_hours_and_the_summary_carries_them(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            summary = dash.build_summary(home, 1, now=NOW, fetch_live=no_proxy)
+        rows = summary["hourly_avg_pct_total"]
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertLessEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["partial"], rows[-1]["t"] + 3600 > NOW // 60 * 60)
+        self.assertEqual(set(rows[0]), {"t", "label", "minutes", "avg", "partial"})
+
+
+class HourlyStepPageTest(unittest.TestCase):
+    def test_the_page_builds_vertical_steps_and_keeps_each_minute_with_its_hour(self) -> None:
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        html = dash.PAGE_HTML
+        snippet = html[html.index("  function hourRowFor("):html.index("  function endSeries(")]
+        script = snippet + """
+var rows = [
+  {t: 0, label: "00 ET", avg: 0.2, minutes: 60, partial: false},
+  {t: 3600, label: "01 ET", avg: 0.6, minutes: 10, partial: true}
+];
+var points = [{t: 3540, pct_total: 0.1}, {t: 3600, pct_total: 0.7}, {t: 3660, pct_total: 0.7}];
+console.log(JSON.stringify(withHourly(points, rows, 3720)));
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30, check=True)
+        out = json.loads(result.stdout)
+        self.assertEqual([p["t"] for p in out], [3540, 3600, 3600, 3660])
+        self.assertEqual((out[0]["hourly"], out[0]["hourlyPartial"]), (0.2, None))
+        self.assertEqual((out[1]["hourly"], out[1]["hourlyPartial"]), (0.2, None), "the boundary point holds the old hour")
+        self.assertEqual((out[2]["hourly"], out[2]["hourlyPartial"]), (None, 0.6), "the new hour starts at the boundary")
+        self.assertEqual(out[3]["hourlyPartial"], 0.6)
+        self.assertEqual([p["pct_total"] for p in out], [0.1, 0.7, 0.7, 0.7])
+
+
 class EnforcedLimitsChartTest(unittest.TestCase):
-    def test_main_billed_chart_has_the_per_minute_line_and_a_dotted_range_average(self) -> None:
+    def test_main_billed_chart_has_the_per_minute_line_and_an_hourly_step_average(self) -> None:
         html = dash.PAGE_HTML
         start = html.index('registerChart("c-billed"')
         block = html[start:html.index('registerChart("c-workers"')]
@@ -1152,9 +1249,11 @@ class EnforcedLimitsChartTest(unittest.TestCase):
         self.assertNotIn("pct_total_avg5", html)
         self.assertNotIn("5-min average", html)
         self.assertIn('{ key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 }', block)
-        self.assertIn('color: COLORS.s3, dash: "1 4", width: 2, end: true', block)
-        self.assertIn('"Average, " + RANGE_LABEL[d.hours]', html)
-        self.assertIn('"avg " + RANGE_LABEL[d.hours] + ": "', block)
+        self.assertIn('{ key: "hourly", name: "Hourly average", color: COLORS.s3, width: 2.5 }', block)
+        self.assertIn('{ key: "hourlyPartial", name: "This hour so far", color: COLORS.s3, width: 2.5, dash: "1 4", opacity: 0.75 }', block)
+        self.assertIn('"Hourly average"', html)
+        self.assertIn('text: lastComplete.label + ": " + Math.round(lastComplete.avg * 100) + "%"', block)
+        self.assertNotIn("range_avg_pct_total", block)
         self.assertIn('Morph limit (10M/min)', block)
         self.assertNotIn("pct_ds_uncached", block)
         self.assertNotIn("70k", block)
