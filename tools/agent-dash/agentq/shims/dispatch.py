@@ -200,7 +200,7 @@ def run_gated(kind: str, command, environ, home) -> int:
     capped = False
     shown = shlex.join(command)
     if kind == "pytest":
-        admit = slots.pytest_admission(limits, slots.Gauges(home, ttl_s=limits.gauge_ttl_s))
+        admit = slots.pytest_admission(limits, slots.Gauges(home, settings=limits.gauge_settings))
         if not environ.get(MEMCAPPED_ENV):
             command, capped = memcap_command(command, environ)
     with slots.acquire(kind, limit=slots.kind_limit(limits, kind), home=home, label=run_label(environ),

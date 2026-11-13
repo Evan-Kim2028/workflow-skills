@@ -41,10 +41,11 @@ ROOM_FRAC = 0.95
 POOL_NEAR_CAPACITY_FRAC = 0.85
 MORPH_429_MINUTES = 2
 SLOW_FACTOR = 2.0
-LOAD_PER_CPU_MAX = 1.5
-MEMORY_FREE_MIN = 25.0
+LAPTOP_BAR_DEFAULTS = {
+    "tests_max_cpu_busy": 0.80, "tests_min_free_pct": 35.0, "light_max_cpu_busy": 0.92,
+    "light_min_free_pct": 20.0, "max_swap_frac": 0.90,
+}
 ROOM_CPU_FRAC = 1.2
-GAUGE_MAX_AGE_S = 60.0
 MEMORY_CACHE_S = 15.0
 MEMORY_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 BUDGET_FIELDS = {"total": "total", "output": "ds_output", "uncached": "kimi_uncached", "uncached_ds": "ds_uncached"}
@@ -72,8 +73,9 @@ VERDICT_CHIPS = {
     "held_other": "Held",
 }
 HOLD_DETAIL = re.compile(r"^hold ([^:]+): (.*)$", re.DOTALL)
-LOAD_HOLD = re.compile(r"load ([\d.]+) per cpu >= ([\d.]+)")
+CPU_HOLD = re.compile(r"cpu (\d+)% busy >= (\d+)%")
 MEMORY_HOLD = re.compile(r"memory free (\d+)% < (\d+)%")
+SWAP_HOLD = re.compile(r"swap (\d+)% used >= (\d+)%")
 HOLD_GROUP_ORDER = ("laptop", "ssh", "proxy", "workspace", "other")
 HOLD_GROUP_KEYS = {group: f"held_{group}" for group in HOLD_GROUP_ORDER}
 RATE_WINDOW_MINUTES = 60
@@ -2622,21 +2624,77 @@ def memory_free_pressure(now: float, run=subprocess.run) -> float | None:
 _MEMORY_CACHE: dict = {}
 
 
+def laptop_bars(home: Path) -> dict:
+    """The bars the broker holds tests and light jobs at, from broker.json's ``laptop`` section over LAPTOP_BAR_DEFAULTS.
+
+    The dashboard reads the file itself (it runs as a script, not as the agentq package), so
+    LAPTOP_BAR_DEFAULTS mirrors the broker's defaults and a test keeps the two equal.
+    """
+    try:
+        data = json.loads((Path(home) / "broker.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    section = data.get("laptop") if isinstance(data, dict) and isinstance(data.get("laptop"), dict) else {}
+    bars = {}
+    for name, default in LAPTOP_BAR_DEFAULTS.items():
+        try:
+            bars[name] = float(section.get(name, default))
+        except (TypeError, ValueError):
+            bars[name] = default
+    return bars
+
+
+def laptop_holds(details: list[str]) -> list[tuple[str, str]]:
+    """The (gate, reason) pairs of queued DeepSeek jobs the broker holds on laptop headroom."""
+    held = []
+    for detail in details:
+        if detail:
+            gate, reason = split_hold(detail)
+            if hold_group(gate, reason) == "laptop":
+                held.append((gate, reason))
+    return held
+
+
+def laptop_pressure(laptop: dict, bars: dict) -> str | None:
+    """The first light-job bar the laptop is past now (CPU busy, memory free, swap used), as text, or None.
+
+    This is context for the secondary line only. The Laptop verdict needs a broker hold, because the
+    broker's own admission decides whether DeepSeek work waits.
+    """
+    busy, free, swap = laptop.get("cpu_busy"), laptop.get("memory_free_pct"), laptop.get("swap_frac")
+    if busy is not None and busy >= bars["light_max_cpu_busy"]:
+        return f"CPU {busy * 100:.0f}% busy against the {bars['light_max_cpu_busy'] * 100:.0f}% light bar"
+    if free is not None and free < bars["light_min_free_pct"]:
+        return f"{free:.0f}% memory free against the {bars['light_min_free_pct']:.0f}% light floor"
+    if swap is not None and swap >= bars["max_swap_frac"]:
+        return f"swap {swap * 100:.0f}% used against the {bars['max_swap_frac'] * 100:.0f}% bar"
+    return None
+
+
 def laptop_reading(home: Path, now: float, memory=memory_free_pressure) -> dict:
-    """Laptop load and free memory. Memory comes from the broker's gauge file when it is fresh, else from memory_pressure."""
+    """Laptop CPU busy, swap used and free memory, from the broker's gauge file while fresh.
+
+    Memory falls back to memory_pressure when the file is stale. Load per CPU is reported with the
+    reading but never judged: the verdict uses CPU busy, memory and swap, as the broker does.
+    """
     try:
         load1 = os.getloadavg()[0]
     except OSError:
         load1 = None
     cpus = os.cpu_count() or 1
-    free = None
     try:
         gauge = json.loads((Path(home) / "slots" / "gauge.json").read_text(encoding="utf-8"))
-        at, value = gauge.get("at"), gauge.get("free")
-        if isinstance(at, (int, float)) and isinstance(value, (int, float)) and 0 <= now - at <= GAUGE_MAX_AGE_S:
-            free = float(value)
     except (OSError, ValueError, AttributeError):
-        pass
+        gauge = {}
+    gauge = gauge if isinstance(gauge, dict) else {}
+
+    def live(value_key: str, until_key: str) -> float | None:
+        value, until = gauge.get(value_key), gauge.get(until_key)
+        if isinstance(value, (int, float)) and isinstance(until, (int, float)) and now < until:
+            return float(value)
+        return None
+
+    free = live("free", "free_until")
     if free is None:
         free = memory(now)
     return {
@@ -2644,6 +2702,9 @@ def laptop_reading(home: Path, now: float, memory=memory_free_pressure) -> dict:
         "cpus": cpus,
         "load_per_cpu": load1 / cpus if load1 is not None else None,
         "memory_free_pct": free,
+        "cpu_busy": live("cpu_busy", "cpu_until"),
+        "swap_frac": live("swap", "swap_until"),
+        "bars": laptop_bars(home),
     }
 
 
@@ -2701,22 +2762,26 @@ def hold_group(gate: str, reason: str) -> str:
         return "workspace"
     if gate == "ssh":
         return "ssh"
-    if gate in ("tests", "light") and (LOAD_HOLD.search(reason) or MEMORY_HOLD.search(reason)):
+    if gate in ("tests", "light") and any(rx.search(reason) for rx in (CPU_HOLD, MEMORY_HOLD, SWAP_HOLD)):
         return "laptop"
     return "other"
 
 
 def laptop_phrases(rows: list[tuple[str, str]]) -> list[str]:
-    """One phrase per gate and limit kind, quoting the worst reading: the highest load or the lowest free memory.
+    """One phrase per gate and limit kind, quoting the worst reading: the highest CPU busy or swap used,
+    or the lowest free memory.
 
     The broker refreshes each held job's reason on its own tick, so the numbers differ a little across jobs.
     """
     buckets: dict[tuple[str, str], list] = {}
     for gate, reason in rows:
-        load, memory = LOAD_HOLD.search(reason), MEMORY_HOLD.search(reason)
-        if load:
-            kind, rank = "load", float(load.group(1))
-            text = f"load {rank:.2f} per CPU, limit {float(load.group(2)):.1f}"
+        cpu, memory, swap = CPU_HOLD.search(reason), MEMORY_HOLD.search(reason), SWAP_HOLD.search(reason)
+        if cpu:
+            kind, rank = "cpu", float(cpu.group(1))
+            text = f"CPU {rank:.0f}% busy, limit {float(cpu.group(2)):.0f}%"
+        elif swap:
+            kind, rank = "swap", float(swap.group(1))
+            text = f"swap {rank:.0f}% used, limit {float(swap.group(2)):.0f}%"
         else:
             kind, rank = "memory", -float(memory.group(1))
             text = f"memory {-rank:.0f}% free, floor {memory.group(2)}%"
@@ -2829,7 +2894,9 @@ def verdict(
     fill: dict | None = None,
 ) -> dict:
     """What limits the DeepSeek pool, from the last 5 complete minutes. The first matching rule wins:
-    Morph limit, Morph slow, Laptop, Near capacity, Proxy pacing, Launching, Headroom.
+    Morph limit, Morph slow, Near capacity, Proxy pacing, Launching (which names a laptop hold as the Laptop
+    chip when the broker holds ready DeepSeek jobs on laptop headroom), Headroom. Laptop pressure that the
+    broker is not holding on goes to the secondary line, never to the headline.
 
     Launching names the broker's hold reason when ready DeepSeek jobs carry one (``ds_holds``, the queued
     jobs' detail strings), and says the broker is starting them otherwise.
@@ -2858,12 +2925,10 @@ def verdict(
         if by_average or by_429:
             hits.append((name, average, peak, minutes_429, by_average))
     pool = window_sum(raw, until, LIMIT_WINDOW_MINUTES, "total") / LIMIT_WINDOW_MINUTES / limits["total"]
-    load = laptop.get("load_per_cpu")
-    free = laptop.get("memory_free_pct")
-    laptop_hot = (load is not None and load > LOAD_PER_CPU_MAX) or (free is not None and free < MEMORY_FREE_MIN)
-    secondary = None
+    bars = laptop.get("bars") or LAPTOP_BAR_DEFAULTS
+    secondary_parts = []
     if kimi_waiting:
-        secondary = (
+        secondary_parts.append(
             f"Kimi reviews waiting: {kimi_jobs_waiting} "
             f"(Kimi's own {limits['uncached']:,}/min uncached limit)."
         )
@@ -2883,12 +2948,6 @@ def verdict(
             f"{ds_p50_5m_ms / ds_p50_base_ms:.1f}x its 6-hour median of {ds_p50_base_ms / 1000:.1f} s, "
             "with nothing queued at the proxy."
         )
-    elif laptop_hot:
-        key = "laptop"
-        cpus = laptop.get("cpus")
-        load_text = f"load {laptop['load1']:.1f} on {cpus} CPUs ({load:.2f} per CPU)" if load is not None else "load unknown"
-        mem_text = f"{free:.0f}% memory free" if free is not None else "memory unknown"
-        text = f"The laptop is the bottleneck: {load_text}, {mem_text}."
     elif pool >= POOL_NEAR_CAPACITY_FRAC:
         key = "near_capacity"
         text = f"Near capacity: pool at {pool * 100:.0f}% of Morph's {limits['total'] // 1_000_000}M/min limit."
@@ -2910,6 +2969,10 @@ def verdict(
     else:
         key = "headroom"
         text = f"Headroom: pool at {pool * 100:.0f}% of Morph's limit; room for more work."
+    pressure = laptop_pressure(laptop, bars)
+    if pressure and key != "held_laptop":
+        secondary_parts.append(f"Laptop pressure, not holding DeepSeek jobs: {pressure}.")
+    secondary = " ".join(secondary_parts) or None
     return {"key": key, "chip": VERDICT_CHIPS[key], "text": text, "secondary": secondary}
 
 

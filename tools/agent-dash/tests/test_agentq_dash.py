@@ -1080,8 +1080,8 @@ class EnforcedLimitsChartTest(unittest.TestCase):
 
 
 LIMITS_NOW = {"total": 10_000_000, "output": 70_000, "uncached": 24_290, "uncached_ds": 400_000}
-CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0}
-HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 40.0}
+CALM = {"load1": 2.0, "cpus": 15, "load_per_cpu": 2.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.30, "swap_frac": 0.10}
+HOT = {"load1": 44.0, "cpus": 15, "load_per_cpu": 44.0 / 15, "memory_free_pct": 60.0, "cpu_busy": 0.90, "swap_frac": 0.10}
 def live_queued(total=0, output=0, uncached=0, uncached_ds=0) -> dict:
     """A proxy status whose budgets hold the given number of waiting requests each, all in the normal lane."""
     waits = {"total": total, "output": output, "uncached": uncached, "uncached_ds": uncached_ds}
@@ -1180,14 +1180,71 @@ class LimitedByTest(unittest.TestCase):
                              ds_p50_5m_ms=12_000, ds_p50_base_ms=5_000)
         self.assertEqual(result["key"], "morph_slow")
 
-    def test_laptop_when_load_per_cpu_is_over_1_5(self) -> None:
-        result = verdict_for(five_minutes(total=1_000_000), laptop=HOT)
-        self.assertEqual(result["key"], "laptop")
-        self.assertIn("load 44.0 on 15 CPUs", result["text"])
+    def test_laptop_pressure_without_a_broker_hold_is_context_not_the_headline(self) -> None:
+        busy = dict(CALM, cpu_busy=0.95)
+        result = verdict_for(five_minutes(total=1_000_000), laptop=busy)
+        self.assertEqual(result["key"], "headroom")
+        self.assertEqual(
+            result["secondary"],
+            "Laptop pressure, not holding DeepSeek jobs: CPU 95% busy against the 92% light bar.",
+        )
 
-    def test_laptop_when_memory_free_is_under_25_percent(self) -> None:
-        low_memory = dict(CALM, memory_free_pct=20.0)
-        self.assertEqual(verdict_for(five_minutes(total=1_000_000), laptop=low_memory)["key"], "laptop")
+    def test_the_laptop_verdict_needs_a_broker_hold_on_a_ready_deepseek_job(self) -> None:
+        result = dash.verdict(
+            five_minutes(total=1_000_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=CALM, ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold light: cpu 95% busy >= 92%"],
+        )
+        self.assertEqual(result["key"], "held_laptop")
+        self.assertEqual(result["chip"], "Laptop")
+        self.assertEqual(
+            result["text"],
+            "1 DeepSeek jobs held for laptop headroom: 1 light job (CPU 95% busy, limit 92%).",
+        )
+
+    def test_a_ready_job_held_on_a_proxy_budget_is_not_a_laptop_verdict_even_under_pressure(self) -> None:
+        result = dash.verdict(
+            five_minutes(total=1_000_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
+            laptop=dict(CALM, cpu_busy=0.99), ds_jobs_ready=1, ds_p50_5m_ms=None, ds_p50_base_ms=None,
+            ds_holds=["hold pi-deepseek-flash: proxy total waiting 9 > 8"],
+        )
+        self.assertNotEqual(result["key"], "held_laptop")
+        self.assertIn("CPU 99% busy", result["secondary"])
+
+    def test_memory_and_swap_pressure_are_context_against_the_light_bars(self) -> None:
+        low_memory = verdict_for(five_minutes(total=1_000_000), laptop=dict(CALM, memory_free_pct=15.0))
+        self.assertIn("15% memory free against the 20% light floor", low_memory["secondary"])
+        swapping = verdict_for(five_minutes(total=1_000_000), laptop=dict(CALM, swap_frac=0.90))
+        self.assertIn("swap 90% used against the 90% bar", swapping["secondary"])
+        self.assertNotEqual(swapping["key"], "laptop")
+
+    def test_laptop_bars_default_to_the_brokers_and_read_broker_json(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sys.path.insert(0, str(root))
+        from agentq import broker
+        for name, default in dash.LAPTOP_BAR_DEFAULTS.items():
+            self.assertEqual(broker.DEFAULT_LAPTOP[name], default, name)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "broker.json").write_text(json.dumps({"laptop": {"tests_max_cpu_busy": 0.7}}), encoding="utf-8")
+            bars = dash.laptop_bars(home)
+            self.assertEqual(bars["tests_max_cpu_busy"], 0.7)
+            self.assertEqual(bars["max_swap_frac"], 0.90)
+
+    def test_laptop_reading_takes_fresh_gauge_state_and_drops_stale_measures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "slots").mkdir()
+            state = {"free": 44.0, "free_until": NOW + 10, "cpu_busy": 0.66, "cpu_until": NOW + 25,
+                     "swap": 0.2, "swap_until": NOW - 1}
+            (home / "slots" / "gauge.json").write_text(json.dumps(state), encoding="utf-8")
+            reading = dash.laptop_reading(home, NOW, memory=lambda now: 99.0)
+            self.assertEqual(reading["memory_free_pct"], 44.0)
+            self.assertEqual(reading["cpu_busy"], 0.66)
+            self.assertIsNone(reading["swap_frac"])
+            state["free_until"] = NOW - 1
+            (home / "slots" / "gauge.json").write_text(json.dumps(state), encoding="utf-8")
+            self.assertEqual(dash.laptop_reading(home, NOW, memory=lambda now: 99.0)["memory_free_pct"], 99.0)
 
     def test_near_capacity_when_the_pool_averages_85_percent(self) -> None:
         result = verdict_for(five_minutes(total=8_500_000))
@@ -1231,7 +1288,7 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["text"], "Launching: 2 DeepSeek jobs are ready; the broker is starting them.")
 
     def test_held_jobs_on_the_laptop_gate_and_ssh_slots_name_the_laptop_chip(self) -> None:
-        details = ["hold tests: load 1.40 per cpu >= 1"] * 4 + ["hold ssh: slots full"] * 2
+        details = ["hold tests: cpu 90% busy >= 80%"] * 4 + ["hold ssh: slots full"] * 2
         result = dash.verdict(
             five_minutes(total=4_100_000), UNTIL, LIMITS_NOW, IDLE_LIVE, kimi_jobs_waiting=0, budget_429s={},
             laptop=CALM, ds_jobs_ready=6, ds_p50_5m_ms=None, ds_p50_base_ms=None,
@@ -1241,7 +1298,7 @@ class LimitedByTest(unittest.TestCase):
         self.assertEqual(result["chip"], "Laptop")
         self.assertEqual(
             result["text"],
-            "6 DeepSeek jobs held for laptop headroom: 4 test jobs (load 1.40 per CPU, limit 1.0); "
+            "6 DeepSeek jobs held for laptop headroom: 4 test jobs (CPU 90% busy, limit 80%); "
             "2 jobs waiting for a production ssh slot (8 in use).",
         )
 

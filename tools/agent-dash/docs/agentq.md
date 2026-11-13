@@ -120,8 +120,8 @@ instead of letting it swing between idle and burst.
   proxy's status is missing or empty. Filler waits while real DeepSeek work is ready,
   while the proxy holds
   a DeepSeek request, after a DeepSeek 429 in the last `gate_429_window_s` (120), and
-  while the laptop is short of memory (`laptop_min_free_pct`, 20) or load
-  (`laptop_max_load_per_cpu`, 1.0).
+  while the laptop is past the filler bars in `laptop`: CPU busy at or above `fill_max_cpu_busy`
+  (0.75), memory free under `fill_min_free_pct` (20), or swap used at or above `fill_max_swap_frac` (0.85).
 - Filler jobs are read-only audits (kind `read`, resource `light`, lane `backlog`).
   The targets come from the `"filler"` key of `$AGENTQ_HOME/backlog-seed.json`:
   `report_dir`, an optional `max_runtime` (default `15m`), and `repos`, each with a
@@ -170,12 +170,25 @@ instead of letting it swing between idle and burst.
     `uncached`. A backlog job also waits until those budgets queue nothing. Urgent
     jobs ignore this gate. If the proxy is down, no Morph gate applies.
   - Laptop: a `tests` job always launches while fewer than `tests_floor` (default 4)
-    tests jobs run. Above the floor it waits while memory free is under
-    `tests_min_free_pct` (default 35), or while 1-minute load per CPU is at or above
-    `tests_max_load_per_cpu` (default 1.0). A `light` job waits only while memory free
-    is under `light_min_free_pct` (default 20). Memory comes from `memory_pressure`
-    and is read at most every `gauge_ttl_s` (default 15) seconds. An unreadable gauge
-    means no extra gate. `ssh` keeps its fixed cap, since it protects prod hosts.
+    tests jobs run. Above the floor it waits while CPU busy (smoothed, see below) is at or
+    above `laptop.tests_max_cpu_busy` (0.80), memory free is under `laptop.tests_min_free_pct`
+    (35), or swap used is at or above `laptop.max_swap_frac` (0.90). A `light` job waits on the
+    same three measures at `laptop.light_max_cpu_busy` (0.92) and `laptop.light_min_free_pct` (20).
+    Load average holds nothing: short git, rg and python processes inflate it while the CPU is
+    idle. An unreadable measure never holds. `ssh` keeps its fixed cap, since it protects prod hosts.
+  - Laptop sampling (`headroom.py`): CPU busy comes from cumulative tick counters (macOS
+    `host_processor_info`, Linux `/proc/stat`) and is smoothed by an exponential moving average
+    with time constant `laptop.ewma_s` (60), sampled every `laptop.sample_s` (10) seconds. Swap
+    comes from `/usr/sbin/sysctl vm.swapusage` (or `/proc/meminfo`) at the same cadence. Memory
+    comes from `memory_pressure` (or `MemAvailable`) and is read at most every
+    `adaptive.gauge_ttl_s` (15) seconds. The state is shared through `slots/gauge.json`. A reader
+    samples only while it holds the exclusive lock `slots/gauge.lock`; a reader that finds the lock
+    busy returns the saved state without sampling. Each measure expires 3 `sample_s` after its last
+    valid sample, so a failed CPU read never keeps an old high reading alive, and an expired measure
+    never holds work. Each hold reason in `jobs.detail` names its measure, for example
+    `hold tests: cpu 84% busy >= 80%`. The dashboard's Laptop verdict appears only when the broker
+    holds a ready DeepSeek job on one of these bars; raw pressure without a hold is shown in the
+    secondary line.
   - The `tests` ceiling is `slots.tests`. Recommended: 16 (the owner's setting is 10).
   - `"adaptive": {"enabled": false}` restores the fixed caps exactly, including the
     old rule that a `saturated` proxy holds backlog jobs.
@@ -292,9 +305,9 @@ Without that file, ssh is not gated, so the launch step matters.
   The ceiling is `slots.tests` when `broker.json` sets it, else 16. The broker's own
   `tests` cap of 6 governs broker jobs and is not reused. A new run starts at once
   while fewer than `adaptive.tests_floor` (4) are busy. Above that it also needs memory
-  free of at least `tests_min_free_pct` (35) and load per CPU under `tests_max_load_per_cpu`
-  (1.0), read through `memory_pressure` at most every `gauge_ttl_s` (15) seconds and cached
-  in `slots/gauge.json`. An unreadable gauge adds no gate, as in the broker.
+  free of at least `laptop.tests_min_free_pct` (35), CPU busy under `laptop.tests_max_cpu_busy`
+  (0.80) and swap used under `laptop.max_swap_frac` (0.90). The readings are the same ones the
+  broker uses (see Laptop above). An unreadable measure adds no gate, as in the broker.
 - **Slots** are `$AGENTQ_HOME/slots/<kind>/slot-N` files. A holder takes
   `flock(LOCK_EX | LOCK_NB)` and keeps it while its child runs, so a crashed holder frees
   its slot. The holder's pid, label and command are written into the slot. Waiters back

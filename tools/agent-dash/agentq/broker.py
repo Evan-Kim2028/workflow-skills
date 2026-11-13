@@ -60,6 +60,7 @@ from agentq import backlog as backlog_lib
 from agentq import db
 from agentq import fill as fill_lib
 from agentq import filler as filler_lib
+from agentq import headroom as headroom_lib
 
 TICK_S = 2.0
 BACKLOG_RETRY_S = 300.0
@@ -77,11 +78,20 @@ DEFAULT_TIERS = {"pi-kimi": 2, "pi-deepseek-flash": 48}
 DEFAULT_ADAPTIVE = {
     "enabled": True,
     "max_waiting_requests": 8,
-    "tests_min_free_pct": 35,
-    "tests_max_load_per_cpu": 1.0,
     "tests_floor": 4,
-    "light_min_free_pct": 20,
     "gauge_ttl_s": 15.0,
+}
+DEFAULT_LAPTOP = {
+    "tests_max_cpu_busy": 0.80,
+    "tests_min_free_pct": 35.0,
+    "light_max_cpu_busy": 0.92,
+    "light_min_free_pct": 20.0,
+    "max_swap_frac": 0.90,
+    "fill_max_cpu_busy": 0.75,
+    "fill_min_free_pct": 20.0,
+    "fill_max_swap_frac": 0.85,
+    "sample_s": 10.0,
+    "ewma_s": 60.0,
 }
 TIER_BUDGETS = {"pi-deepseek-flash": ("total", "output", "uncached_ds"), "pi-kimi": ("total", "uncached")}
 TIER_FAMILY = {"pi-deepseek-flash": "morph-dsv41flash", "pi-kimi": "morph-kimik31"}
@@ -92,7 +102,7 @@ GIT_TIMEOUT_S = 60.0
 LAUNCH_TIMEOUT_S = 120.0
 MAX_CONCURRENT_LAUNCHES = 8
 LAPTOP_GATED = ("tests", "light")
-MEMORY_FREE_LINE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
+memory_free_pct = headroom_lib.memory_free_pct
 VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
@@ -139,6 +149,7 @@ def load_config(home) -> dict:
         "slots": _caps(DEFAULT_SLOTS, data.get("slots")),
         "tiers": _caps(DEFAULT_TIERS, data.get("tiers")),
         "adaptive": _adaptive(data.get("adaptive")),
+        "laptop": _laptop(data.get("laptop")),
         "auto_worktree": _auto_worktree(data.get("auto_worktree")),
         "fill": fill_lib.section(data.get("fill"), fill_lib.DEFAULT_FILL),
         "pacing": fill_lib.section(data.get("pacing"), fill_lib.DEFAULT_PACING),
@@ -165,6 +176,20 @@ def _adaptive(override) -> dict:
                 continue
             if name == "enabled":
                 settings[name] = bool(value)
+                continue
+            try:
+                settings[name] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return settings
+
+
+def _laptop(override) -> dict:
+    """Laptop headroom bars and sampling cadence. Only the known keys are read; bad values keep the default."""
+    settings = dict(DEFAULT_LAPTOP)
+    if isinstance(override, dict):
+        for name, value in override.items():
+            if name not in DEFAULT_LAPTOP:
                 continue
             try:
                 settings[name] = float(value)
@@ -236,63 +261,26 @@ def morph_hold(tier: str, lane: str, status: dict | None, max_waiting: float) ->
     return None
 
 
-def laptop_hold(res: str, gauges: tuple, running_tests: int, adaptive: dict) -> tuple[str, str] | None:
+def laptop_hold(res: str, reading: headroom_lib.Headroom, running_tests: int, laptop: dict,
+                tests_floor: int) -> tuple[str, str] | None:
     """Why a ``tests`` or ``light`` job must wait for laptop headroom, or None.
 
-    Returns (key, text). ``gauges`` is (memory free percent, load per CPU), either may be None
-    when unreadable. An unreadable gauge means no extra gate: the fixed slot caps apply, as with
-    the proxy. ``tests`` jobs below ``tests_floor`` always launch. ``light`` waits only on memory.
+    Returns (key, text). ``tests`` jobs below ``tests_floor`` always launch; from the floor up they
+    wait on CPU busy, memory free or swap used. ``light`` jobs wait on the same three measures at
+    their own bars, with no floor. An unreadable measure never holds, so the fixed slot caps apply
+    alone when every gauge is unreadable.
     """
-    free, load = gauges
     if res == "tests":
-        if running_tests < adaptive["tests_floor"] or free is None or load is None:
+        if running_tests < tests_floor:
             return None
-        min_free = adaptive["tests_min_free_pct"]
-        if free < min_free:
-            return f"memory free < {min_free:.0f}%", f"memory free {free:.0f}% < {min_free:.0f}%"
-        max_load = adaptive["tests_max_load_per_cpu"]
-        if load >= max_load:
-            return f"load per cpu >= {max_load:g}", f"load {load:.2f} per cpu >= {max_load:g}"
+        bars = dict(max_cpu_busy=laptop["tests_max_cpu_busy"], min_free_pct=laptop["tests_min_free_pct"],
+                    max_swap_frac=laptop["max_swap_frac"])
+    elif res == "light":
+        bars = dict(max_cpu_busy=laptop["light_max_cpu_busy"], min_free_pct=laptop["light_min_free_pct"],
+                    max_swap_frac=laptop["max_swap_frac"])
+    else:
         return None
-    if res == "light" and free is not None and free < adaptive["light_min_free_pct"]:
-        floor = adaptive["light_min_free_pct"]
-        return f"memory free < {floor:.0f}%", f"memory free {free:.0f}% < {floor:.0f}%"
-    return None
-
-
-def memory_free_pct(run=subprocess.run) -> float | None:
-    """Free system memory percent from macOS ``memory_pressure``, or None when unavailable."""
-    try:
-        out = run(["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = MEMORY_FREE_LINE.search(out or "")
-    return float(match.group(1)) if match else None
-
-
-class Gauges:
-    """Laptop headroom readings. Memory is a subprocess, so it is cached for ``gauge_ttl_s``."""
-
-    def __init__(self, *, memory=memory_free_pct, loadavg=os.getloadavg, cpus=os.cpu_count,
-                 clock=time.time):
-        self.memory = memory
-        self.loadavg = loadavg
-        self.cpus = cpus
-        self.clock = clock
-        self._free: float | None = None
-        self._free_at: float | None = None
-
-    def read(self, ttl_s: float) -> tuple[float | None, float | None]:
-        """(memory free percent, 1-minute load per CPU); each is None when unreadable."""
-        now = self.clock()
-        if self._free_at is None or now - self._free_at >= ttl_s:
-            self._free = self.memory()
-            self._free_at = now
-        try:
-            load = self.loadavg()[0] / (self.cpus() or 1)
-        except (OSError, IndexError):
-            load = None
-        return self._free, load
+    return headroom_lib.pressure(reading, **bars)
 
 
 def queue_rank(job: dict, now: float) -> int:
@@ -753,7 +741,8 @@ class Broker:
         self.labeler = labeler or label_for
         self.now = now
         self.proxy = proxy or proxy_status
-        self.gauges = gauges or Gauges(clock=now)
+        self.gauges = gauges or headroom_lib.Gauges(home, settings=headroom_lib.settings(load_config(home)),
+                                                    clock=now)
         self.launch_pool = launch_pool or concurrent.futures.ThreadPoolExecutor(
             max_workers=MAX_CONCURRENT_LAUNCHES, thread_name_prefix="agentq-launch")
         self._inflight: dict[str, concurrent.futures.Future] = {}
@@ -834,11 +823,12 @@ class Broker:
         urgent_cap = max(1, sum(cfg["slots"].values()) // 2)
         others_waiting = any(job["lane"] != "urgent" for job in ready)
         saturated = bool(status and status.get("saturated"))
-        gauge_reading: list[tuple] = []
+        laptop_cfg = cfg["laptop"]
+        gauge_reading: list[headroom_lib.Headroom] = []
 
-        def laptop() -> tuple:
+        def laptop() -> headroom_lib.Headroom:
             if not gauge_reading:
-                gauge_reading.append(self.gauges.read(adaptive["gauge_ttl_s"]))
+                gauge_reading.append(self.gauges.read())
             return gauge_reading[0]
 
         worktree_settings = cfg["auto_worktree"]
@@ -874,7 +864,8 @@ class Broker:
             if reason is None and tier_cap is not None and tier_used.get(job["tier"], 0) >= tier_cap:
                 name, reason = job["tier"], plain_hold("tier cap full")
             if reason is None and on and job["res"] in LAPTOP_GATED:
-                reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), adaptive)
+                reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), laptop_cfg,
+                                     adaptive["tests_floor"])
             if reason is None and filler_paused and is_filler(job):
                 name, reason = "filler", plain_hold("filler paused")
             paced = reason is None and pace is not None and job["tier"] == fill_lib.DS_TIER
@@ -1077,10 +1068,10 @@ class Broker:
             self._controller = fill_lib.FillController(ceiling=self._load_ceiling(conn))
         enabled = fill_cfg["enabled"]
         ps_text = self._process_table(now) if enabled else None
-        laptop = self.gauges.read(cfg["adaptive"]["gauge_ttl_s"]) if enabled else (None, None)
+        laptop = self.gauges.read() if enabled else None
         decision = fill_lib.decide(
             conn, now, controller=self._controller, fill=fill_cfg, pacing=pacing, status=status,
-            ps_text=ps_text, laptop=laptop,
+            ps_text=ps_text, laptop=laptop, laptop_cfg=cfg["laptop"],
             paused=filler_lib.paused(conn), measured=self._measured_cost(conn, now, pacing),
         )
         controller = self._controller

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from agentq import broker
+from agentq import headroom as headroom_lib
 
 KINDS = ("ssh", "pytest")
 DEFAULT_GATED_HOSTS: tuple[str, ...] = ()
@@ -48,14 +49,15 @@ class Limits:
     adaptive: bool
     floor: int
     min_free_pct: float
-    max_load_per_cpu: float
-    gauge_ttl_s: float
+    max_cpu_busy: float
+    max_swap_frac: float
+    gauge_settings: dict
 
 
 class GaugeReader(Protocol):
-    """Anything with ``read() -> (memory free percent or None, load per CPU or None)``."""
+    """Anything with ``read() -> Headroom``."""
 
-    def read(self) -> tuple[Optional[float], Optional[float]]:
+    def read(self) -> headroom_lib.Headroom:
         """Current headroom."""
 
 
@@ -94,7 +96,7 @@ def read_broker_json(home) -> dict:
 def load_limits(home) -> Limits:
     """Limits for ``home``.
 
-    ``slots.ssh`` and ``adaptive`` use the broker's keys and defaults. The pytest
+    ``slots.ssh``, ``adaptive`` and ``laptop`` use the broker's keys and defaults. The pytest
     ceiling is ``slots.tests`` when the file sets it, else ``PYTEST_CEILING``
     (16), because the broker's ``tests`` cap of 6 governs broker jobs, not shims.
     """
@@ -113,9 +115,10 @@ def load_limits(home) -> Limits:
         pytest=ceiling,
         adaptive=bool(adaptive["enabled"]),
         floor=int(adaptive["tests_floor"]),
-        min_free_pct=float(adaptive["tests_min_free_pct"]),
-        max_load_per_cpu=float(adaptive["tests_max_load_per_cpu"]),
-        gauge_ttl_s=float(adaptive["gauge_ttl_s"]),
+        min_free_pct=float(config["laptop"]["tests_min_free_pct"]),
+        max_cpu_busy=float(config["laptop"]["tests_max_cpu_busy"]),
+        max_swap_frac=float(config["laptop"]["max_swap_frac"]),
+        gauge_settings=headroom_lib.settings(config),
     )
 
 
@@ -153,50 +156,24 @@ def kind_limit(limits: Limits, kind: str) -> int:
 
 
 class Gauges:
-    """Laptop memory and load. Memory is read by ``memory_pressure`` at most once per TTL.
+    """Laptop headroom shared by every shim through ``slots/gauge.json`` (see ``headroom.Gauges``)."""
 
-    The reading is shared by every shim through ``slots/gauge.json``, so many
-    concurrent shims do not each spawn ``memory_pressure``.
-    """
-
-    def __init__(self, home, *, ttl_s: float = 15.0, memory: Callable[[], Optional[float]] = broker.memory_free_pct,
+    def __init__(self, home, *, settings: dict, memory=None, ticks=None, swap=None,
                  loadavg=os.getloadavg, cpus=os.cpu_count, clock=time.time):
-        self.path = Path(home) / "slots" / "gauge.json"
-        self.ttl_s = ttl_s
-        self.memory = memory
-        self.loadavg = loadavg
-        self.cpus = cpus
-        self.clock = clock
+        self._gauges = headroom_lib.Gauges(home, settings=settings, memory=memory, ticks=ticks, swap=swap,
+                                           loadavg=loadavg, cpus=cpus, clock=clock)
 
-    def read(self) -> tuple[Optional[float], Optional[float]]:
-        """(memory free percent, 1-minute load per CPU); each is None when unreadable."""
-        return self._memory_free(), self._load_per_cpu()
-
-    def _memory_free(self) -> Optional[float]:
-        now = self.clock()
-        cached = _read_json(self.path)
-        if isinstance(cached, dict) and isinstance(cached.get("at"), (int, float)):
-            age = now - cached["at"]
-            if 0 <= age < self.ttl_s:
-                free = cached.get("free")
-                return float(free) if isinstance(free, (int, float)) else None
-        free = self.memory()
-        _write_json(self.path, {"at": now, "free": free})
-        return free
-
-    def _load_per_cpu(self) -> Optional[float]:
-        try:
-            return self.loadavg()[0] / (self.cpus() or 1)
-        except (OSError, IndexError):
-            return None
+    def read(self) -> headroom_lib.Headroom:
+        """Current headroom, sampling only what is stale."""
+        return self._gauges.read()
 
 
 def pytest_admission(limits: Limits, gauges: GaugeReader) -> Callable[[int], bool]:
     """Admission rule for a new pytest run, given how many pytest slots are busy.
 
-    Below the ceiling, a run starts when fewer than ``floor`` are busy, or when
-    memory free is at least ``min_free_pct`` and load per CPU is under
-    ``max_load_per_cpu``. An unreadable gauge adds no gate, as in the broker.
+    Below the ceiling, a run starts when fewer than ``floor`` are busy, or when no tests bar is
+    breached: memory free at least ``min_free_pct``, CPU busy under ``max_cpu_busy``, swap used
+    under ``max_swap_frac``. An unreadable measure adds no gate, as in the broker.
     With adaptive admission off, only the ceiling applies.
     """
 
@@ -205,10 +182,11 @@ def pytest_admission(limits: Limits, gauges: GaugeReader) -> Callable[[int], boo
             return False
         if not limits.adaptive or running < limits.floor:
             return True
-        free, load = gauges.read()
-        if free is None or load is None:
-            return True
-        return free >= limits.min_free_pct and load < limits.max_load_per_cpu
+        breach = headroom_lib.pressure(
+            gauges.read(), max_cpu_busy=limits.max_cpu_busy, min_free_pct=limits.min_free_pct,
+            max_swap_frac=limits.max_swap_frac,
+        )
+        return breach is None
 
     return admit
 
