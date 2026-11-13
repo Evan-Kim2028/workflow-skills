@@ -26,6 +26,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_PORT = 18791
@@ -91,6 +92,7 @@ WORKER_TICK_S = 1.0
 REQUEST_BUDGET_S = 0.8
 BACKGROUND_BUDGET_S = 30.0
 WATCHDOG_FACTOR = 3.0
+MAX_LIVE_COMPUTES = 4
 GONE_LOG_S = 60.0
 DB_TIMEOUT_S = 2.0
 PS_TIMEOUT_S = 5.0
@@ -3370,16 +3372,20 @@ def read_running_queue(agentq_db: Path) -> int:
 def sample_once(home: Path, ps_runner=run_ps, now: float | None = None) -> dict:
     """Take one worker sample. Raises when ps fails, so the gap shows instead of a false zero.
 
-    ps no longer reports environments, so queue workers come from the jobs table when it is readable, and
-    the environment count is the fallback. Direct workers are every other launch_pi process.
+    ps no longer reports environments, so queue workers are the running jobs in the jobs table. Direct workers
+    are every other launch_pi process. When the jobs table cannot be read, queue and direct are unknown (None),
+    so the sample shows a gap rather than a classification.
     """
     home = Path(home)
     now = time.time() if now is None else now
-    row = {"ts": now, **parse_workers(ps_runner()), "queued_jobs": None, "ds_queued": None, "kimi_queued": None}
-    total = row["queue_workers"] + row["direct_workers"]
+    counts = parse_workers(ps_runner())
+    total = counts["queue_workers"] + counts["direct_workers"]
+    row = {"ts": now, "ds_workers": counts["ds_workers"], "kimi_workers": counts["kimi_workers"],
+           "queue_workers": None, "direct_workers": None, "queued_jobs": None, "ds_queued": None, "kimi_queued": None}
     try:
-        row["queue_workers"] = read_running_queue(home / "agentq.db")
-        row["direct_workers"] = max(0, total - row["queue_workers"])
+        running = read_running_queue(home / "agentq.db")
+        row["queue_workers"] = running
+        row["direct_workers"] = max(0, total - running)
     except (sqlite3.Error, FileNotFoundError):
         pass
     try:
@@ -3458,23 +3464,43 @@ class BackgroundReader(threading.Thread):
         self.wake.set()
 
 
+class Stored(NamedTuple):
+    """One stored summary body. ``generation`` numbers the compute that built it: higher is newer."""
+
+    body: bytes
+    generated_at: float
+    partial: bool
+    generation: int
+
+
+class Compute:
+    """One in-flight compute: ``kind`` is "ordinary" (the cadence) or "forced" (the watchdog)."""
+
+    def __init__(self, hours: int, kind: str, generation: int) -> None:
+        self.hours = hours
+        self.kind = kind
+        self.generation = generation
+
+
 class SummaryCache:
     """Serves the summary JSON as stored bytes, computed off the request path.
 
-    Computes run on their own threads and never under a lock: the lock guards only the stored bodies and
-    the in-flight markers, and a request never waits for a compute or a reader. A range with no stored body
-    gets a DB-only partial summary, computed under REQUEST_BUDGET_S and stored with ``partial`` set; the full
-    compute replaces it. A watchdog starts a fresh compute for any range whose data is older than
-    WATCHDOG_FACTOR times its cadence, logging once per episode. Nothing is computed while nobody has asked
-    for the page in IDLE_AFTER_S.
+    Computes run on their own threads and never under a lock: the lock guards only the stored bodies, the
+    generation counters and the in-flight set. Every compute takes a per-range generation when it starts, and
+    a stored body is replaced only by a newer generation (and a partial only by a newer partial). A range
+    with no stored body gets a DB-only partial summary, computed under REQUEST_BUDGET_S. A watchdog starts a
+    forced compute for any range whose data is older than WATCHDOG_FACTOR times its cadence. At most one
+    ordinary and one forced compute per range run at a time, and at most MAX_LIVE_COMPUTES in all, forced
+    starts included. Nothing is computed while nobody has asked for the page in IDLE_AFTER_S.
     """
 
     def __init__(self, home: Path, fetch_live=fetch_live_status, clock=time.time) -> None:
         self.home = Path(home)
         self.clock = clock
         self.last_request: float | None = None
-        self.bodies: dict[int, tuple[bytes, float, bool]] = {}
-        self.inflight: dict[int, object] = {}
+        self.bodies: dict[int, Stored] = {}
+        self.generations: dict[int, int] = {}
+        self.inflight: dict[int, set[Compute]] = {}
         self.stale_logged: set[int] = set()
         self.forced_at: dict[int, float] = {}
         self.threads: list[threading.Thread] = []
@@ -3508,16 +3534,27 @@ class SummaryCache:
     def active(self) -> bool:
         return self.last_request is not None and self.clock() - self.last_request <= IDLE_AFTER_S
 
+    def live_computes(self) -> int:
+        """Compute threads still running, across all ranges."""
+        with self.lock:
+            return sum(len(computes) for computes in self.inflight.values())
+
     def get(self, hours: int) -> tuple[bytes, float]:
         """The stored JSON bytes and generated_at for one range. With nothing stored, a DB-only partial is built now."""
         self.touch()
         with self.lock:
             entry = self.bodies.get(hours)
+            generation = self._next_generation(hours)
         if entry is None:
-            entry = self._store(hours, self._build(hours, REQUEST_BUDGET_S))
-        return entry[0], entry[1]
+            entry = self._store(hours, self._build(hours, REQUEST_BUDGET_S, generation))
+        return entry.body, entry.generated_at
 
-    def _build(self, hours: int, budget: float) -> tuple[bytes, float, bool]:
+    def _next_generation(self, hours: int) -> int:
+        """Caller holds the lock."""
+        self.generations[hours] = self.generations.get(hours, 0) + 1
+        return self.generations[hours]
+
+    def _build(self, hours: int, budget: float, generation: int) -> Stored:
         """One summary as JSON bytes, built with the SQLite waits bounded by ``budget`` seconds."""
         now = self.clock()
         with time_budget(budget):
@@ -3526,42 +3563,51 @@ class SummaryCache:
         summary["cadence_s"] = RANGE_CADENCE_S[hours]
         partial = any("time budget" in message for message in summary["errors"].values())
         summary["partial"] = partial
-        return json.dumps(summary).encode("utf-8"), now, partial
+        return Stored(json.dumps(summary).encode("utf-8"), now, partial, generation)
 
-    def _store(self, hours: int, entry: tuple[bytes, float, bool]) -> tuple[bytes, float, bool]:
-        """Keep the newest body, but never let a partial replace a full one."""
+    def _store(self, hours: int, entry: Stored) -> Stored:
+        """Keep the newest generation. A partial replaces only a partial or nothing; a full body replaces any newer-generation body."""
         with self.lock:
             current = self.bodies.get(hours)
-            if current is None or (current[2] and not entry[2]) or (current[2] == entry[2] and entry[1] >= current[1]):
-                self.bodies[hours] = entry
-                if not entry[2]:
-                    self.stale_logged.discard(hours)
-                return entry
-            return current
+            if current is not None and entry.generation < current.generation:
+                return current
+            if current is not None and entry.partial and not current.partial:
+                return current
+            if current is not None and entry.generation == current.generation:
+                return current
+            self.bodies[hours] = entry
+            if not entry.partial:
+                self.stale_logged.discard(hours)
+            return entry
 
     def _start_compute(self, hours: int, force: bool = False) -> bool:
-        """Start one full compute for a range on its own thread. Unless forced, skipped while one is in flight."""
+        """Start one full compute for a range on its own thread.
+
+        Skipped when the range already has a compute of the same kind running, or when MAX_LIVE_COMPUTES
+        are running. A forced start is subject to both limits too.
+        """
+        kind = "forced" if force else "ordinary"
         with self.lock:
-            if hours in self.inflight and not force:
+            if sum(len(computes) for computes in self.inflight.values()) >= MAX_LIVE_COMPUTES:
                 return False
-            token = object()
-            self.inflight[hours] = token
-        worker = threading.Thread(
-            target=self._run_compute, args=(hours, token), name=f"agentq-dash-{hours}h", daemon=True
-        )
+            computes = self.inflight.setdefault(hours, set())
+            if any(compute.kind == kind for compute in computes):
+                return False
+            compute = Compute(hours, kind, self._next_generation(hours))
+            computes.add(compute)
+        worker = threading.Thread(target=self._run_compute, args=(compute,), name=f"agentq-dash-{hours}h-{kind}", daemon=True)
         self.threads = [t for t in self.threads if t.is_alive()] + [worker]
         worker.start()
         return True
 
-    def _run_compute(self, hours: int, token: object) -> None:
+    def _run_compute(self, compute: Compute) -> None:
         try:
-            self._store(hours, self._build(hours, BACKGROUND_BUDGET_S))
+            self._store(compute.hours, self._build(compute.hours, BACKGROUND_BUDGET_S, compute.generation))
         except Exception as exc:
-            sys.stderr.write(f"agentq dash: {hours}h summary skipped: {type(exc).__name__}: {exc}\n")
+            sys.stderr.write(f"agentq dash: {compute.hours}h summary skipped: {type(exc).__name__}: {exc}\n")
         finally:
             with self.lock:
-                if self.inflight.get(hours) is token:
-                    del self.inflight[hours]
+                self.inflight.get(compute.hours, set()).discard(compute)
 
     def wait_for_computes(self, timeout: float = 30.0) -> None:
         """Wait for the compute threads started so far (tests use this; the server never waits)."""
@@ -3579,8 +3625,8 @@ class SummaryCache:
             cadence = RANGE_CADENCE_S[hours]
             with self.lock:
                 entry = self.bodies.get(hours)
-            age = None if entry is None else now - entry[1]
-            if entry is None or entry[2] or age >= cadence:
+            age = None if entry is None else now - entry.generated_at
+            if entry is None or entry.partial or age >= cadence:
                 self._start_compute(hours)
             if age is not None and age > WATCHDOG_FACTOR * cadence:
                 self._watchdog(hours, age, cadence, now)
@@ -3593,9 +3639,8 @@ class SummaryCache:
                 f"agentq dash: {hours}h summary is {age:.0f} s old (over {WATCHDOG_FACTOR:g}x its {cadence:g} s cadence); "
                 "recomputing on a fresh worker\n"
             )
-        if now - self.forced_at.get(hours, float("-inf")) >= cadence:
+        if now - self.forced_at.get(hours, float("-inf")) >= cadence and self._start_compute(hours, force=True):
             self.forced_at[hours] = now
-            self._start_compute(hours, force=True)
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():

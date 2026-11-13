@@ -1996,12 +1996,41 @@ class SummaryCacheTest(unittest.TestCase):
         self.assertEqual(reader.age(self.now), 7.0)
 
     def test_a_partial_body_never_replaces_a_full_one(self) -> None:
-        full = (b"full", 100.0, False)
+        full = dash.Stored(b"full", 100.0, False, 1)
         self.cache.bodies[6] = full
-        self.assertIs(self.cache._store(6, (b"partial", 200.0, True)), full)
+        self.assertIs(self.cache._store(6, dash.Stored(b"partial", 200.0, True, 2)), full)
         self.assertEqual(self.cache.bodies[6], full)
-        newer_full = (b"newer", 300.0, False)
+
+    def test_a_newer_partial_replaces_an_older_partial(self) -> None:
+        self.cache.bodies[6] = dash.Stored(b"old", 100.0, True, 1)
+        newer = dash.Stored(b"new", 200.0, True, 2)
+        self.assertIs(self.cache._store(6, newer), newer)
+
+    def test_a_newer_full_replaces_any_body(self) -> None:
+        self.cache.bodies[6] = dash.Stored(b"partial", 200.0, True, 2)
+        newer_full = dash.Stored(b"full", 300.0, False, 3)
         self.assertIs(self.cache._store(6, newer_full), newer_full)
+
+    def test_an_older_full_never_replaces_a_newer_full(self) -> None:
+        """The review case: a full compute that started first but finished late, over a newer body."""
+        self.cache.bodies[6] = dash.Stored(b"newer", 200.0, False, 5)
+        older_full = dash.Stored(b"older", 100.0, False, 4)
+        self.assertIs(self.cache._store(6, older_full), self.cache.bodies[6])
+        self.assertEqual(self.cache.bodies[6].body, b"newer")
+
+    def test_an_older_full_never_replaces_a_newer_partial(self) -> None:
+        self.cache.bodies[6] = dash.Stored(b"partial", 200.0, True, 5)
+        self.cache._store(6, dash.Stored(b"full", 100.0, False, 4))
+        self.assertTrue(self.cache.bodies[6].partial)
+        self.assertEqual(self.cache.bodies[6].body, b"partial")
+
+    def test_the_generation_is_taken_when_each_compute_starts(self) -> None:
+        self.cache._start_compute(6)
+        self.cache.wait_for_computes()
+        first = self.cache.bodies[6].generation
+        self.cache._start_compute(6)
+        self.cache.wait_for_computes()
+        self.assertGreater(self.cache.bodies[6].generation, first)
 
 
 class BlockedReaderTest(unittest.TestCase):
@@ -2097,12 +2126,12 @@ class WatchdogTest(unittest.TestCase):
             self.cache.touch()
             self.cache._start_compute(6)
             time.sleep(0.05)
-            self.cache.bodies[6] = (b"{}", self.now - 3 * dash.RANGE_CADENCE_S[6] - 1, False)
+            self.cache.bodies[6] = dash.Stored(b"{}", self.now - 3 * dash.RANGE_CADENCE_S[6] - 1, False, 0)
             self.now += 1
             self.cache.tick()
             self.cache.tick()
             self.cache.wait_for_computes(10)
-            fresh_generated = self.cache.bodies[6][1]
+            fresh_generated = self.cache.bodies[6].generated_at
         self.assertEqual(len(calls), 2, calls)
         self.assertGreater(fresh_generated, self.now - 1)
         self.assertEqual(err.getvalue().count("recomputing on a fresh worker"), 1, err.getvalue())
@@ -2118,6 +2147,89 @@ class WatchdogTest(unittest.TestCase):
             self.cache.wait_for_computes()
         self.assertEqual(build.call_count, first)
         self.assertNotIn("recomputing", err.getvalue())
+
+
+class ComputeCapTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+
+    def tearDown(self) -> None:
+        self.cache.stop()
+        self.cache.wait_for_computes()
+        self.tmp.cleanup()
+
+    def test_a_persistently_locked_store_keeps_live_computes_within_the_cap_for_sixty_seconds(self) -> None:
+        real_build = dash.build_summary
+
+        def slow_build(*args, **kwargs):
+            time.sleep(0.25)
+            return real_build(*args, **kwargs)
+
+        clock = {"now": 1000.0}
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: clock["now"])
+        lock = sqlite3.connect(self.home / "agentq.db", isolation_level=None, timeout=5)
+        lock.execute("BEGIN EXCLUSIVE")
+        peak = 0
+        peak_per_range = 0
+        try:
+            with mock.patch.object(dash, "build_summary", side_effect=slow_build), \
+                    mock.patch.object(dash.sys, "stderr", new=io.StringIO()):
+                self.cache.touch()
+                for _ in range(60):
+                    self.cache.touch()
+                    self.cache.tick()
+                    peak = max(peak, self.cache.live_computes())
+                    with self.cache.lock:
+                        peak_per_range = max([peak_per_range] + [len(c) for c in self.cache.inflight.values()])
+                    clock["now"] += 1.0
+                    time.sleep(0.02)
+                self.cache.wait_for_computes(30)
+        finally:
+            lock.execute("ROLLBACK")
+            lock.close()
+        self.assertLessEqual(peak, dash.MAX_LIVE_COMPUTES)
+        self.assertLessEqual(peak_per_range, 2)
+        self.assertGreater(peak, 0)
+
+    def test_a_forced_start_never_bypasses_the_cap(self) -> None:
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: 1000.0)
+        gate = threading.Event()
+        with mock.patch.object(dash, "build_summary", side_effect=lambda *a, **k: (gate.wait(10), None)[1]):
+            started = [self.cache._start_compute(h) for h in dash.RANGE_HOURS]
+            forced = [self.cache._start_compute(h, force=True) for h in dash.RANGE_HOURS]
+            gate.set()
+            self.cache.wait_for_computes(10)
+        self.assertLessEqual(sum(started) + sum(forced), dash.MAX_LIVE_COMPUTES)
+        self.assertFalse(all(forced))
+
+    def test_one_ordinary_and_one_forced_compute_per_range_at_a_time(self) -> None:
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: 1000.0)
+        gate = threading.Event()
+        with mock.patch.object(dash, "build_summary", side_effect=lambda *a, **k: (gate.wait(10), None)[1]):
+            self.assertTrue(self.cache._start_compute(1))
+            self.assertFalse(self.cache._start_compute(1))
+            self.assertTrue(self.cache._start_compute(1, force=True))
+            self.assertFalse(self.cache._start_compute(1, force=True))
+            gate.set()
+            self.cache.wait_for_computes(10)
+        self.assertEqual(self.cache.live_computes(), 0)
+
+
+class SamplerGapTest(unittest.TestCase):
+    def test_unreadable_jobs_table_reports_queue_and_direct_as_unknown_not_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            row = dash.sample_once(home, ps_runner=lambda: "  101 /x/launch_pi.py --model morph-dsv41flash-1017\n", now=NOW)
+            stored = sqlite3.connect(home / "dash.db").execute("SELECT ds_workers, queue_workers, direct_workers FROM samples").fetchall()
+        self.assertEqual((row["ds_workers"], row["queue_workers"], row["direct_workers"]), (1, None, None))
+        self.assertEqual(stored, [(1, None, None)])
+
+    def test_readable_jobs_table_still_splits_queue_from_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            row = dash.sample_once(home, ps_runner=lambda: "  101 /x/launch_pi.py --model morph-dsv41flash-1017\n  102 /x/launch_pi.py --tier pi-kimi\n", now=NOW)
+        self.assertEqual((row["queue_workers"], row["direct_workers"]), (1, 1))
 
 
 class RunPsTest(unittest.TestCase):
