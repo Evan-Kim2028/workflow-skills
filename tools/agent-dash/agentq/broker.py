@@ -139,6 +139,14 @@ class Probe(NamedTuple):
     args: str
 
 
+def _tiers_thinking(override) -> dict:
+    """Per-tier thinking levels from ``broker.json`` ``tiers_thinking``. Only pi's levels count; an unknown tier
+    name is kept (it simply matches no job), an unknown level is dropped, so the tier runs at pi's default."""
+    if not isinstance(override, dict):
+        return {}
+    return {str(tier): level for tier, level in override.items() if level in db.THINKING_LEVELS}
+
+
 def load_config(home) -> dict:
     """Slot caps by resource and per-tier caps from ``broker.json``, defaults filled in."""
     try:
@@ -153,6 +161,7 @@ def load_config(home) -> dict:
         "adaptive": _adaptive(data.get("adaptive")),
         "laptop": _laptop(data.get("laptop")),
         "auto_worktree": _auto_worktree(data.get("auto_worktree")),
+        "tiers_thinking": _tiers_thinking(data.get("tiers_thinking")),
         "fill": fill_lib.section(data.get("fill"), fill_lib.DEFAULT_FILL),
         "pacing": fill_lib.section(data.get("pacing"), fill_lib.DEFAULT_PACING),
     }
@@ -608,6 +617,16 @@ def label_for(kind: str, slug: str) -> str | None:
         return None
     lines = proc.stdout.strip().splitlines()
     return lines[-1] if proc.returncode == 0 and lines else None
+
+
+def thinking_for(job: dict, tiers_thinking: dict) -> str | None:
+    """The thinking level a job runs at: its own ``thinking`` field when it names a valid level, else its tier's level
+    from ``broker.json`` ``tiers_thinking``, else None (pi's default). Real work and every other tier are unchanged
+    unless configured."""
+    own = job.get("thinking")
+    if own in db.THINKING_LEVELS:
+        return own
+    return tiers_thinking.get(job.get("tier"))
 
 
 def is_filler(job: dict) -> bool:
@@ -1346,15 +1365,19 @@ class Broker:
         """
         previous = job["run_dir"]
         run_dir = db.job_dir(self.home, job["id"]) / "runs" / uuid.uuid4().hex[:8]
+        level = thinking_for(job, load_config(self.home)["tiers_thinking"])
         if not self._move(
             conn, job["id"], ("queued",), now, "launch", f"tier {job['tier']} attempt {job['attempt'] + 1}",
             state="running", run_dir=str(run_dir), pid=None, pgid=None, pid_start=None, started_at=now,
-            detail=None,
+            detail=None, thinking_used=level,
         ):  # fmt: skip
             return False
         env = dict(os.environ, AGENTQ_JOB=job["id"], AGENTQ_HOME=str(self.home))
         env.pop("AGENTQ_RESUME_SESSION", None)
         env.pop("AGENTQ_RESUME_DIR", None)
+        env.pop("AGENTQ_THINKING", None)
+        if level is not None:
+            env["AGENTQ_THINKING"] = level
         resume = resume_file(previous, job["pi_session"])
         if resume:
             env["AGENTQ_RESUME_SESSION"] = resume

@@ -26,6 +26,7 @@ from agentq import broker as broker_lib
 from agentq import db
 from agentq import gc as gc_lib
 from agentq import slots as slots_lib
+from agentq import thinking_report as thinking_lib
 
 HARNESS_VARS = (
     ("CLAUDE_CODE_SESSION_ID", "claude"),
@@ -407,6 +408,17 @@ def _set_paused(args, ctx: Context, enabled: bool) -> int:
     return answer(ctx, f"{state} backlog {args.name}", 0)
 
 
+def cmd_thinking_report(args, ctx: Context) -> int:
+    """Read-only: DeepSeek jobs per thinking level. The store is opened with mode=ro."""
+    try:
+        lines, summary = thinking_lib.report_text(ctx.home, since=args.since)
+    except (ValueError, sqlite3.Error) as exc:
+        return answer(ctx, f"thinking report: {exc}", 1)
+    for line in lines:
+        ctx.print(line)
+    return answer(ctx, summary.removeprefix("ANSWER: "), 0)
+
+
 def cmd_backlog_pause(args, ctx: Context) -> int:
     return _set_paused(args, ctx, False)
 
@@ -508,6 +520,11 @@ def build_parser() -> argparse.ArgumentParser:
     b = bsub.add_parser("resume", help="submit a paused template again; with no name, resume all templates and the filler")
     b.add_argument("name", nargs="?", help="one template to resume; omit to resume all templates and the filler")
     b.set_defaults(func=cmd_backlog_resume)
+    thinking = sub.add_parser("thinking", help="DeepSeek thinking levels: the report for before and after a change")
+    tsub = thinking.add_subparsers(dest="thinking_cmd", required=True)
+    report = tsub.add_parser("report", help="per thinking level: verdicts, output per job and per turn, billed tokens")
+    report.add_argument("--since", metavar="ISO", help="only jobs submitted at or after this UTC time")
+    report.set_defaults(func=cmd_thinking_report)
     return parser
 
 

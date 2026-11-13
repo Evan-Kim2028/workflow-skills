@@ -12,16 +12,18 @@ from __future__ import annotations
 import contextlib
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
 import uuid
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LANES = ("urgent", "normal", "backlog")
 KINDS = ("read", "write", "review")
 RESOURCES = ("light", "tests", "ssh")
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 REVIEW_TIER = "pi-kimi"
 DEFAULT_TIER = "pi-deepseek-flash"
 OPEN_STATES = ("queued", "running")
@@ -127,7 +129,9 @@ _STATEMENTS = (
         submitted_at REAL NOT NULL,
         started_at REAL,
         finished_at REAL,
-        priority_age_at REAL NOT NULL
+        priority_age_at REAL NOT NULL,
+        thinking TEXT,
+        thinking_used TEXT
     )""",
     "CREATE INDEX jobs_queue ON jobs(state, lane, queue_seq)",
     "CREATE INDEX jobs_session ON jobs(session, state)",
@@ -156,6 +160,10 @@ _UPGRADES = {
     3: (FILLER_TARGETS_TABLE, FILLER_STATE_TABLE),
     4: (FILLER_AUDITS_TABLE, FILLER_PRS_TABLE) + FILLER_AUDIT_MIGRATION,
     5: (FILLER_JOBS_TABLE,),
+    6: (
+        "ALTER TABLE jobs ADD COLUMN thinking TEXT",
+        "ALTER TABLE jobs ADD COLUMN thinking_used TEXT",
+    ),
 }
 
 JOB_COLUMNS = frozenset(
@@ -165,7 +173,7 @@ JOB_COLUMNS = frozenset(
         "pgid", "pid_start", "pi_session", "attempt", "rate_attempts",
         "watchdog_trips", "capacity_refusals", "max_runtime_s", "not_before",
         "verdict", "report_path", "detail", "submitted_at", "started_at",
-        "finished_at", "priority_age_at",
+        "finished_at", "priority_age_at", "thinking", "thinking_used",
     }
 )  # fmt: skip
 
@@ -252,6 +260,19 @@ def ensure_wal(conn: sqlite3.Connection) -> None:
 _NEWER_STORE_WARNED: set[str] = set()
 
 
+_ADD_COLUMN = re.compile(r"^ALTER TABLE (\w+) ADD COLUMN (\w+)")
+
+
+def _column_already_added(conn: sqlite3.Connection, statement: str) -> bool:
+    """True when an ``ALTER TABLE ... ADD COLUMN`` step names a column the table already has, so an upgrade
+    re-run over a store that has the column does not fail."""
+    match = _ADD_COLUMN.match(statement)
+    if match is None:
+        return False
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({match.group(1)})")}
+    return match.group(2) in columns
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the schema once, or upgrade an older store step by step.
 
@@ -279,6 +300,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         else:
             for step in range(version, SCHEMA_VERSION):
                 for statement in _UPGRADES[step]:
+                    if _column_already_added(conn, statement):
+                        continue
                     conn.execute(statement)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 

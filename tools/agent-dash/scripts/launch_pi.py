@@ -347,7 +347,37 @@ def extension_args(extension):
     return ["-e", str(extension)] if extension else []
 
 
-def build_argv(label, workspace, prompt_file, outdir, model, extension=None):
+THINKING_ENV = "AGENTQ_THINKING"
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+THINKING_LEVEL_FILE = "thinking-level"
+
+
+def thinking_level(environ):
+    """The thinking level the broker set for this run (``AGENTQ_THINKING``), or None.
+
+    The broker sets it from ``broker.json`` ``tiers_thinking`` or from the job's ``thinking`` field. Only the levels pi
+    accepts count; an unset variable means pi's own default.
+    """
+    value = (environ.get(THINKING_ENV) or "").strip()
+    return value if value in THINKING_LEVELS else None
+
+
+def thinking_args(level):
+    """``--thinking <level>`` when a level is set, else nothing."""
+    return ["--thinking", level] if level else []
+
+
+def write_thinking_level(outdir, level):
+    """Record the level this run was launched with in its run folder. Best effort; nothing is written when unset."""
+    if level is None:
+        return
+    try:
+        (Path(outdir) / THINKING_LEVEL_FILE).write_text(level + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def build_argv(label, workspace, prompt_file, outdir, model, extension=None, thinking=None):
     """The exact pi command line. ``stdin`` is closed by the caller."""
     return [
         "pi",
@@ -358,6 +388,7 @@ def build_argv(label, workspace, prompt_file, outdir, model, extension=None):
         str(Path(outdir) / "sessions"),
         "--model",
         model,
+        *thinking_args(thinking),
         *extension_args(extension),
         *brief_args(prompt_file),
         BRIEF_MESSAGE,
@@ -382,7 +413,7 @@ def resume_source(requested):
         return None
 
 
-def build_resume_argv(session_file, outdir, model, prompt_file, extension=None):
+def build_resume_argv(session_file, outdir, model, prompt_file, extension=None, thinking=None):
     """Fork the dead run's session into the new pi dir and send the continuation prompt.
 
     ``--fork`` makes a new session from the old one, and ``--session-dir``
@@ -401,6 +432,7 @@ def build_resume_argv(session_file, outdir, model, prompt_file, extension=None):
         str(Path(outdir) / "sessions"),
         "--model",
         model,
+        *thinking_args(thinking),
         *extension_args(extension),
         *brief_args(prompt_file),
         RESUME_PROMPT,
@@ -572,6 +604,8 @@ def main(argv=None):
     arm, extension = pilot_for(label, agentq_home())
     if arm is not None:
         record_pilot(label, arm, out, agentq_home(), started)
+    thinking = thinking_level(os.environ)
+    write_thinking_level(out, thinking)
     run_id = f"running/{label}"
     (out / run_id).write_text(f"{os.getpid()}\t{model}", encoding="utf-8")
     requested = (os.environ.get(RESUME_ENV) or "").strip()
@@ -584,7 +618,7 @@ def main(argv=None):
             se.write(f"resume: {requested} is missing or empty; starting fresh\n")
             se.flush()
         if resume is not None:
-            rc = run_pi(build_resume_argv(resume, out, model, local_prompt, extension), stream, workspace, se)
+            rc = run_pi(build_resume_argv(resume, out, model, local_prompt, extension, thinking), stream, workspace, se)
             if pi_refused_resume(rc, stream):
                 se.write(f"resume: pi refused {resume} (exit {rc}, no output); starting fresh\n")
                 se.flush()
@@ -592,7 +626,7 @@ def main(argv=None):
             else:
                 resumed_from = str(resume)
         if resume is None:
-            rc = run_pi(build_argv(label, workspace, local_prompt, out, model, extension), stream, workspace, se)
+            rc = run_pi(build_argv(label, workspace, local_prompt, out, model, extension, thinking), stream, workspace, se)
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
