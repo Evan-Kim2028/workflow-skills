@@ -12,6 +12,7 @@ import argparse
 import calendar
 import contextlib
 import faulthandler
+import functools
 import json
 import math
 import os
@@ -25,6 +26,7 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
@@ -98,6 +100,7 @@ READER_CADENCE_S = 5.0
 IDLE_AFTER_S = 120.0
 WORKER_TICK_S = 1.0
 REQUEST_BUDGET_S = 0.8
+REQUEST_WAIT_S = 0.5
 BACKGROUND_BUDGET_S = 30.0
 WATCHDOG_FACTOR = 3.0
 MAX_LIVE_COMPUTES = 4
@@ -125,7 +128,7 @@ VERDICTS = ("PASS", "PARTIAL", "FAIL")
 FAR_FUTURE = 4102444800.0
 BUCKET_SUM_KEYS = ("total", "ds_output", "kimi_uncached", "ds_uncached", "ok", "r429", "req", "input", "cache_read", "output", "wait_p50_weighted")
 PCT_KEYS = ("pct_total", "pct_ds_output", "pct_kimi_uncached", "pct_ds_uncached")
-WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued", "queued_unsplit")
+WORKER_KEYS = ("ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued")
 DS_TIER = "pi-deepseek-flash"
 KIMI_TIER = "pi-kimi"
 SAMPLE_COLUMNS = ("ts", "ds_workers", "kimi_workers", "queue_workers", "direct_workers", "queued_jobs", "ds_queued", "kimi_queued")
@@ -613,7 +616,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   var RANGE_LABEL = { 1: "last 1 h", 6: "last 6 h", 24: "last 24 h", 168: "last 7 d" };
   var NAME_RANGE = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
   var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)", muted: "var(--ink-3)", kimiQueue: "#8a6cc0" };
-  var state = { hours: 6, data: null, seq: 0, lastFetch: 0, stale: null, timer: null };
+  var state = { hours: 6, data: null, seq: 0, lastFetch: 0, stale: null, timer: null, warming: false };
   var log = { source: "proxy", page: 1, q: "", seq: 0, data: null, qTimer: null, fetchedAt: 0 };
   var charts = [];
   var tables = {};
@@ -1257,10 +1260,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     var tb = d.token_bucket_s || bucket;
     var tunit = unitLabel(tb);
     var workers = (d.workers || []).map(function (w) {
-      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued, unsplit: w.queued_unsplit };
+      return { t: w.ts, ds: w.ds_workers, kimi: w.kimi_workers, dsq: w.ds_queued, kimiq: w.kimi_queued };
     });
-    var firstSplit = workers.find(function (w) { return w.dsq !== null && w.dsq !== undefined; });
-    var unsplitName = firstSplit ? "Queued, unsplit (before " + hm(firstSplit.t) + ")" : "Queued, unsplit";
     var PAIR_LAYOUT = { height: 260, margin: { l: 64, r: 16, t: 26, b: 24 } };
     var pctFmt = function (v, inline) { return inline ? (v * 100).toFixed(1) + "%" : Math.round(v * 100) + "%"; };
     var intFmt = function (v) { return Math.round(v).toLocaleString("en-US"); };
@@ -1294,8 +1295,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         { key: "ds", name: "DeepSeek runs", color: COLORS.s1 },
         { key: "kimi", name: "Kimi runs", color: COLORS.s2 },
         { key: "dsq", name: "DeepSeek queued", color: COLORS.s3, area: true, fillOpacity: 0.32 },
-        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 },
-        { key: "unsplit", name: unsplitName, color: COLORS.muted, dash: "2 3", width: 1.25, opacity: 0.6 }
+        { key: "kimiq", name: "Kimi queued", color: COLORS.kimiQueue, area: true, fillOpacity: 0.3 }
       ],
       y: labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs"),
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
@@ -1324,8 +1324,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       { name: "DeepSeek runs", color: COLORS.s1 },
       { name: "Kimi runs", color: COLORS.s2 },
       { name: "DeepSeek queued", color: COLORS.s3, block: true },
-      { name: "Kimi queued", color: COLORS.kimiQueue, block: true },
-      { name: unsplitName, color: COLORS.muted, dashed: true }
+      { name: "Kimi queued", color: COLORS.kimiQueue, block: true }
     ]);
     legendFor($("lg-tokens"), [
       { name: "Tokens billed", color: COLORS.s1, block: true },
@@ -1683,7 +1682,8 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       status.appendChild(document.createTextNode(" · " + state.stale + " · "));
     }
     var data = state.data;
-    var text = data && data.generated_at ? "updated " + hms(data.generated_at) : "loading";
+    var text = data && data.generated_at ? "updated " + hms(data.generated_at) : (state.warming ? "updating…" : "loading");
+    if (state.warming && data && data.generated_at) text += " · updating…";
     var errs = data && data.errors ? Object.keys(data.errors) : [];
     if (data && data.partial) text += " · partial summary, full one on the way";
     if (errs.length) text += " · partial: " + errs.join(", ");
@@ -1710,6 +1710,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       })
       .then(function (data) {
         if (seq !== state.seq) return;
+        if (data.warming_up) {
+          state.warming = true;
+          renderStatus();
+          return;
+        }
+        state.warming = false;
         var unchanged = state.data && state.data.hours === data.hours && state.data.generated_at === data.generated_at;
         state.data = data;
         state.stale = null;
@@ -1827,9 +1833,20 @@ def minute_stamp(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M", time.gmtime(ts))
 
 
+@functools.lru_cache(maxsize=65536)
 def minute_epoch(stamp: str) -> int:
-    """The epoch second at the start of a proxy minute key."""
-    return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M"))
+    """The epoch second at the start of a proxy minute key (``YYYY-MM-DDTHH:MM``), read by slicing.
+
+    Cached per distinct key, so a log with many lines in the same minutes parses each minute once.
+    Raises ValueError for anything that is not a minute key.
+    """
+    if len(stamp) != 16 or stamp[4] != "-" or stamp[7] != "-" or stamp[10] != "T" or stamp[13] != ":":
+        raise ValueError(f"not a minute key: {stamp!r}")
+    year, month, day = int(stamp[0:4]), int(stamp[5:7]), int(stamp[8:10])
+    hour, minute = int(stamp[11:13]), int(stamp[14:16])
+    if not (1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60):
+        raise ValueError(f"not a minute key: {stamp!r}")
+    return calendar.timegm((year, month, day, hour, minute, 0))
 
 
 def fraction(value: float, limit: int) -> float:
@@ -2118,8 +2135,8 @@ def read_caps(home: Path) -> dict[str, int]:
 def read_samples(dash_db: Path, since: float) -> list[dict]:
     """Worker samples recorded at or after ``since``. Empty before the first sample exists.
 
-    A database written before the per-tier queue split has no split columns: those read as None. A sample with
-    a total but no split is reported as ``queued_unsplit``, so the chart never invents a per-tier figure.
+    A database written before the per-tier queue split has no split columns: those samples read as None,
+    so the chart shows no queued value for them.
     """
     if not dash_db.exists():
         return []
@@ -2130,9 +2147,6 @@ def read_samples(dash_db: Path, since: float) -> list[dict]:
         rows = [dict(row) for row in connection.execute(f"SELECT {columns} FROM samples WHERE ts >= ? ORDER BY ts", (since,))]
     finally:
         connection.close()
-    for row in rows:
-        split = row["ds_queued"] is not None
-        row["queued_unsplit"] = None if split or row["queued_jobs"] is None else row["queued_jobs"]
     return rows
 
 
@@ -2296,7 +2310,7 @@ def bucket_minutes(points: list[dict], size: int) -> list[dict]:
     return buckets
 
 
-RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "ds_queued", "kimi_queued", "queued_unsplit")
+RUNS_AXIS_KEYS = ("ds_workers", "kimi_workers", "ds_queued", "kimi_queued")
 RUNS_AXIS_HEADROOM = 1.15
 RUNS_AXIS_MIN = 10
 RUNS_AXIS_STEPS = tuple(sorted({m * 10**k for k in range(7) for m in (1, 2, 5, 10, 20, 25, 50)}))
@@ -2722,67 +2736,127 @@ def live_ttfb_baseline(live: dict | None, baseline_raw: dict[int, dict], until: 
     return round(statistics.median(values)) if values else None
 
 
-def read_log_recent(path: Path, max_bytes: int = LOG_MAX_BYTES) -> tuple[bytes, bool]:
-    """The recent lines of a rotating log: the live file, preceded by its newest backup (``.1``).
+CALIB_MARK = b" calib "
 
-    ``RotatingLog`` renames the live file to ``.1`` and starts an empty one, so right after a
-    rotation the newest lines (a 429 from a minute ago) are in the backup, not the live file.
-    Readers that need the last few minutes read both, live lines last, so line order is
-    preserved. ``truncated`` is True whenever a backup exists: older history in ``.2``/``.3``
-    was not read, so the window may not reach back to the start of the log.
+
+class _CalibFile:
+    """The stated-budget 429 lines of one log file, parsed up to ``offset`` (always just past a newline).
+
+    ``head`` is the file's first bytes when it was first read. A file that has been replaced under the same
+    inode number (inodes are reused after a delete) has another head, so it is parsed again from scratch.
     """
-    data, truncated = read_log_tail(path, max_bytes)
-    backup = path.with_name(path.name + ".1")
-    if not backup.exists():
-        return data, truncated
+
+    def __init__(self, start: int, head: bytes) -> None:
+        self.head = head
+        self.offset = start
+        self.counts: Counter = Counter()
+        self.truncated = start > 0
+        self.skip_partial = start > 0
+
+
+_CALIB_FILES: dict[int, _CalibFile] = {}
+_CALIB_LOCK = threading.Lock()
+
+
+def _parse_calib(entry: _CalibFile, data: bytes) -> None:
+    """Count the calib lines that name a 429 budget into ``entry``. Works on bytes; a line is parsed only when it has the mark."""
+    for line in data.split(b"\n"):
+        at = line.find(CALIB_MARK)
+        if at < 0:
+            continue
+        budget = minute = None
+        for token in line[at + len(CALIB_MARK):].split():
+            if token.startswith(b"budget="):
+                budget = token[7:].decode("utf-8", "replace")
+            elif token.startswith(b"minute="):
+                minute = token[7:].decode("utf-8", "replace")
+        if not budget or budget == "None" or not minute:
+            continue
+        try:
+            epoch = minute_epoch(minute)
+        except ValueError:
+            continue
+        entry.counts[(budget, epoch)] += 1
+
+
+def _read_head(path: Path) -> bytes:
     try:
-        older, _ = read_log_tail(backup, max_bytes)
+        with open(path, "rb") as handle:
+            return handle.read(64)
     except OSError:
-        return data, truncated
-    return older + data, True
+        return b""
+
+
+def _extend(path: Path) -> _CalibFile | None:
+    """The parsed counts of one file, after parsing only the bytes appended since the last call. None when missing."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    head = _read_head(path)
+    entry = _CALIB_FILES.get(stat.st_ino)
+    if entry is None or stat.st_size < entry.offset or entry.head != head:
+        entry = _CalibFile(max(0, stat.st_size - LOG_MAX_BYTES), head)
+        _CALIB_FILES[stat.st_ino] = entry
+    if stat.st_size > entry.offset:
+        with open(path, "rb") as handle:
+            handle.seek(entry.offset)
+            chunk = handle.read(stat.st_size - entry.offset)
+        end = chunk.rfind(b"\n")
+        if end >= 0:
+            body = chunk[:end + 1]
+            if entry.skip_partial:
+                cut = body.find(b"\n")
+                body = body[cut + 1:] if cut >= 0 else b""
+                entry.skip_partial = False
+            _parse_calib(entry, body)
+            entry.offset += end + 1
+    return entry
+
+
+def _inode(path: Path) -> int | None:
+    try:
+        return path.stat().st_ino
+    except OSError:
+        return None
 
 
 def read_calib_429s(home: Path) -> dict | None:
-    """Calib log lines that name a 429 budget, from the proxy log tail: ``events`` as (budget, minute epoch) pairs.
+    """Stated-budget 429s from the proxy log: ``counts`` maps (budget, minute epoch) to the number of such lines.
 
-    The live file and its newest rotated backup are read, so a 429 written just before a
-    rotation is still counted. ``events`` is empty when the log holds no such line, which
-    means the proxy did not record rejections. ``truncated`` says the tail does not reach
-    back to the start of the log. None when the log is unreadable.
+    The live file and its newest backup (``.1``) are read. Each file is parsed once; later reads parse only the
+    bytes appended since, and a rotated file keeps its counts because the cache is keyed by inode. A cold read
+    covers at most LOG_MAX_BYTES of each file, so ``truncated`` is True when history was cut or a backup exists.
+    None when the live log is missing.
     """
-    try:
-        data, truncated = read_log_recent(Path(home) / "logs" / LOG_SOURCES["proxy"])
-    except OSError:
-        return None
-    events: list[tuple[str, int]] = []
-    for line in data.decode("utf-8", "replace").splitlines():
-        if " calib " not in line:
-            continue
-        entry = parse_log_line(line)
-        if entry is None or entry["event"] != "calib":
-            continue
-        fields = {f["k"]: f["v"] for f in entry["fields"]}
-        budget, stamp = fields.get("budget"), fields.get("minute")
-        if not budget or budget == "None" or not stamp:
-            continue
-        try:
-            events.append((budget, minute_epoch(stamp)))
-        except ValueError:
-            continue
-    return {"events": events, "truncated": truncated}
+    live = Path(home) / "logs" / LOG_SOURCES["proxy"]
+    backup = live.with_name(live.name + ".1")
+    with _CALIB_LOCK:
+        live_entry = _extend(live)
+        backup_entry = _extend(backup) if backup.exists() else None
+        keep = {inode for inode in (_inode(live), _inode(backup)) if inode is not None}
+        for inode in [inode for inode in _CALIB_FILES if inode not in keep]:
+            del _CALIB_FILES[inode]
+        if live_entry is None:
+            return None
+        counts = Counter(live_entry.counts)
+        truncated = live_entry.truncated
+        if backup_entry is not None:
+            counts.update(backup_entry.counts)
+            truncated = True
+    return {"counts": counts, "truncated": truncated}
 
 
-def budget_429_minutes(home: Path, until: int) -> dict[str, set[int]]:
-    """Minutes with an upstream 429 per budget name, from the proxy's calib log lines in the last 5 minutes.
+def budget_429_minutes(read: dict | None, until: int) -> dict[str, set[int]]:
+    """Minutes with an upstream 429 per budget name, from ``read_calib_429s``, in the last LIMIT_WINDOW_MINUTES.
 
     The proxy names the budget a 429 body states. A 429 with no stated budget is not counted.
     """
-    read = read_calib_429s(home)
     if read is None:
         return {}
     start = until - LIMIT_WINDOW_MINUTES * 60
     found: dict[str, set[int]] = {}
-    for budget, minute in read["events"]:
+    for budget, minute in read["counts"]:
         if start <= minute < until:
             found.setdefault(budget, set()).add(minute)
     return found
@@ -2792,11 +2866,11 @@ def budget_rejections(read: dict | None, budget: str, since: int, until: int) ->
     """Upstream 429s that named ``budget`` in [since, until), from ``read_calib_429s``.
 
     ``count`` is None when the log records no stated-budget 429 at all, so the page can say rejections are not recorded.
-    ``partial`` says the log tail may not cover the whole range.
+    ``partial`` says the log may not cover the whole range.
     """
-    if read is None or not read["events"]:
+    if read is None or not read["counts"]:
         return {"count": None, "partial": False}
-    count = sum(1 for name, minute in read["events"] if name == budget and since <= minute < until)
+    count = sum(n for (name, minute), n in read["counts"].items() if name == budget and since <= minute < until)
     return {"count": count, "partial": bool(read["truncated"])}
 
 
@@ -3322,9 +3396,13 @@ def room(
 
 
 def build_summary(
-    home: Path, hours: int = DEFAULT_HOURS, *, now: float | None = None, fetch_live=fetch_live_status, laptop: dict | None = None
+    home: Path, hours: int = DEFAULT_HOURS, *, now: float | None = None, fetch_live=fetch_live_status, laptop: dict | None = None,
+    read_logs: bool = True,
 ) -> dict:
-    """The JSON the page renders. Each source degrades to null or empty and is named in ``errors``."""
+    """The JSON the page renders. Each source degrades to null or empty and is named in ``errors``.
+
+    ``read_logs=False`` skips the proxy log (the 429 budgets and rejections), for the request-path partial build.
+    """
     home = Path(home)
     now = time.time() if now is None else float(now)
     hours = hours if hours in RANGE_HOURS else DEFAULT_HOURS
@@ -3337,6 +3415,7 @@ def build_summary(
     admitted = _guard("admitted", errors, read_calib, {}, agentq_db, since, until)
     live = _guard("live", errors, fetch_live, None)
     jobs = _guard("jobs", errors, read_jobs, None, agentq_db)
+    calib_429s = _guard("calib_429s", errors, read_calib_429s, None, home) if read_logs else None
     samples = _guard("workers", errors, read_samples, [], home / DASH_DB_NAME, float(since))
     run_rows = _guard("runs", errors, read_run_rows, [], agentq_db, int(now - RUN_LOOKBACK_S))
     caps = read_caps(home)
@@ -3372,7 +3451,7 @@ def build_summary(
     verdict_now = verdict(
         raw, until, resolved, live,
         kimi_jobs_waiting=int((jobs_by_tier.get("pi-kimi") or {}).get("queued") or 0),
-        budget_429s=budget_429_minutes(home, until),
+        budget_429s=budget_429_minutes(calib_429s, until),
         laptop=laptop_now,
         ds_jobs_ready=int((jobs_by_tier.get("pi-deepseek-flash") or {}).get("queued") or 0),
         slow=ttfb_slow(raw, until, live_ttfb_baseline(live, baseline_raw, until), live_inflight_limit(live)),
@@ -3386,7 +3465,6 @@ def build_summary(
         active_ds_workers=(sum(worker_vals) / len(worker_vals)) if worker_vals else None,
         laptop=laptop_now,
     )
-    calib_429s = _guard("calib_429s", errors, read_calib_429s, None, home)
     activity = {
         "tokens_5m": window_tokens(raw, until, 5),
         "tokens_15m": window_tokens(raw, until, 15),
@@ -3622,6 +3700,7 @@ class SummaryCache:
         self.forced_at: dict[int, float] = {}
         self.threads: list[threading.Thread] = []
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
         self.wake = threading.Event()
         self.stop_event = threading.Event()
         self.live = BackgroundReader("live", fetch_live, self.active, clock=clock)
@@ -3657,13 +3736,22 @@ class SummaryCache:
             return sum(len(computes) for computes in self.inflight.values())
 
     def get(self, hours: int) -> tuple[bytes, float]:
-        """The stored JSON bytes and generated_at for one range. With nothing stored, a DB-only partial is built now."""
+        """The stored JSON bytes and generated_at for one range.
+
+        With nothing stored, one request build for the range is started and this thread waits at most
+        REQUEST_WAIT_S for it. If the build has not stored a body by then (a build already running, the
+        concurrency cap, or a slow store), a small "warming up" body is returned and the page shows it as updating.
+        """
         self.touch()
-        with self.lock:
+        with self.changed:
             entry = self.bodies.get(hours)
-            generation = self._next_generation(hours)
         if entry is None:
-            entry = self._store(hours, self._build(hours, REQUEST_BUDGET_S, generation))
+            self._start_compute(hours, request=True)
+            with self.changed:
+                self.changed.wait_for(lambda: hours in self.bodies or not self.inflight.get(hours), REQUEST_WAIT_S)
+                entry = self.bodies.get(hours)
+        if entry is None:
+            return warming_body(hours), self.clock()
         return entry.body, entry.generated_at
 
     def _next_generation(self, hours: int) -> int:
@@ -3671,20 +3759,25 @@ class SummaryCache:
         self.generations[hours] = self.generations.get(hours, 0) + 1
         return self.generations[hours]
 
-    def _build(self, hours: int, budget: float, generation: int) -> Stored:
-        """One summary as JSON bytes, built with the SQLite waits bounded by ``budget`` seconds."""
+    def _build(self, hours: int, budget: float, generation: int, read_logs: bool = True) -> Stored:
+        """One summary as JSON bytes, built with the SQLite waits bounded by ``budget`` seconds.
+
+        A build without the proxy log is partial by definition: its 429 budgets are not counted.
+        """
         now = self.clock()
         with time_budget(budget):
-            summary = build_summary(self.home, hours, now=now, fetch_live=self.live.latest, laptop=self.laptop.latest())
+            summary = build_summary(
+                self.home, hours, now=now, fetch_live=self.live.latest, laptop=self.laptop.latest(), read_logs=read_logs
+            )
         summary["source_age_s"] = {"live": self.live.age(now), "laptop": self.laptop.age(now)}
         summary["cadence_s"] = RANGE_CADENCE_S[hours]
-        partial = any("time budget" in message for message in summary["errors"].values())
+        partial = not read_logs or any("time budget" in message for message in summary["errors"].values())
         summary["partial"] = partial
         return Stored(json.dumps(summary).encode("utf-8"), now, partial, generation)
 
     def _store(self, hours: int, entry: Stored) -> Stored:
         """Keep the newest generation. A partial replaces only a partial or nothing; a full body replaces any newer-generation body."""
-        with self.lock:
+        with self.changed:
             current = self.bodies.get(hours)
             if current is not None and entry.generation < current.generation:
                 return current
@@ -3695,19 +3788,26 @@ class SummaryCache:
             self.bodies[hours] = entry
             if not entry.partial:
                 self.stale_logged.discard(hours)
+            self.changed.notify_all()
             return entry
 
-    def _start_compute(self, hours: int, force: bool = False) -> bool:
-        """Start one full compute for a range on its own thread.
+    def _start_compute(self, hours: int, force: bool = False, request: bool = False) -> bool:
+        """Start one compute for a range on its own thread.
 
-        Skipped when the range already has a compute of the same kind running, or when MAX_LIVE_COMPUTES
-        are running. A forced start is subject to both limits too.
+        A request build (no body yet, a reader is waiting) runs only when the range has nothing else in flight,
+        and while it runs nothing else starts for that range, so a range never has two builds at once.
+        Otherwise at most one ordinary and one forced compute per range, and MAX_LIVE_COMPUTES in all, forced
+        starts included. Each compute takes the range's next generation.
         """
-        kind = "forced" if force else "ordinary"
+        kind = "request" if request else ("forced" if force else "ordinary")
         with self.lock:
-            if sum(len(computes) for computes in self.inflight.values()) >= MAX_LIVE_COMPUTES:
-                return False
             computes = self.inflight.setdefault(hours, set())
+            if any(compute.kind == "request" for compute in computes):
+                return False
+            if request and computes:
+                return False
+            if sum(len(running) for running in self.inflight.values()) >= MAX_LIVE_COMPUTES:
+                return False
             if any(compute.kind == kind for compute in computes):
                 return False
             compute = Compute(hours, kind, self._next_generation(hours))
@@ -3718,13 +3818,16 @@ class SummaryCache:
         return True
 
     def _run_compute(self, compute: Compute) -> None:
+        request = compute.kind == "request"
+        budget = REQUEST_BUDGET_S if request else BACKGROUND_BUDGET_S
         try:
-            self._store(compute.hours, self._build(compute.hours, BACKGROUND_BUDGET_S, compute.generation))
+            self._store(compute.hours, self._build(compute.hours, budget, compute.generation, read_logs=not request))
         except Exception as exc:
             sys.stderr.write(f"agentq dash: {compute.hours}h summary skipped: {type(exc).__name__}: {exc}\n")
         finally:
-            with self.lock:
+            with self.changed:
                 self.inflight.get(compute.hours, set()).discard(compute)
+                self.changed.notify_all()
 
     def wait_for_computes(self, timeout: float = 30.0) -> None:
         """Wait for the compute threads started so far (tests use this; the server never waits)."""
@@ -3764,6 +3867,14 @@ class SummaryCache:
             self.tick()
             self.wake.wait(WORKER_TICK_S)
             self.wake.clear()
+
+
+def warming_body(hours: int) -> bytes:
+    """What a request gets while a range has no summary yet: no figures, and the page shows "updating…"."""
+    return json.dumps({
+        "warming_up": True, "partial": True, "hours": hours, "generated_at": None,
+        "cadence_s": RANGE_CADENCE_S[hours], "errors": {},
+    }).encode("utf-8")
 
 
 def laptop_unread() -> dict:
@@ -3842,6 +3953,8 @@ class Handler(BaseHTTPRequestHandler):
 
 class DashServer(ThreadingHTTPServer):
     """The dashboard's HTTP server on 127.0.0.1, with the summary cache and its workers attached."""
+
+    request_queue_size = 64
 
     def __init__(self, address: tuple[str, int], home: Path, fetch_live) -> None:
         super().__init__(address, Handler)
