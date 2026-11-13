@@ -95,7 +95,7 @@ class ReserveMathTest(unittest.TestCase):
         reserve.sync(0.0, "m0", used=800, free=600)
         saved = reserve.snapshot()
         restored = Reserve(1000, refill_s=1800.0, wall=0.0)
-        restored.restore(saved, now=300.0)
+        restored.restore(saved, now=300.0, minute="m0", used=800, free=600)
         self.assertAlmostEqual(restored.level, 800 + 1000 * 300 / 1800)
         self.assertEqual(restored.drained, {"m0": 200.0})
 
@@ -345,6 +345,48 @@ class GovernorReserveTest(unittest.TestCase):
         self.assertFalse(newer.holds)
         self.assertEqual(newer.last_refusal, RESERVE)
         self.assertEqual(self.output_level(), 210_000)
+
+    def write_output_state(self, reserve: dict) -> None:
+        (self.home / "proxy_state.json").write_text(json.dumps({
+            "saved_at": self.wall[0],
+            "budgets": {"output": {"limit": 70_000, "target_frac": 1.0, "window_used": 170_000, "reserve": reserve}},
+        }))
+
+    def test_a_legacy_numeric_drain_is_migrated_to_its_minute_and_not_drained_twice(self) -> None:
+        self.write_output_state({"level": 110_000, "wall": self.wall[0], "minute": minute_stamp(self.wall[0]), "drained": 100_000})
+        restored = self.make_governor()
+        self.assertEqual(restored.budgets["output"].reserve.drained, {minute_stamp(self.wall[0]): 100_000.0})
+        self.assertEqual(self.gov_level(restored), 110_000)
+
+    def test_an_unparseable_drain_marks_the_current_minute_as_already_drained(self) -> None:
+        self.write_output_state({"level": 110_000, "wall": self.wall[0], "drained": "garbage"})
+        restored = self.make_governor()
+        self.assertEqual(self.gov_level(restored), 110_000)
+        self.assertEqual(restored.budgets["output"].reserve.drained, {minute_stamp(self.wall[0]): 100_000.0})
+
+    def gov_level(self, gov: Governor) -> float:
+        gov.sync_reserve(gov.budgets["output"])
+        return gov.budgets["output"].reserve.level
+
+    def test_an_oversized_backlog_head_does_not_block_backlog_that_fits_the_allowance(self) -> None:
+        oldest = self.ticket(500_000, lane="backlog", budget="uncached_ds")
+        newer = self.ticket(20_000, lane="backlog", budget="uncached_ds")
+        self.gov.enqueue(oldest)
+        self.gov.enqueue(newer)
+        self.occupy("uncached_ds", 1)
+        self.gov.pump()
+        self.assertFalse(oldest.holds)
+        self.assertEqual(oldest.last_refusal, RESERVE)
+        self.assertTrue(newer.holds)
+
+    def test_an_idle_budget_still_admits_the_oversized_backlog_head_first(self) -> None:
+        oldest = self.ticket(500_000, lane="backlog", budget="uncached_ds")
+        newer = self.ticket(20_000, lane="backlog", budget="uncached_ds")
+        self.gov.enqueue(oldest)
+        self.gov.enqueue(newer)
+        self.gov.pump()
+        self.assertTrue(oldest.holds)
+        self.assertFalse(newer.holds)
 
     def test_a_restored_reserve_target_is_clamped_to_the_morph_limit(self) -> None:
         (self.home / "proxy_state.json").write_text(json.dumps({

@@ -1027,19 +1027,32 @@ class Reserve:
             "drained": {minute: round(value, 3) for minute, value in self.drained.items()},
         }
 
-    def restore(self, data: dict, now: float) -> None:
-        """Load a saved snapshot. The level refills for the time since it was taken. The per-minute drains
-        are kept, and the next reconcile drops any minute that no longer holds charges."""
+    def restore(self, data: dict, now: float, minute: str, used: float, free: float) -> None:
+        """Load a saved snapshot. The level refills for the time since it was taken, and the saved level already
+        reflects the drains it records, so those drains must not be taken twice.
+
+        ``drained`` is a per-minute map in the current format. The previous format kept one number with the minute
+        it belonged to, which is migrated to that minute. Any other shape is treated as already drained for the
+        current minute: its overflow, ``used`` minus ``free``, is recorded so the reconcile does not drain it again.
+        """
         saved_wall = float(data.get("wall", now))
         self.level = min(self.capacity, max(0.0, float(data.get("level", self.capacity))))
         self.wall = min(saved_wall, now)
         self.refill(now)
-        drained = data.get("drained")
-        self.drained = (
-            {str(minute): max(0.0, float(value)) for minute, value in drained.items()}
-            if isinstance(drained, dict)
-            else {}
-        )
+        self.drained = self._restored_drains(data.get("drained"), data.get("minute"), minute, max(0.0, used - free))
+
+    @staticmethod
+    def _restored_drains(drained, saved_minute, minute: str, current_overflow: float) -> dict[str, float]:
+        """The per-minute drain map for a saved snapshot. See restore."""
+        try:
+            if isinstance(drained, dict):
+                return {str(key): max(0.0, float(value)) for key, value in drained.items()}
+            if isinstance(drained, (int, float)) and not isinstance(drained, bool):
+                if isinstance(saved_minute, str):
+                    return {saved_minute: max(0.0, float(drained))}
+        except (TypeError, ValueError):
+            pass
+        return {minute: current_overflow}
 
 
 @dataclass(eq=False)
@@ -1306,7 +1319,9 @@ class Governor:
             if budget.reserve is not None:
                 saved_reserve = spec.get("reserve")
                 if isinstance(saved_reserve, dict):
-                    budget.reserve.restore(saved_reserve, self.wall())
+                    budget.reserve.restore(
+                        saved_reserve, self.wall(), minute_stamp(self.wall()), self._used(budget), budget.cap()
+                    )
                 else:
                     budget.reserve.empty()
         for family, spec in (data.get("uncached_ratio") or {}).items():
@@ -1577,6 +1592,9 @@ class Governor:
                 if refusal == CAPACITY:
                     blocker.saturated = True
                     blocker.saturated_since_tick = True
+                if refusal == RESERVE and lane == "backlog":
+                    index += 1
+                    continue
                 (urgent_guarded if refusal == GUARD else blocked).add(blocker.name)
                 index += 1
 
