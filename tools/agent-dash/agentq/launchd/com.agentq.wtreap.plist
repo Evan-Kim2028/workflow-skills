@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Worktree disk janitor, every 2 hours. After the worktree sweep it runs `scratch gc ‑‑older-than-days 0.21 ‑‑apply`, which removes worker scratch folders whose runs finished and whose newest file is over 5 hours old (live, running, in-use and unowned folders are kept). Then it runs `janitor postgres ‑‑min-age 1h ‑‑apply`, which stops local Postgres servers orphaned by finished runs or killed pytest sessions (guards in dash/pgjanitor.py). Then it runs the temp janitor (dash/tempjanitor.py), which removes stale top-level entries of the user temp dir and /private/tmp that no process, postgres or checkout uses.
+  Worktree disk janitor, every 2 hours. After the worktree sweep it runs `scratch gc ‑‑older-than-days 0.21 ‑‑apply`, which removes worker scratch folders whose runs finished and sat idle for an hour, plus unmarked worker-label folders idle for 5 hours (live, running, in-use and hand-made folders are kept); the worktree sweep drops .venv and tool caches from worktrees idle for 5 hours. Then it runs `janitor postgres ‑‑min-age 1h ‑‑apply`, which stops local Postgres servers orphaned by finished runs or killed pytest sessions (guards in dash/pgjanitor.py). Then it runs the temp janitor (dash/tempjanitor.py), which removes stale top-level entries of the user temp dir and /private/tmp that no process, postgres or checkout uses.
 
   Template: __HOME__, __PYTHON__ and __REPOS__ are replaced at install
   time (the live copy is ~/Library/LaunchAgents/com.agentq.wtreap.plist;
@@ -42,7 +42,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --daily-maintenance; done; echo "== $(date -u +%FT%TZ) scratch gc"; __PYTHON__ agent_dash.py scratch gc --older-than-days 0.21 --apply; echo "== $(date -u +%FT%TZ) postgres janitor"; __PYTHON__ agent_dash.py janitor postgres --min-age 1h --apply; echo "== $(date -u +%FT%TZ) temp janitor"; __PYTHON__ agent_dash.py janitor temp --min-age 5h --apply</string>
+		<string>cd __HOME__/.claude/tools/agent-dash &amp;&amp; for r in __REPOS__; do echo "== $(date -u +%FT%TZ) $r"; __PYTHON__ agent_dash.py worktrees janitor --repo "$r" --apply --apply-cooldown 1h --min-age 4h --artifact-age 5h --daily-maintenance; done; echo "== $(date -u +%FT%TZ) scratch gc"; __PYTHON__ agent_dash.py scratch gc --older-than-days 0.21 --finished-after-hours 1 --apply; echo "== $(date -u +%FT%TZ) postgres janitor"; __PYTHON__ agent_dash.py janitor postgres --min-age 1h --apply; echo "== $(date -u +%FT%TZ) temp janitor"; __PYTHON__ agent_dash.py janitor temp --min-age 5h --apply</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
