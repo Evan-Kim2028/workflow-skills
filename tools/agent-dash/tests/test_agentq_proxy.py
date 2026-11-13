@@ -3166,3 +3166,21 @@ class LaunchAgentTest(unittest.TestCase):
         with PLIST.open("rb") as handle:
             plist = plistlib.load(handle)
         self.assertEqual(plist["ExitTimeOut"], int(DEFAULT_CONFIG["shutdown_s"]) + 15)
+
+
+class UsedByFamilyTest(unittest.TestCase):
+    """The status splits each budget's usage by model family, so the controller can read DeepSeek's share of the total."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.gov = Governor(Path(tmp.name), config_with(), log=quiet)
+
+    def test_the_families_add_up_to_the_budget_usage_and_name_each_family(self) -> None:
+        self.gov.enqueue(make_ticket(self.gov, job="ds", model=MODEL_OUT, text="x", max_tokens=8))
+        self.gov.enqueue(make_ticket(self.gov, job="kimi", model=MODEL_KIMI, text="x", max_tokens=8))
+        self.gov.pump()
+        total = self.gov.status()["budgets"]["total"]
+        self.assertEqual(sum(total["used_by_family"].values()), total["used_60s"])
+        self.assertGreater(total["used_by_family"]["morph-dsv41flash"], 0)
+        self.assertGreater(total["used_by_family"]["morph-kimik31"], 0)

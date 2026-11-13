@@ -1,6 +1,8 @@
 """DeepSeek fill controller and launch pacing.
 
-The fill controller adds filler workers while the DeepSeek 5-minute billed average is below the low mark:
+The fill controller adds filler workers while the DeepSeek billed rate is below the low mark. The rate is the lower of the
+window average (``fill.window_minutes``, default 2 complete minutes) and this minute's live projection, and the high mark
+is judged on the higher of the two, so a drop starts filling within seconds and a burst stops growth at once:
 at most ``step_workers`` every ``step_interval_s``, and only while every gate is open (proxy status
 available, no DeepSeek request blocked at the proxy, no DeepSeek 429 recently, the in-flight limit not
 binding, and the laptop within the filler bars). It stops at the high mark and never takes busy DeepSeek
@@ -44,7 +46,8 @@ FILLER_LABEL_LIKE = "%-backlog-filler-%"
 LAUNCH_PI = "launch_pi.py"
 DS_MARKERS = ("pi-deepseek-flash", DS_FAMILY)
 QUEUE_JOB_ENV = re.compile(r"AGENTQ_JOB=[0-9a-f]{12}\b")
-WINDOW_MINUTES = 5
+LIVE_MIN_ELAPSED_S = 15.0
+LIVE_BUDGET = "total"
 MINUTE_S = 60.0
 PS_TIMEOUT_S = 10.0
 MEASURED_CLAMP = (10_000, 200_000)
@@ -53,6 +56,7 @@ MINUTE_GATE_BUDGETS = ("output", UNCACHED_BUDGET)
 
 DEFAULT_FILL = {
     "enabled": False,
+    "window_minutes": 2,
     "target_billed_per_min": 8_000_000,
     "max_workers": 64,
     "low_frac": 0.9,
@@ -95,13 +99,55 @@ def section(override, defaults: dict) -> dict:
     return out
 
 
-def filling_state(was_filling: bool, avg: float, target: float, low_frac: float, high_frac: float) -> bool:
-    """Hysteresis: start filling below the low mark, stop above the high mark, keep the state between."""
-    if avg < low_frac * target:
+def filling_decision(was_filling: bool, window_avg: float, live_rate: float | None, target: float, low_frac: float,
+                     high_frac: float) -> bool:
+    """Hysteresis on the window average and the live projection.
+
+    The window average is the rate over complete minutes, so after a sudden drop it still reads high for up to two minutes,
+    and a burst it has not yet seen still reads low. When the live projection is outside the band, it decides: below the
+    low mark starts filling, at or above the high mark stops it. Inside the band the window decides: below the low mark
+    starts filling (the lower of the two signals is below it), at or above the high mark stops it (the higher of the two is
+    at or above it). With no live projection the window average alone decides. Between the marks the state is kept.
+    """
+    low, high = low_frac * target, high_frac * target
+    if live_rate is not None:
+        if live_rate < low:
+            return True
+        if live_rate >= high:
+            return False
+    if window_avg < low:
         return True
-    if avg >= high_frac * target:
+    if window_avg >= high:
         return False
     return was_filling
+
+
+def filling_state(was_filling: bool, avg: float, target: float, low_frac: float, high_frac: float) -> bool:
+    """Hysteresis on one signal (the window average alone)."""
+    return filling_decision(was_filling, avg, None, target, low_frac, high_frac)
+
+
+def live_projection(status: dict | None, fill: dict | None = None) -> float | None:
+    """This calendar minute's DeepSeek billed rate, projected to a full minute, or None when there is no projection.
+
+    The projection is the DeepSeek family's usage in the total budget this minute, times 60 over the seconds elapsed.
+    It needs the calendar window (``seconds_to_reset`` tells the elapsed time) and at least LIVE_MIN_ELAPSED_S of it,
+    so the first seconds of a minute, where a projection swings, are ignored.
+    """
+    budget = ((status or {}).get("budgets") or {}).get(LIVE_BUDGET) if isinstance(status, dict) else None
+    if not isinstance(budget, dict) or budget.get("window_mode") != "calendar":
+        return None
+    to_reset = budget.get("seconds_to_reset")
+    by_family = budget.get("used_by_family")
+    if not isinstance(to_reset, (int, float)) or not isinstance(by_family, dict):
+        return None
+    elapsed = MINUTE_S - min(max(float(to_reset), 0.0), MINUTE_S)
+    if elapsed < LIVE_MIN_ELAPSED_S:
+        return None
+    used = by_family.get(DS_FAMILY)
+    if not isinstance(used, (int, float)):
+        return None
+    return float(used) * MINUTE_S / elapsed
 
 
 def ds_blocked(status: dict | None) -> int:
@@ -253,8 +299,9 @@ class FillController:
         return controller
 
     def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int, filler_busy: int,
-             ready_real: int, queued_filler: int, gate: str | None) -> FillPlan:
-        """One decision. ``active`` counts busy DeepSeek workers (real and filler); ``filler_busy`` and
+             ready_real: int, queued_filler: int, gate: str | None, live_rate: float | None = None) -> FillPlan:
+        """One decision. ``billed_avg`` is the window average; ``live_rate`` is the current minute's projection (None
+        before LIVE_MIN_ELAPSED_S). ``active`` counts busy DeepSeek workers (real and filler); ``filler_busy`` and
         ``queued_filler`` count the filler population."""
         if not fill["enabled"]:
             self.filling = False
@@ -266,11 +313,13 @@ class FillController:
         population = filler_busy + queued_filler
         target = float(fill["target_billed_per_min"])
         low, high = fill["low_frac"] * target, fill["high_frac"] * target
-        self.filling = filling_state(self.filling, billed_avg, target, fill["low_frac"], fill["high_frac"])
+        self.filling = filling_decision(self.filling, billed_avg, live_rate, target, fill["low_frac"], fill["high_frac"])
         if self.level is None:
             self.level = population
         self.level = min(self.level, max_workers)
-        average = f"5-min average {billed_avg / 1e6:.2f}M/min"
+        average = f"{int(fill['window_minutes'])}-min average {billed_avg / 1e6:.2f}M/min"
+        if live_rate is not None:
+            average += f", this minute projects {live_rate / 1e6:.2f}M/min"
         if not self.filling:
             self.level = min(population, max_workers)
             self.gate_since = None
@@ -324,6 +373,7 @@ class Decision:
 
     plan: FillPlan
     billed_avg: float
+    live_rate: float | None
     active_now: int
     direct_ds: int | None
     running_ds: int
@@ -349,7 +399,9 @@ def decide(
     counts = job_counts(conn, now)
     direct = direct_ds_workers(ps_text) if fill["enabled"] else None
     active = counts["running_ds"] + (direct or 0)
-    billed_avg = sum(row["billed"] for row in minute_rows(conn, now, WINDOW_MINUTES).values()) / WINDOW_MINUTES
+    window = int(fill["window_minutes"])
+    billed_avg = sum(row["billed"] for row in minute_rows(conn, now, window).values()) / window
+    live_rate = live_projection(status, fill)
     recent = recent_429(conn, now, fill["gate_429_window_s"])
     gate = gate_reason(status, recent, laptop, laptop_cfg, fill)
     if fill["enabled"] and direct is None and gate is None:
@@ -357,12 +409,12 @@ def decide(
     plan = controller.tick(
         now, fill=fill, paused=paused, billed_avg=billed_avg, active=active,
         filler_busy=counts["running_filler"], ready_real=counts["ready_real"], queued_filler=counts["queued_filler"],
-        gate=gate,
+        gate=gate, live_rate=live_rate,
     )
     current, source, pending = pacing_inputs(conn, now, status, pacing)
     left, cost = pacing_allowance(current, pending, pacing, measured)
     return Decision(
-        plan=plan, billed_avg=billed_avg, active_now=active, direct_ds=direct,
+        plan=plan, billed_avg=billed_avg, live_rate=live_rate, active_now=active, direct_ds=direct,
         running_ds=counts["running_ds"], ready_real=counts["ready_real"], queued_filler=counts["queued_filler"],
         running_filler=counts["running_filler"], recent_429=recent, gate=gate, pacing_current=current,
         pacing_pending=pending, pacing_source=source, pacing_left=left, pacing_cost=cost,
@@ -570,7 +622,8 @@ def main(argv=None, out=None) -> int:
     plan = decision.plan
     print(f"fill enabled={fill['enabled']} target={fill['target_billed_per_min']:,}/min "
           f"low={fill['low_frac'] * fill['target_billed_per_min']:,.0f} high={fill['high_frac'] * fill['target_billed_per_min']:,.0f}", file=out)
-    print(f"DeepSeek billed 5-min average {decision.billed_avg:,.0f}/min; busy {decision.active_now} "
+    live = "no live projection yet" if decision.live_rate is None else f"live projection {decision.live_rate:,.0f}/min"
+    print(f"DeepSeek billed {fill['window_minutes']}-min average {decision.billed_avg:,.0f}/min, {live}; busy {decision.active_now} "
           f"(queue {decision.running_ds}, filler {decision.running_filler}, direct {decision.direct_ds})", file=out)
     print(f"ready real {decision.ready_real}; queued filler {decision.queued_filler}; "
           f"gate: {decision.gate or 'open'}; DeepSeek 429s in gate window {decision.recent_429}", file=out)

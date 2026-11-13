@@ -113,6 +113,85 @@ class MinuteGateTests(unittest.TestCase):
         self.assertIn("429", F.gate_reason(self.status(output=1_000), 1, None, LAPTOP, FILL))
 
 
+def total_status(used_ds, seconds_to_reset, used_other=0, window_mode="calendar"):
+    """A proxy status whose calendar total budget holds ``used_ds`` DeepSeek and ``used_other`` other tokens."""
+    return {"budgets": {"total": {
+        "queued": {}, "blocked_by_family": {}, "used_60s": used_ds + used_other,
+        "used_by_family": {"morph-dsv41flash": used_ds, "other": used_other},
+        "window_mode": window_mode, "seconds_to_reset": seconds_to_reset,
+    }}}
+
+
+class LiveSignalTests(unittest.TestCase):
+    """The live projection (this minute's DeepSeek rate, scaled to a full minute) and how the controller uses it."""
+
+    def test_the_projection_scales_this_minutes_use_to_a_full_minute(self):
+        self.assertEqual(F.live_projection(total_status(1_000_000, 45), FILL), 4_000_000)
+
+    def test_no_projection_before_fifteen_seconds_of_the_minute(self):
+        self.assertIsNone(F.live_projection(total_status(1_000_000, 50), FILL))
+        self.assertIsNotNone(F.live_projection(total_status(1_000_000, 45), FILL))
+
+    def test_no_projection_without_the_calendar_window_or_its_fields(self):
+        self.assertIsNone(F.live_projection(total_status(1_000_000, 45, window_mode="rolling"), FILL))
+        self.assertIsNone(F.live_projection({"budgets": {"total": {"window_mode": "calendar"}}}, FILL))
+        self.assertIsNone(F.live_projection(None, FILL))
+
+    def test_other_families_do_not_count_toward_the_deepseek_projection(self):
+        self.assertEqual(F.live_projection(total_status(0, 45, used_other=9_000_000), FILL), 0)
+
+    def test_a_sudden_drop_starts_a_step_within_one_tick_after_fifteen_seconds(self):
+        ctl = F.FillController()
+        minute = NOW
+        for second in range(0, 15, 2):
+            plan = tick(ctl, minute + second, 9_000_000, 10, filler=0, fill=dict(FILL, window_minutes=2))
+            self.assertEqual(plan.key, "high-mark", f"second {second}")
+        seen = []
+        for second in range(15, 31, 2):
+            live = F.live_projection(total_status(1_000_000, 60 - second), FILL)
+            plan = ctl.tick(minute + second, fill=FILL, paused=False, billed_avg=9_000_000, active=10,
+                            filler_busy=0, ready_real=0, queued_filler=0, gate=None, live_rate=live)
+            seen.append((second, plan.key))
+            if plan.key == "stepping":
+                break
+        self.assertEqual(seen[-1][1], "stepping")
+        self.assertLessEqual(seen[-1][0], 17)
+
+    def test_a_burst_above_the_high_mark_stops_steps_in_the_same_minute(self):
+        ctl = F.FillController()
+        first = ctl.tick(NOW, fill=FILL, paused=False, billed_avg=5_000_000, active=10, filler_busy=0, ready_real=0,
+                         queued_filler=0, gate=None, live_rate=None)
+        self.assertEqual(first.key, "stepping")
+        burst = ctl.tick(NOW + 20, fill=FILL, paused=False, billed_avg=5_000_000, active=14, filler_busy=4,
+                         ready_real=0, queued_filler=0, gate=None,
+                         live_rate=F.live_projection(total_status(9_000_000, 40), FILL))
+        self.assertEqual((burst.submit, burst.key), (0, "high-mark"))
+
+    def test_the_window_average_alone_decides_before_any_projection(self):
+        ctl = F.FillController()
+        self.assertEqual(tick(ctl, NOW, 5_000_000, 10).key, "stepping")
+        self.assertEqual(tick(F.FillController(), NOW, 9_000_000, 10).key, "high-mark")
+
+    def test_the_window_minutes_setting_is_honoured_by_the_store_average(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = db.connect(Path(tmp.name))
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE IF NOT EXISTS proxy_minutes (minute TEXT, model TEXT, input INT, cache_read INT,"
+                     " output INT, r429 INT, PRIMARY KEY (minute, model))")
+        for k in (1, 2, 3, 4, 5):
+            conn.execute("INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?)",
+                         (stamp(NOW - 60 * k), DS_MODEL, 1_000_000, 0, 0, 0))
+        status = {"budgets": {"total": {"queued": {}, "blocked_by_family": {}}}}
+        common = dict(controller=F.FillController(), pacing=PACING, status=status, ps_text="",
+                      laptop=None, laptop_cfg=LAPTOP, paused=False, measured=None)
+        two = F.decide(conn, NOW, fill=dict(FILL, window_minutes=2), **common)
+        five = F.decide(conn, NOW, fill=dict(FILL, window_minutes=5), **common)
+        self.assertEqual(two.billed_avg, 1_000_000)
+        self.assertEqual(five.billed_avg, 1_000_000)
+        self.assertEqual(F.DEFAULT_FILL["window_minutes"], 2)
+
+
 class LaptopGateTests(unittest.TestCase):
     def test_laptop_cpu_memory_and_swap_hold_at_the_filler_bars(self):
         self.assertIn("memory free 10% < 20%", F.gate_reason(status_doc(), 0, reading(free=10.0), LAPTOP, FILL))
@@ -501,7 +580,7 @@ class StoreTest(unittest.TestCase):
             laptop=CALM, laptop_cfg=LAPTOP, paused=False, measured=None,
         )
         self.assertEqual((decision.plan.submit, decision.plan.key), (4, "stepping"))
-        self.assertEqual(decision.billed_avg, 20_000)
+        self.assertEqual(decision.billed_avg, 50_000)
         self.assertEqual(decision.direct_ds, 0)
         self.assertEqual(decision.pacing_current, 100_000)
         self.assertEqual(decision.pacing_source, "proxy")
