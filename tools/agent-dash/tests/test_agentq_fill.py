@@ -122,6 +122,53 @@ def total_status(used_ds, seconds_to_reset, used_other=0, window_mode="calendar"
     }}}
 
 
+class MinutePressureTests(unittest.TestCase):
+    """The minute gate reads the worst of this minute's partial count, its projection, and the last complete minute, and
+    holds while a DeepSeek burst reserve is below half."""
+
+    def budget(self, used, free=68_600, to_reset=None, reserve=None):
+        entry = {"used_60s": used, "free": free, "limit": 70_000, "target_frac": 0.98, "window_mode": "calendar"}
+        if to_reset is not None:
+            entry["seconds_to_reset"] = to_reset
+        if reserve is not None:
+            entry["reserve"] = reserve
+        return {"budgets": {"output": entry}}
+
+    def test_a_low_partial_count_holds_when_the_last_minute_was_over_the_allowance(self):
+        reason = F.minute_gate(self.budget(used=3_000, to_reset=57), last_minute={"output": 90_000})
+        self.assertIsNotNone(reason)
+        self.assertIn("last minute 90,000", reason)
+        self.assertIsNone(F.minute_gate(self.budget(used=3_000, to_reset=57), last_minute={"output": 30_000}))
+
+    def test_a_projection_over_the_allowance_holds(self):
+        reason = F.minute_gate(self.budget(used=30_000, to_reset=40))
+        self.assertIsNotNone(reason)
+        self.assertIn("projected 90,000", reason)
+
+    def test_a_projection_under_the_allowance_does_not_hold(self):
+        self.assertIsNone(F.minute_gate(self.budget(used=20_000, to_reset=40)))
+
+    def test_no_projection_is_used_before_fifteen_seconds_of_the_minute(self):
+        self.assertIsNone(F.minute_gate(self.budget(used=30_000, to_reset=50)))
+
+    def test_a_burst_reserve_below_half_holds_filler(self):
+        reason = F.minute_gate(self.budget(used=1_000, reserve={"level": 90_000, "capacity": 210_000}))
+        self.assertIsNotNone(reason)
+        self.assertIn("reserve at 90,000 of 210,000", reason)
+        self.assertIsNone(F.minute_gate(self.budget(used=1_000, reserve={"level": 110_000, "capacity": 210_000})))
+
+    def test_the_last_complete_minute_comes_from_the_store(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = db.connect(Path(tmp.name))
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE IF NOT EXISTS proxy_minutes (minute TEXT, model TEXT, input INT, cache_read INT,"
+                     " output INT, r429 INT, PRIMARY KEY (minute, model))")
+        conn.execute("INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?)", (stamp(NOW - 60), DS_MODEL, 50_000, 0, 80_000, 0))
+        conn.execute("INSERT INTO proxy_minutes VALUES (?,?,?,?,?,?)", (stamp(NOW), DS_MODEL, 1, 0, 9_000, 0))
+        self.assertEqual(F.last_minute_ds(conn, NOW), {"output": 80_000, "input": 50_000})
+
+
 class LiveSignalTests(unittest.TestCase):
     """The live projection (this minute's DeepSeek rate, scaled to a full minute) and how the controller uses it."""
 

@@ -196,15 +196,56 @@ def inflight_gate(status: dict) -> str | None:
     return None
 
 
-def minute_gate(status: dict | None) -> str | None:
-    """Hold filler while a DeepSeek per-minute budget (output or uncached input) has used its free allowance this
-    calendar minute. Usage past the free allowance would drain the burst reserve, which only real work may spend,
-    so filler waits at the allowance. The allowance is the budget's ``free`` field (limit times target), with
-    limit times target_frac as the fallback for a proxy that does not report it. None when clear or unreadable."""
+RESERVE_FLOOR_FRAC = 0.5
+MINUTE_GATE_FIELDS = {"output": "output", UNCACHED_BUDGET: "input"}
+
+
+def minute_projection(budget: dict) -> float | None:
+    """This calendar minute's use of one budget, projected to a full minute, or None before LIVE_MIN_ELAPSED_S of it.
+
+    Only a calendar budget has a current minute (``seconds_to_reset`` gives the elapsed time)."""
+    used = budget.get("used_60s")
+    to_reset = budget.get("seconds_to_reset")
+    if budget.get("window_mode") != "calendar" or not isinstance(used, (int, float)):
+        return None
+    if not isinstance(to_reset, (int, float)):
+        return None
+    elapsed = MINUTE_S - min(max(float(to_reset), 0.0), MINUTE_S)
+    if elapsed < LIVE_MIN_ELAPSED_S:
+        return None
+    return float(used) * MINUTE_S / elapsed
+
+
+def last_minute_ds(conn, now: float) -> dict[str, int]:
+    """DeepSeek output and uncached input summed over the last complete UTC minute, keyed as MINUTE_GATE_FIELDS
+    values. Empty when the store has no proxy rows (the proxy never ran)."""
+    stamp = minute_stamp(math.floor(now / 60) * 60 - MINUTE_S)
+    try:
+        row = conn.execute(
+            "SELECT SUM(output), SUM(input) FROM proxy_minutes WHERE model LIKE ? AND minute = ?",
+            (DS_MODEL_LIKE, stamp),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if row is None or (row[0] is None and row[1] is None):
+        return {}
+    return {"output": int(row[0] or 0), "input": int(row[1] or 0)}
+
+
+def minute_gate(status: dict | None, last_minute: dict | None = None) -> str | None:
+    """Hold filler while a DeepSeek per-minute budget (output or uncached input) is at or past its free allowance, or
+    while its burst reserve is below half its capacity. Usage past the free allowance drains the reserve, which only real
+    work may spend, so filler waits.
+
+    The pressure on each budget is the largest of this minute's partial count, its live projection (from 15 seconds into
+    the minute), and the last complete minute's DeepSeek total from the store. The partial count alone reads low early in a
+    minute, so a heavy last minute still holds. The allowance is the budget's ``free`` field, with limit times target_frac
+    as the fallback. None when clear or unreadable."""
     budgets = (status or {}).get("budgets") if isinstance(status, dict) else None
     if not isinstance(budgets, dict):
         return None
-    for name in MINUTE_GATE_BUDGETS:
+    last_minute = last_minute or {}
+    for name, field in MINUTE_GATE_FIELDS.items():
         budget = budgets.get(name)
         if not isinstance(budget, dict):
             continue
@@ -217,14 +258,25 @@ def minute_gate(status: dict | None) -> str | None:
             free = limit * frac
         if not isinstance(used, (int, float)) or free <= 0:
             continue
-        if used >= free:
-            return (f"Morph gate: {name} budget at {used:,.0f} this minute, at its {free:,.0f} free allowance "
+        projected = minute_projection(budget)
+        history = last_minute.get(field)
+        pressure = max(v for v in (float(used), projected, history) if v is not None)
+        if pressure >= free:
+            return (f"Morph gate: {name} budget at {pressure:,.0f} (this minute {used:,.0f}, projected "
+                    f"{projected or 0:,.0f}, last minute {history or 0:,.0f}), at its {free:,.0f} free allowance "
                     f"(reserve kept for real work)")
+        reserve = budget.get("reserve")
+        if isinstance(reserve, dict):
+            level, capacity = reserve.get("level"), reserve.get("capacity")
+            if isinstance(level, (int, float)) and isinstance(capacity, (int, float)) and capacity > 0 \
+                    and level < RESERVE_FLOOR_FRAC * capacity:
+                return (f"Morph gate: {name} reserve at {level:,.0f} of {capacity:,.0f}, below half; filler stays "
+                        f"off the reserve")
     return None
 
 
 def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headroom | None, laptop_cfg: dict,
-                fill: dict) -> str | None:
+                fill: dict, last_minute: dict | None = None) -> str | None:
     """Why filler must wait now, or None. Any one of these holds filler: the proxy status is unavailable,
     DeepSeek requests blocked at the proxy, a DeepSeek 429 in the recent window (output 429s included: the
     proxy's per-budget 429 record is in its log, not its status), a DeepSeek output or uncached per-minute budget at its free allowance,
@@ -238,7 +290,7 @@ def gate_reason(status: dict | None, recent_429: int, laptop: headroom_lib.Headr
         return f"Morph gate: {blocked} DeepSeek requests waiting at the proxy"
     if recent_429 > 0:
         return f"Morph gate: {recent_429} DeepSeek 429s in the last {int(fill['gate_429_window_s'])} s"
-    minute = minute_gate(status)
+    minute = minute_gate(status, last_minute)
     if minute is not None:
         return minute
     slow = inflight_gate(status)
@@ -403,7 +455,7 @@ def decide(
     billed_avg = sum(row["billed"] for row in minute_rows(conn, now, window).values()) / window
     live_rate = live_projection(status, fill)
     recent = recent_429(conn, now, fill["gate_429_window_s"])
-    gate = gate_reason(status, recent, laptop, laptop_cfg, fill)
+    gate = gate_reason(status, recent, laptop, laptop_cfg, fill, last_minute_ds(conn, now))
     if fill["enabled"] and direct is None and gate is None:
         gate = "worker count unknown (ps failed); filler waits"
     plan = controller.tick(
