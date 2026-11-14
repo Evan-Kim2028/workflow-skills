@@ -737,3 +737,23 @@ class GuardShimTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KillShimTests(unittest.TestCase):
+    """pkill and killall are refused for workers and logged."""
+
+    def run_kill_shim(self, name, args, env_extra=None):
+        home = Path(tempfile.mkdtemp())
+        env = dict(os.environ, AGENTQ_HOME=str(home))
+        env.update(env_extra or {})
+        shim = Path(__file__).resolve().parents[1] / "agentq" / "shims" / name
+        result = subprocess.run(["sh", str(shim), *args], env=env, capture_output=True, text=True, timeout=30)
+        return result, home / "guard_blocks.tsv"
+
+    def test_pkill_and_killall_are_refused_and_logged(self):
+        for name in ("pkill", "killall"):
+            with self.subTest(name=name):
+                result, log = self.run_kill_shim(name, ["-f", "x", "-P", "1"])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("BLOCKED: agentq guard", result.stderr)
+                self.assertIn(f"{name} refused", log.read_text())
