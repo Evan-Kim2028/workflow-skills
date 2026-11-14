@@ -1068,7 +1068,7 @@ class TargetCeilingTest(unittest.TestCase):
         return Governor(self.home, config, clock=lambda: self.now[0], log=quiet)
 
     def test_tick_raises_past_one_and_stops_at_the_ceiling(self) -> None:
-        gov = self.governor(legacy_config(fast_until=0.9))
+        gov = self.governor(legacy_config(fast_until=0.9, target_ceiling=1.5))
         output = gov.budgets["output"]
         output.target = 1.4
         output.saturated = True
@@ -1081,7 +1081,7 @@ class TargetCeilingTest(unittest.TestCase):
         self.assertEqual(output.target, 1.5)
 
     def test_tick_stops_at_one_when_an_older_config_has_no_ceiling(self) -> None:
-        config = legacy_config(fast_until=0.9)
+        config = legacy_config(fast_until=0.9, target_ceiling=1.5)
         del config["target_ceiling"]
         gov = self.governor(config)
         output = gov.budgets["output"]
@@ -1092,7 +1092,7 @@ class TargetCeilingTest(unittest.TestCase):
         self.assertEqual(output.target, 1.0)
 
     def test_429_above_one_cuts_by_target_cut(self) -> None:
-        gov = self.governor(legacy_config())
+        gov = self.governor(legacy_config(target_ceiling=1.5))
         gov.budgets["output"].target = 1.4
         gov.learn_from_429(make_ticket(gov, max_tokens=800), "Limit: 60000 output tokens/minute.")
         self.assertAlmostEqual(gov.budgets["output"].target, 1.4 * 0.97, places=6)
@@ -1100,9 +1100,29 @@ class TargetCeilingTest(unittest.TestCase):
     def test_state_file_target_clamps_to_floor_and_ceiling(self) -> None:
         state = {"budgets": {"output": {"target_frac": 1.3}, "total": {"target_frac": 9.0}}}
         (self.home / "proxy_state.json").write_text(json.dumps(state))
-        gov = self.governor(legacy_config())
+        gov = self.governor(legacy_config(target_ceiling=1.5))
         self.assertEqual(gov.budgets["output"].target, 1.3)
         self.assertEqual(gov.budgets["total"].target, 1.5)
+
+    def test_default_ceiling_is_98_percent_of_the_window_limit(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["target_ceiling"], 0.98)
+        gov = self.governor(legacy_config())
+        output = gov.budgets["output"]
+        output.target = 0.97
+        output.saturated = True
+        self.now[0] += 60
+        gov.tick()
+        self.assertEqual(output.target, 0.98)
+        for _ in range(5):
+            self.now[0] += 60
+            gov.tick()
+        self.assertEqual(output.target, 0.98)
+
+    def test_default_total_budget_is_rolling_whatever_the_global_mode(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG["budgets"]["total"]["window_mode"], "rolling")
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 45, window_mode="calendar")
+        self.assertEqual(gov.budgets["total"].window_mode, "rolling")
+        self.assertEqual(gov.budgets["output"].window_mode, "calendar")
 
 
 class StateTest(unittest.TestCase):
@@ -1707,7 +1727,7 @@ class CalendarWindowTest(unittest.TestCase):
         self.home = Path(tmp.name)
 
     def test_calendar_used_resets_at_the_next_utc_minute(self) -> None:
-        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, window_mode="calendar")
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, budgets={"total": {"window_mode": "calendar"}})
         ticket = make_ticket(gov, text="x" * 400)
         admit(gov, ticket)
         gov.finish_ok(ticket, {"prompt_tokens": 100, "completion_tokens": 50})
@@ -1728,7 +1748,7 @@ class CalendarWindowTest(unittest.TestCase):
         self.assertEqual(gov.budgets["total"].window_mode, "rolling")
 
     def test_a_full_calendar_budget_retries_at_the_next_minute(self) -> None:
-        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, window_mode="calendar", budgets={"total": {"limit": 1000}})
+        gov, clocks = timed_governor(self.home, WALL_MINUTE_START + 50, budgets={"total": {"window_mode": "calendar", "limit": 1000}})
         first = make_ticket(gov, text="x" * 400)
         admit(gov, first)
         refused = make_ticket(gov, text="x" * 400)
@@ -1769,10 +1789,12 @@ class CalendarWindowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             timed_governor(self.home, WALL_MINUTE_START, window_mode="hourly")
         with self.assertRaises(ValueError):
+            timed_governor(self.home, WALL_MINUTE_START, budgets={"total": {"window_mode": "hourly"}})
+        with self.assertRaises(ValueError):
             timed_governor(self.home, WALL_MINUTE_START, budgets={"total": {"charge_basis": "guess"}})
 
     def test_status_reports_window_mode_basis_and_seconds_to_reset(self) -> None:
-        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 45, window_mode="calendar")
+        gov, _ = timed_governor(self.home, WALL_MINUTE_START + 45, budgets={"total": {"window_mode": "calendar"}})
         budgets = gov.status()["budgets"]
         self.assertEqual(budgets["total"]["window_mode"], "calendar")
         self.assertEqual(budgets["total"]["charge_basis"], "billed")

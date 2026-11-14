@@ -18,11 +18,10 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agentq"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from proxy import PROXY_MINUTES_DDL
-
-import dash
+from agentq import dash
+from agentq.proxy import PROXY_MINUTES_DDL
 
 NOW = float(calendar.timegm((2026, 11, 12, 12, 0, 30)))
 UNTIL = int(NOW // 60) * 60
@@ -2059,7 +2058,7 @@ class FillerHeadlineTest(unittest.TestCase):
     def test_read_fill_defaults_when_broker_json_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fill = dash.read_fill(Path(tmp))
-        self.assertEqual(fill, {"enabled": False, "target_billed_per_min": 8_000_000.0, "low_frac": 0.9})
+        self.assertEqual(fill, {"enabled": False, "target_billed_per_min": 9_400_000.0, "low_frac": 0.9})
 RANGE_AGES = (30 * 60, 2 * 3600, 10 * 3600, 3 * 24 * 3600)
 
 

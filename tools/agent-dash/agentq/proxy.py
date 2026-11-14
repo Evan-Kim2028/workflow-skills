@@ -94,7 +94,7 @@ DEFAULT_CONFIG = {
     "window_s": 60.0,
     "start_target": 0.98,
     "target_floor": 0.6,
-    "target_ceiling": 1.5,
+    "target_ceiling": 0.98,
     "target_cut": 0.97,
     "target_step_up": 0.02,
     "fast_until": 1.5,
@@ -123,7 +123,7 @@ DEFAULT_CONFIG = {
     "log_backups": LOG_BACKUPS,
     "reserve_refill_s": RESERVE_REFILL_S,
     "budgets": {
-        "total": {"limit_type": "total", "limit": 10_000_000},
+        "total": {"limit_type": "total", "limit": 10_000_000, "window_mode": "rolling"},
         "output": {
             "limit_type": "output", "limit": 70_000, "model_prefix": "morph-dsv41flash",
             "window_mode": "calendar", "reserve": 210_000,
@@ -1232,6 +1232,8 @@ class Governor:
         start = clock()
         hold_s = float(config["give_up_s"]) + float(config["upstream_idle_s"])
         self.budgets: dict[str, Budget] = {}
+        if config["window_mode"] not in WINDOW_MODES:
+            raise ValueError(f"window_mode must be one of {WINDOW_MODES}, not {config['window_mode']!r}")
         for name, spec in config["budgets"].items():
             window_mode = spec.get("window_mode", config["window_mode"])
             charge_basis = spec.get("charge_basis", config["charge_basis"])
@@ -1958,7 +1960,8 @@ class Governor:
         """Raise a target while its budget is saturated and no 429 has come recently.
 
         Below the fast cap the target climbs by fast_step_up every fast_interval_s. The fast cap is
-        fast_until, or the budget's fast_limit (the target a 429 cut left) when that is lower. Above
+        fast_until, or the budget's fast_limit (the target a 429 cut left) when that is lower, and never above
+        target_ceiling. Above
         the fast cap the target climbs by target_step_up once per full window, up to target_ceiling.
         A budget with no 429 for FAST_LIMIT_QUIET_S loses its fast_limit. Saturation counts if the
         current pump or any pump since the last tick marked the budget.

@@ -357,16 +357,16 @@ class ControllerTests(unittest.TestCase):
         self.assertLessEqual(peak, 64)
 
     def test_the_high_mark_stops_steps(self):
-        plan = tick(F.FillController(), NOW, 8_000_000, 60)
+        plan = tick(F.FillController(), NOW, 9_400_000, 60)
         self.assertEqual((plan.filling, plan.submit, plan.key), (False, 0, "high-mark"))
 
     def test_hysteresis_keeps_filling_between_the_marks(self):
         fresh = F.FillController()
-        self.assertEqual(tick(fresh, NOW, 7_500_000, 40).key, "high-mark")
+        self.assertEqual(tick(fresh, NOW, 9_200_000, 40).key, "high-mark")
         ctl = F.FillController()
-        self.assertEqual(tick(ctl, NOW, 7_000_000, 40).key, "stepping")
-        self.assertEqual(tick(ctl, NOW + 200, 7_500_000, 44).key, "stepping")
-        self.assertEqual(tick(ctl, NOW + 400, 7_800_000, 44).key, "high-mark")
+        self.assertEqual(tick(ctl, NOW, 8_000_000, 40).key, "stepping")
+        self.assertEqual(tick(ctl, NOW + 200, 8_800_000, 44).key, "stepping")
+        self.assertEqual(tick(ctl, NOW + 400, 9_200_000, 44).key, "high-mark")
 
     def test_real_work_ready_goes_first(self):
         self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, ready_real=2).key, "real-ready")
@@ -457,7 +457,7 @@ class LevelTests(unittest.TestCase):
     def test_the_high_mark_sets_the_level_to_the_current_filler_count(self):
         ctl = F.FillController()
         ctl.level = 40
-        plan = tick(ctl, NOW, 8_000_000, 25, filler=25)
+        plan = tick(ctl, NOW, 9_400_000, 25, filler=25)
         self.assertEqual((plan.submit, plan.key), (0, "high-mark"))
         self.assertEqual(ctl.level, 25)
 
