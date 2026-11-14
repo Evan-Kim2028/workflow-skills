@@ -461,6 +461,9 @@ def main_branch_now(repo: str | Path) -> str | None:
     return name or None
 
 
+RELEASE_SEGMENT = os.sep + os.path.join("agent-dash", "releases") + os.sep
+
+
 def decide(
     repo: str | Path,
     entry: dict,
@@ -483,6 +486,9 @@ def decide(
         return row
     if path == top:
         row["reason"] = "is the main checkout"
+        return row
+    if RELEASE_SEGMENT in str(path) + os.sep:
+        row["reason"] = "agent-dash deploy release (releases/CURRENT and PREVIOUS run from these)"
         return row
     if branch in skips or path in skips:
         row["reason"] = "on the skip list"

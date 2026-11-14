@@ -251,6 +251,13 @@ class ReapDecisionsTest(unittest.TestCase):
         self.assertFalse(Path(path).exists())
         self.assertEqual(git(repo, "branch", "--list").count("\n"), 0)
 
+    def test_deploy_release_worktree_is_always_kept(self):
+        """A detached release under agent-dash/releases is kept even when its commit is on main."""
+        entry = {"path": "/home/u/.local/share/agent-dash/releases/abc123", "head": "abc123", "branch": None}
+        row = worktrees.decide("/repo", entry, "/repo", "main", 0.0, set(), time.time())
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("deploy release", row["reason"])
+
     def test_detached_with_own_commit_is_kept(self):
         """A detached HEAD carrying a commit main lacks is kept."""
         repo = self._repo()
