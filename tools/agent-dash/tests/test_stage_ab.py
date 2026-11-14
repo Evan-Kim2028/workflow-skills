@@ -299,3 +299,14 @@ class DryRunCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnvPairsTest(unittest.TestCase):
+    """--control-env / --treatment-env pairs become environment entries."""
+
+    def test_pairs_parse(self):
+        self.assertEqual(SA.parse_env_pairs(["A=1", "B=x=y"]), {"A": "1", "B": "x=y"})
+
+    def test_malformed_pair_raises(self):
+        with self.assertRaises(ValueError):
+            SA.parse_env_pairs(["nope"])

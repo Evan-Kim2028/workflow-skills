@@ -312,42 +312,30 @@ class SkillsArgsTest(unittest.TestCase):
 
 
 class ToolOutputTrimArgsTest(unittest.TestCase):
-    """Workers load the bash-output trim extension unless AGENTQ_TOOL_OUTPUT_CAP=0."""
+    """The bash-output trim extension is opt-in: only a positive AGENTQ_TOOL_OUTPUT_CAP loads it."""
 
     EXT = LP.TOOL_OUTPUT_EXTENSION
 
-    def test_default_loads_the_trim_extension_by_absolute_path(self):
-        self.assertEqual(LP.tool_output_args({}), ["-e", str(self.EXT)])
+    def test_default_is_off(self):
+        self.assertEqual(LP.tool_output_args({}), [])
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": ""}), [])
+
+    def test_zero_and_junk_are_off(self):
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "0"}), [])
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "lots"}), [])
+
+    def test_a_positive_cap_loads_it_by_absolute_path(self):
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "8000"}), ["-e", str(self.EXT)])
         self.assertTrue(Path(str(self.EXT)).is_absolute())
         self.assertTrue(self.EXT.is_file())
 
-    def test_cap_zero_turns_it_off(self):
-        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "0"}), [])
-        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": " 0 "}), [])
-
-    def test_a_nonzero_cap_keeps_it_on(self):
-        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "4000"}), ["-e", str(self.EXT)])
-
     def test_a_missing_file_is_skipped_not_passed(self):
-        self.assertEqual(LP.tool_output_args({}, extension=Path("/nonexistent/trim.ts")), [])
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "8000"}, extension=Path("/nonexistent/trim.ts")), [])
 
-    def test_build_argv_carries_the_flag_by_default_and_not_with_cap_zero(self):
+    def test_build_and_resume_argv_follow_the_setting(self):
         with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": ""}):
-            argv = LP.build_argv("lbl", "/ws", "/p.md", "/out", "m", None)
-        at = argv.index(str(self.EXT))
-        self.assertEqual(argv[at - 1], "-e")
-        self.assertLess(at, argv.index(LP.BRIEF_MESSAGE))
-        with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": "0"}):
             self.assertNotIn(str(self.EXT), LP.build_argv("lbl", "/ws", "/p.md", "/out", "m", None))
-            self.assertNotIn(str(self.EXT), LP.build_resume_argv("/s.jsonl", "/out", "m", "/p.md"))
-
-    def test_resume_argv_carries_the_flag_too(self):
-        with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": ""}):
-            self.assertIn(str(self.EXT), LP.build_resume_argv("/s.jsonl", "/out", "m", "/p.md"))
-
-    def test_the_pilot_extension_stays_alongside_it(self):
-        with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": ""}):
+        with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": "8000"}):
             argv = LP.build_argv("lbl", "/ws", "/p.md", "/out", "m", "/pilot.ts")
-        self.assertIn("/pilot.ts", argv)
-        self.assertIn(str(self.EXT), argv)
-        self.assertEqual(argv.count("-e"), 2)
+            self.assertEqual(argv.count("-e"), 2)
+            self.assertIn(str(self.EXT), LP.build_resume_argv("/s.jsonl", "/out", "m", "/p.md"))

@@ -395,16 +395,20 @@ TOOL_OUTPUT_EXTENSION = ROOT / "agentq" / "pi-ext" / "trim-tool-output.ts"
 
 
 def tool_output_args(environ=None, extension=TOOL_OUTPUT_EXTENSION):
-    """``-e`` for the bash-output trim extension; nothing when ``AGENTQ_TOOL_OUTPUT_CAP=0`` or the file is absent.
+    """``-e`` for the bash-output trim extension, only when ``AGENTQ_TOOL_OUTPUT_CAP`` is a positive number.
 
-    The extension replaces a bash result longer than the cap with its head and tail and keeps the full text
-    under ``$AGENT_SCRATCH/tool-output/``. A checkout without the file (the main checkout before this lands)
-    launches without it instead of failing on a missing extension.
+    Off by default: a staging A/B on 8 replayed read jobs (2026-11-14) showed lower context per request
+    but more turns and 27% more tokens in total, so the trim is opt-in until a change makes it a clear win.
+    The extension replaces a bash result longer than the cap with its head and tail and keeps the full
+    text under ``$AGENT_SCRATCH/tool-output/``. A checkout without the file launches without it.
     """
     environ = os.environ if environ is None else environ
-    if (environ.get(TOOL_OUTPUT_ENV) or "").strip() == "0":
-        return []
-    return ["-e", str(extension)] if extension.is_file() else []
+    raw = (environ.get(TOOL_OUTPUT_ENV) or "").strip()
+    try:
+        on = int(raw) > 0
+    except ValueError:
+        on = False
+    return ["-e", str(extension)] if on and extension.is_file() else []
 
 
 def build_argv(label, workspace, prompt_file, outdir, model, extension=None, thinking=None):

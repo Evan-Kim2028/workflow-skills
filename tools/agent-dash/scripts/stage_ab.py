@@ -220,6 +220,17 @@ def build_command(code_dir, label, workspace, prompt_file, outdir, model, tier):
             "--model", model, "--tier", tier]
 
 
+def parse_env_pairs(pairs):
+    """``KEY=VALUE`` strings from --control-env / --treatment-env as a dict; a malformed pair raises ValueError."""
+    out = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            raise ValueError(f"expected KEY=VALUE, got {pair!r}")
+        out[key] = value
+    return out
+
+
 def build_env(base, home, key, scratch, dash_state):
     """The child environment: a separate queue home and dash state, the arm's proxy key, and a scratch folder.
 
@@ -464,6 +475,7 @@ def run_task(task, args, home, dash_state, out_dir, staging):
     argv = build_command(args.control_code if arm == "control" else args.treatment_code, label,
                          worktree, task["prompt_path"], run_dir, task["model"], task["tier"])
     env = build_env(os.environ, home, key, scratch, dash_state)
+    env.update(parse_env_pairs(args.control_env if arm == "control" else args.treatment_env))
     rc, timed_out, wall = run_arm(argv, env, worktree, run_dir / "harness-stdout.txt", args.timeout_min * 60)
     result.update(rc=rc, timed_out=timed_out, wall_s=wall, verdict=read_verdict(run_dir, label))
     result["status"] = "timeout" if timed_out else ("done" if rc == 0 else f"exit {rc}")
@@ -496,6 +508,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Replay finished jobs through two launcher code dirs.")
     parser.add_argument("--control-code", required=True, help="agent-dash root for the control arm")
     parser.add_argument("--treatment-code", required=True, help="agent-dash root for the treatment arm")
+    parser.add_argument("--control-env", action="append", default=[], metavar="KEY=VALUE",
+                        help="extra environment for control runs (repeatable)")
+    parser.add_argument("--treatment-env", action="append", default=[], metavar="KEY=VALUE",
+                        help="extra environment for treatment runs (repeatable), e.g. AGENTQ_TOOL_OUTPUT_CAP=8000")
     parser.add_argument("--jobs", type=int, default=4, help="how many jobs to replay (default 4)")
     parser.add_argument("--job-ids", default="", help="comma-separated job ids to replay instead of choosing")
     parser.add_argument("--arms", default="control,treatment", help="comma-separated arms to run (smoke runs use control)")
