@@ -104,11 +104,13 @@ LIVE_TIMEOUT_S = 2.0
 RANGE_CADENCE_S = {1: 5.0, 6: 5.0, 24: 15.0, 168: 60.0}
 READER_CADENCE_S = 5.0
 IDLE_AFTER_S = 120.0
+IDLE_REFRESH_S = 60.0
 WORKER_TICK_S = 1.0
 REQUEST_BUDGET_S = 0.8
 REQUEST_WAIT_S = 0.5
 BACKGROUND_BUDGET_S = 30.0
 WATCHDOG_FACTOR = 3.0
+STALE_WAIT_S = 3.0
 MAX_LIVE_COMPUTES = 4
 GONE_LOG_S = 60.0
 DB_TIMEOUT_S = 2.0
@@ -642,7 +644,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   var RANGE_LABEL = { 1: "last 1 h", 6: "last 6 h", 24: "last 24 h", 168: "last 7 d" };
   var NAME_RANGE = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
   var COLORS = { s1: "var(--s1)", s2: "var(--s2)", s3: "var(--s3)", ink: "var(--ink)", muted: "var(--ink-3)", kimiQueue: "#8a6cc0" };
-  var state = { hours: 6, data: null, seq: 0, lastFetch: 0, stale: null, timer: null, warming: false };
+  var state = { hours: 6, data: null, seq: 0, lastFetch: 0, stale: null, timer: null, warming: false, staleRetries: 0 };
+  var STALE_RETRY_MAX = 5;
+  var STALE_RETRY_MS = 1000;
   var log = { source: "proxy", page: 1, q: "", seq: 0, data: null, qTimer: null, fetchedAt: 0 };
   var charts = [];
   var tables = {};
@@ -1198,7 +1202,11 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var l = cx - barW / 2, rt = cx + barW / 2;
       var d = "M" + l + "," + base + " L" + l + "," + (top + r) + " Q" + l + "," + top + " " + (l + r) + "," + top +
         " L" + (rt - r) + "," + top + " Q" + rt + "," + top + " " + rt + "," + (top + r) + " L" + rt + "," + base + " Z";
-      svgEl("path", { d: d, fill: cfg.series[0].color }, svg);
+      if (p.partial) {
+        svgEl("path", { d: d, fill: cfg.series[0].color, "fill-opacity": 0.22, stroke: cfg.series[0].color, "stroke-width": 1.25, "stroke-dasharray": "3 2" }, svg);
+      } else {
+        svgEl("path", { d: d, fill: cfg.series[0].color }, svg);
+      }
     });
 
     var line = points.map(function (p, idx) {
@@ -1219,13 +1227,15 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       band.setAttribute("x", X(p.t));
       band.setAttribute("visibility", "visible");
       var head = (cfg.tickFmt || hm)(p.t) + " \u2013 " + hm(p.t + cfg.bucket_s);
-      fillTip(tip, head, [
+      var lines = [
         { color: cfg.series[0].color, text: "Total: " + fmtTokens(p.total) },
         { color: null, text: "Cache read: " + fmtTokens(p.cache_read) + " (" + shareText(p.cache_read, p.total) + ")" },
         { color: null, text: "Uncached input: " + fmtTokens(p.uncached) + " (" + shareText(p.uncached, p.total) + ")" },
         { color: null, text: "Output: " + fmtTokens(p.output) + " (" + shareText(p.output, p.total) + ")" },
         { color: COLORS.muted, text: "Cumulative (right axis): " + fmtTokens(p.cumulative) }
-      ]);
+      ];
+      if (p.partial) lines.unshift({ color: null, text: "So far, " + p.minutes + " of " + p.bucket_minutes + " min" });
+      fillTip(tip, head, lines);
       placeTip(tip, W, center(p), 8);
     }
     function hide() {
@@ -1841,6 +1851,18 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     }
   }
 
+  function retryIfStale(data) {
+    if (typeof data.generated_at !== "number" || !data.cadence_s) return;
+    var age = Date.now() / 1000 - data.generated_at;
+    if (age <= 2 * data.cadence_s) {
+      state.staleRetries = 0;
+      return;
+    }
+    if (state.staleRetries >= STALE_RETRY_MAX) return;
+    state.staleRetries += 1;
+    setTimeout(refresh, STALE_RETRY_MS);
+  }
+
   function refresh() {
     var seq = ++state.seq;
     var hours = state.hours;
@@ -1863,6 +1885,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         state.stale = null;
         if (unchanged) renderStatus();
         else render(data);
+        retryIfStale(data);
       })
       .catch(function (err) {
         if (seq !== state.seq) return;
@@ -2873,8 +2896,12 @@ TOKEN_KINDS = ("cache_read", "uncached", "output")
 TOKEN_AXIS_MULTIPLES = (1, 2, 2.5, 5)
 
 
-def token_mix(minutes: list[dict]) -> list[dict]:
-    """Billed tokens per interval (cache read, uncached input and output) plus the running total from the range start."""
+def token_mix(minutes: list[dict], bucket_s: int = 60) -> list[dict]:
+    """Billed tokens per interval (cache read, uncached input and output) plus the running total from the range start.
+
+    The newest interval is marked ``partial`` with the minutes it covers when it holds fewer than ``bucket_s / 60``
+    minutes, so the chart can draw the still-filling bucket as partial rather than as a full one.
+    """
     running = 0
     mix = []
     for point in minutes:
@@ -2882,6 +2909,8 @@ def token_mix(minutes: list[dict]) -> list[dict]:
         total = sum(parts.values())
         running += total
         mix.append({"t": point["t"], "minute": point["minute"], "total": total, **parts, "cumulative": running})
+    if mix and minutes[-1]["minutes"] < bucket_s // 60:
+        mix[-1].update(partial=True, minutes=minutes[-1]["minutes"], bucket_minutes=bucket_s // 60)
     return mix
 
 
@@ -3689,7 +3718,7 @@ def build_summary(
     minutes = bucket_minutes(minute_points, bucket)
     token_bucket = TOKEN_BUCKET_S[hours]
     token_minutes = bucket_minutes(minute_points, token_bucket)
-    mix = token_mix(token_minutes)
+    mix = token_mix(token_minutes, token_bucket)
     totals = token_totals(mix)
     limit = token_limit(resolved["total"], token_bucket)
     axes = token_axes(mix, limit)
@@ -3942,7 +3971,9 @@ class SummaryCache:
     with no stored body gets a DB-only partial summary, computed under REQUEST_BUDGET_S. A watchdog starts a
     forced compute for any range whose data is older than WATCHDOG_FACTOR times its cadence. At most one
     ordinary and one forced compute per range run at a time, and at most MAX_LIVE_COMPUTES in all, forced
-    starts included. Nothing is computed while nobody has asked for the page in IDLE_AFTER_S.
+    starts included. Once nobody has asked for the page in IDLE_AFTER_S, the worker recomputes a range only when
+    its body is older than max(cadence, IDLE_REFRESH_S), and the live and laptop readers stay stopped. A request
+    that finds a body older than WATCHDOG_FACTOR times its cadence waits up to STALE_WAIT_S for a fresh one.
     """
 
     def __init__(self, home: Path, fetch_live=fetch_live_status, clock=time.time) -> None:
@@ -4006,9 +4037,27 @@ class SummaryCache:
             with self.changed:
                 self.changed.wait_for(lambda: hours in self.bodies or not self.inflight.get(hours), REQUEST_WAIT_S)
                 entry = self.bodies.get(hours)
+        elif self.clock() - entry.generated_at > WATCHDOG_FACTOR * RANGE_CADENCE_S[hours]:
+            entry = self._refetch_stale(hours, entry)
         if entry is None:
             return warming_body(hours), self.clock()
         return entry.body, entry.generated_at
+
+    def _refetch_stale(self, hours: int, stale: Stored) -> Stored:
+        """Start a forced compute for a body past WATCHDOG_FACTOR x cadence and wait up to STALE_WAIT_S for a newer body.
+
+        Returns the newer body when one is stored in time, else the stale body.
+        """
+        self._start_compute(hours, force=True)
+        with self.changed:
+            self.changed.wait_for(lambda: self._newer_than(hours, stale.generated_at), STALE_WAIT_S)
+            current = self.bodies.get(hours)
+        return current if current is not None and current.generated_at > stale.generated_at else stale
+
+    def _newer_than(self, hours: int, generated_at: float) -> bool:
+        """Caller holds the lock."""
+        current = self.bodies.get(hours)
+        return current is not None and current.generated_at > generated_at
 
     def _next_generation(self, hours: int) -> int:
         """Caller holds the lock."""
@@ -4091,9 +4140,12 @@ class SummaryCache:
             worker.join(timeout)
 
     def tick(self) -> None:
-        """One worker pass: start the computes that are due, and run the watchdog. Never blocks on a compute."""
-        if not self.active():
-            return
+        """One worker pass: start the computes that are due, and run the watchdog. Never blocks on a compute.
+
+        While idle a range is due only once its body is older than max(cadence, IDLE_REFRESH_S), and the watchdog
+        stays off, so an idle dashboard costs one compute per range each IDLE_REFRESH_S at most.
+        """
+        active = self.active()
         now = self.clock()
         for hours in RANGE_HOURS:
             if self.stop_event.is_set():
@@ -4102,6 +4154,10 @@ class SummaryCache:
             with self.lock:
                 entry = self.bodies.get(hours)
             age = None if entry is None else now - entry.generated_at
+            if not active:
+                if entry is None or age >= max(cadence, IDLE_REFRESH_S):
+                    self._start_compute(hours)
+                continue
             if entry is None or entry.partial or age >= cadence:
                 self._start_compute(hours)
             if age is not None and age > WATCHDOG_FACTOR * cadence:
