@@ -348,7 +348,8 @@ class ShimEndToEndTests(Base):
             "from agentq import slots; print('busy', len(slots.holders('%s', 'pytest', 16)))\""
         ) % self.home
         self.fake_binary("pytest", child + "\n")
-        result = subprocess.run([str(SHIMS / "pytest"), "-q"], env=self.shim_env({"AGENTQ_MEMCAPPED": "1"}),
+        result = subprocess.run([str(SHIMS / "pytest"), "-q", "tests/x.py"],
+                                env=self.shim_env({"AGENTQ_MEMCAPPED": "1"}),
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("busy 1", result.stdout)
@@ -356,7 +357,7 @@ class ShimEndToEndTests(Base):
 
     def test_nested_pytest_inside_a_held_pytest_does_not_wait_for_a_slot(self):
         self.fake_binary("pytest", "echo nested-ok\n")
-        result = subprocess.run([str(SHIMS / "pytest")], env=self.shim_env({"AGENTQ_SLOT_HELD": "pytest",
+        result = subprocess.run([str(SHIMS / "pytest"), "tests/x.py"], env=self.shim_env({"AGENTQ_SLOT_HELD": "pytest",
                                                                              "AGENTQ_MEMCAPPED": "1"}),
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0)
@@ -434,7 +435,7 @@ class ShellFastPathTests(Base):
     def copied_shims(self):
         folder = self.bin / "shims-copy"
         folder.mkdir()
-        for name in ("python", "python3", "uv", "ssh", "pytest", "shim-lib.sh"):
+        for name in ("python", "python3", "uv", "ssh", "pytest", "sleep", "shim-lib.sh"):
             shutil.copy(SHIMS / name, folder / name)
         marker = self.home / "dispatch-ran"
         (folder / "dispatch.py").write_text(
@@ -466,6 +467,22 @@ class ShellFastPathTests(Base):
         marker.unlink(missing_ok=True)
         self.run_shim(folder, "uv", ["sync"])
         self.assertFalse(marker.exists())
+
+    def test_guard_words_reach_dispatch_and_other_argv_does_not(self):
+        folder, marker = self.copied_shims()
+        for name, args in (("uv", ["run", "pyright"]), ("uv", ["run", "scripts/lor-ci-local.sh"]),
+                           ("python3", ["scripts/validate.sh"]), ("uv", ["run", "pre-commit", "run", "-a"]),
+                           ("uv", ["run", "pyright", "a.py"]), ("python3", ["scripts/select_pytests.py", "--all"]),
+                           ("sleep", ["5"])):
+            with self.subTest(name=name, args=args):
+                marker.unlink(missing_ok=True)
+                self.run_shim(folder, name, args)
+                self.assertTrue(marker.exists())
+        for name, args in (("uv", ["run", "ruff", "check"]), ("python3", ["scripts/tool.py", "validate"])):
+            with self.subTest(name=name, args=args):
+                marker.unlink(missing_ok=True)
+                self.run_shim(folder, name, args)
+                self.assertFalse(marker.exists())
 
     def test_shell_shim_refuses_to_recurse_into_itself(self):
         folder, _ = self.copied_shims()
@@ -523,6 +540,198 @@ class SshHostsFileTests(Base):
 
     def test_file_is_empty_without_configuration(self):
         self.assertEqual(slots.write_ssh_hosts(self.home).read_text(), "")
+
+
+class GuardDecisionTests(unittest.TestCase):
+    """The guard's refusal decisions for each argv shape, with no process started."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name) / "tests"
+        self.dir.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def assertRefused(self, name, args, fragment):
+        found = dispatch.refusal(name, list(args), {})
+        self.assertIsNotNone(found, f"{name} {args} should be refused")
+        self.assertIn(fragment, found[0])
+        self.assertTrue(found[1].startswith("BLOCKED: agentq guard: "), found[1])
+
+    def assertAllowed(self, name, args):
+        self.assertIsNone(dispatch.refusal(name, list(args), {}), f"{name} {args} should pass")
+
+    def test_pytest_without_a_test_target_is_refused(self):
+        self.assertRefused("pytest", [], "no test target")
+        self.assertRefused("pytest", ["-q"], "no test target")
+        self.assertRefused("pytest", ["-k", "test_a"], "no test target")
+        self.assertRefused("python3", ["-m", "pytest"], "no test target")
+        self.assertRefused("uv", ["run", "pytest", "-q"], "no test target")
+        self.assertRefused("uv", ["run", "python", "-m", "pytest"], "no test target")
+
+    def test_directory_targets_are_refused_even_with_a_filter(self):
+        self.assertRefused("pytest", ["-k", "test_a", str(self.dir)], "is a directory")
+        self.assertRefused("pytest", ["tests/"], "is a directory")
+        self.assertRefused("python3", ["-m", "pytest", "-m", "unit", str(self.dir)], "is a directory")
+
+    def test_more_than_25_test_files_are_refused(self):
+        self.assertRefused("pytest", [f"t{i}.py" for i in range(26)], "names 26 test files")
+        self.assertAllowed("pytest", [f"t{i}.py" for i in range(25)])
+
+    def test_explicit_test_targets_pass(self):
+        self.assertAllowed("pytest", ["tests/test_a.py"])
+        self.assertAllowed("pytest", ["tests/test_a.py::test_x"])
+        self.assertAllowed("pytest", ["-q", "a.py", "b.py"])
+        self.assertAllowed("pytest", ["-k", "tests", "a.py"])
+        self.assertAllowed("python3", ["-m", "pytest", "tests/test_a.py::TestA::test_b"])
+        self.assertAllowed("uv", ["run", "pytest", "tests/test_a.py"])
+        self.assertAllowed("uv", ["run", "--no-sync", "python", "-m", "pytest", "tests/test_a.py"])
+
+    def test_full_gates_are_refused_through_uv_and_python(self):
+        self.assertRefused("uv", ["run", "scripts/lor-ci-local.sh"], "full gate lor-ci-local.sh")
+        self.assertRefused("uv", ["run", "scripts/ci-local.sh"], "full gate ci-local.sh")
+        self.assertRefused("python3", ["scripts/validate.sh"], "full gate validate.sh")
+        self.assertRefused("uv", ["run", "--no-sync", "scripts/validate.sh"], "full gate validate.sh")
+        self.assertRefused("uv", ["run", "pre-commit", "run", "--all-files"], "whole-repo")
+        self.assertRefused("uv", ["run", "pre-commit", "run", "-a"], "whole-repo")
+        self.assertRefused("python3", ["scripts/select_pytests.py", "--all"], "select_pytests.py --all")
+
+    def test_pyright_without_file_arguments_is_refused(self):
+        self.assertRefused("uv", ["run", "pyright"], "whole repo")
+        self.assertRefused("uv", ["run", "pyright", "--outputjson"], "whole repo")
+        self.assertRefused("uv", ["run", "pyright", "-p", "pyproject.toml"], "whole repo")
+
+    def test_targeted_pyright_pre_commit_and_selection_pass(self):
+        self.assertAllowed("uv", ["run", "pyright", "a.py"])
+        self.assertAllowed("uv", ["run", "pyright", "--outputjson", "a.py"])
+        self.assertAllowed("uv", ["run", "pyright", "-p", "pyproject.toml", "a.py"])
+        self.assertAllowed("uv", ["run", "pre-commit", "run"])
+        self.assertAllowed("python3", ["scripts/select_pytests.py", "tests/x.py"])
+
+    def test_non_python_shims_never_match_gate_words(self):
+        self.assertAllowed("ssh", ["prod-box", "pyright"])
+
+    def test_sleep_up_to_120_seconds_passes(self):
+        self.assertAllowed("sleep", ["5"])
+        self.assertAllowed("sleep", ["120"])
+        self.assertAllowed("sleep", ["2m"])
+        self.assertAllowed("sleep", ["--help"])
+
+    def test_sleep_over_120_seconds_is_refused_with_the_babysitting_message(self):
+        found = dispatch.refusal("sleep", ["121"], {})
+        self.assertEqual(found[0], "sleep 121 s refused")
+        self.assertEqual(
+            found[1],
+            "BLOCKED: agentq guard: sleep 121 s refused; workers never babysit. Launch long work detached, "
+            "write a status file, and return its PID and paths in your report.",
+        )
+        self.assertIn("sleep 180 s refused", dispatch.refusal("sleep", ["3m"], {})[0])
+
+    def test_refusal_message_ends_with_the_scoped_command(self):
+        found = dispatch.refusal("pytest", [], {})
+        self.assertTrue(found[1].endswith(
+            "Run only the test files for the code you changed: pytest <file.py> [...]"), found[1])
+
+    def test_agentq_guard_zero_disables_every_refusal(self):
+        env = {"AGENTQ_GUARD": "0"}
+        self.assertIsNone(dispatch.refusal("pytest", [], env))
+        self.assertIsNone(dispatch.refusal("uv", ["run", "pyright"], env))
+        self.assertIsNone(dispatch.refusal("sleep", ["300"], env))
+
+
+class GuardShimTests(Base):
+    """End to end through the real shims: a refusal exits 2, logs one line, and never runs the command."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = Path(self._tmp.name) / "work"
+        (self.work / "tests").mkdir(parents=True)
+        self.log = self.home / dispatch.GUARD_LOG
+        for name in ("pytest", "python3", "uv", "sleep"):
+            self.fake_binary(name, f'echo "$@" >> "{self.bin / (name + ".ran")}"\n')
+
+    def run_shim(self, name, args, extra=None):
+        return subprocess.run([str(SHIMS / name), *args], cwd=self.work, env=self.shim_env(extra),
+                              capture_output=True, text=True, timeout=60)
+
+    def ran(self, name):
+        return (self.bin / (name + ".ran")).exists()
+
+    def log_lines(self):
+        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+
+    def test_bare_pytest_is_refused_and_logged(self):
+        result = self.run_shim("pytest", ["-q"], {"AGENTQ_JOB": "ws9-exec-x"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("BLOCKED: agentq guard: pytest has no test target", result.stderr)
+        self.assertFalse(self.ran("pytest"))
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1)
+        epoch, job, reason, command = lines[0].split("\t")
+        self.assertTrue(epoch.isdigit())
+        self.assertEqual(job, "ws9-exec-x")
+        self.assertIn("no test target", reason)
+        self.assertEqual(command, "pytest -q")
+
+    def test_python_directory_target_is_refused(self):
+        result = self.run_shim("python3", ["-m", "pytest", "tests"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is a directory", result.stderr)
+        self.assertFalse(self.ran("python3"))
+
+    def test_uv_full_gate_is_refused(self):
+        result = self.run_shim("uv", ["run", "scripts/lor-ci-local.sh"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("BLOCKED: agentq guard: full gate lor-ci-local.sh", result.stderr)
+        self.assertFalse(self.ran("uv"))
+
+    def test_uv_pyright_without_files_is_refused(self):
+        result = self.run_shim("uv", ["run", "pyright"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("pyright with no file arguments", result.stderr)
+
+    def test_long_sleep_is_refused_and_logged_with_its_label(self):
+        result = self.run_shim("sleep", ["300"], {"AGENTQ_JOB": "ws9-exec-x"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("BLOCKED: agentq guard: sleep 300 s refused; workers never babysit.", result.stderr)
+        self.assertFalse(self.ran("sleep"))
+        self.assertEqual(self.log_lines()[0].split("\t")[1], "ws9-exec-x")
+
+    def test_short_sleep_execs_the_real_sleep(self):
+        result = self.run_shim("sleep", ["5"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / "sleep.ran").read_text().split(), ["5"])
+        self.assertEqual(self.log_lines(), [])
+
+    def test_targeted_runs_pass_through_to_the_real_command(self):
+        self.assertEqual(self.run_shim("python3", ["-m", "pytest", "tests/test_a.py::test_x"]).returncode, 0)
+        self.assertEqual(self.run_shim("uv", ["run", "pyright", "a.py"]).returncode, 0)
+        self.assertTrue(self.ran("python3") and self.ran("uv"))
+        self.assertEqual(self.log_lines(), [])
+
+    def test_agentq_guard_zero_runs_the_refused_command(self):
+        result = self.run_shim("pytest", [], {"AGENTQ_GUARD": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.ran("pytest"))
+        self.assertEqual(self.log_lines(), [])
+
+    def test_a_failed_log_write_never_fails_the_refusal(self):
+        self.log.mkdir()
+        result = self.run_shim("sleep", ["300"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("BLOCKED:", result.stderr)
+
+    def test_logged_command_is_truncated_to_300_characters(self):
+        self.run_shim("pytest", ["-k", "x" * 400])
+        command = self.log_lines()[0].split("\t")[3]
+        self.assertEqual(len(command), 300)
+        self.assertTrue(command.startswith("pytest -k xxx"))
+
+    def test_each_refusal_appends_one_line(self):
+        self.run_shim("sleep", ["300"])
+        self.run_shim("pytest", [])
+        self.assertEqual(len(self.log_lines()), 2)
 
 
 if __name__ == "__main__":

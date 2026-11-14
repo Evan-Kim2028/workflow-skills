@@ -1,0 +1,5 @@
+#!/bin/sh
+# agentq PATH shim for sleep: always dispatched; dispatch.py refuses sleeps over 120 s and execs the real sleep otherwise.
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+shim_dispatch sleep "$@"

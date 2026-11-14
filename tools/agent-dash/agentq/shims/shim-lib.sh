@@ -33,6 +33,13 @@ shim_real() {
     fi
 }
 
+shim_guarded_word() {
+    case $1 in
+        pytest|pyright|pre-commit|*ci-local.sh|*validate.sh|*select_pytests.py) return 0 ;;
+    esac
+    return 1
+}
+
 shim_dispatch() {
     exec "${AGENTQ_SHIM_PYTHON:-/usr/bin/python3}" -I "$SHIM_HERE/dispatch.py" "$@"
 }

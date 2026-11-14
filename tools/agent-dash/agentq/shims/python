@@ -3,7 +3,7 @@
 case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
 . "$SHIM_HERE/shim-lib.sh"
 for _arg in "$@"; do
-    if [ "$_arg" = pytest ]; then
+    if shim_guarded_word "$_arg"; then
         shim_dispatch "${0##*/}" "$@"
     fi
 done
