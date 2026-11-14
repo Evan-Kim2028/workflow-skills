@@ -210,6 +210,75 @@ class StoreTest(unittest.TestCase):
         )
         self.assertEqual(self.store.data_seq, seq)
 
+    def test_usage_batch_rebuilds_each_hour_once(self):
+        def row(message, ts, tokens):
+            return {
+                "ts": ts,
+                "session_id": "s",
+                "run_id": "claude-main:s:main",
+                "model": "claude-opus-5-5",
+                "tool": "claude",
+                "message_id": message,
+                "input": tokens,
+                "output": 10,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+
+        rows = [row("m%d" % i, 100 + i, 1000 + i) for i in range(4)]
+        rows.append(row("m0", 4000, 1000))
+        calls = []
+        real = self.store._rebuild_hour
+        self.store._rebuild_hour = lambda hour: (calls.append(hour), real(hour))[1]
+        self.store.add_usage_batch(rows)
+        self.assertEqual(sorted(calls), [0, 3600])
+        buckets = self.store._conn.execute(
+            "SELECT hour_ts, input_tokens FROM usage_buckets ORDER BY hour_ts"
+        ).fetchall()
+        self.assertEqual(
+            [(b["hour_ts"], b["input_tokens"]) for b in buckets],
+            [(0, 1001 + 1002 + 1003), (3600, 1000)],
+        )
+        count = self.store._conn.execute("SELECT COUNT(*) AS n FROM usage_events").fetchone()["n"]
+        self.assertEqual(count, 4)
+
+    def test_usage_batch_matches_the_per_row_path(self):
+        def row(message, ts, tokens):
+            return {
+                "ts": ts,
+                "session_id": "s",
+                "run_id": "claude-main:s:main",
+                "model": "claude-opus-5-5",
+                "tool": "claude",
+                "message_id": message,
+                "input": tokens,
+                "output": 10,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+            }
+
+        rows = [row("m%d" % i, 100 + i, 1000 + i) for i in range(4)]
+        rows.append(row("m1", 110, 2000))
+        rows.append(row("m2", 3700, 1))
+        for item in rows:
+            self.store.add_usage(dict(item))
+        per_row = self.store._conn.execute(
+            "SELECT hour_ts, model, workstream, tool, input_tokens, output_tokens,"
+            " cache_read, cache_write, reasoning, missing, cost_usd FROM usage_buckets"
+            " ORDER BY hour_ts, model, workstream, tool"
+        ).fetchall()
+        self.store.close()
+        self.store = memory(Path(self.tmp.name) / "batch")
+        self.store.add_usage_batch([dict(item) for item in rows])
+        batched = self.store._conn.execute(
+            "SELECT hour_ts, model, workstream, tool, input_tokens, output_tokens,"
+            " cache_read, cache_write, reasoning, missing, cost_usd FROM usage_buckets"
+            " ORDER BY hour_ts, model, workstream, tool"
+        ).fetchall()
+        self.assertEqual([tuple(r) for r in per_row], [tuple(r) for r in batched])
+
     def test_unpriced_usage(self):
         self.store.upsert_run(
             {

@@ -10,11 +10,13 @@ import os
 
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
+import builtins
 import importlib.util
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -762,6 +764,100 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["verdict"], "PASS")
         self.assertNotIn("pi:%s:%s" % (label, label), self.store.runs)
+
+
+class IncrementalPollTest(SourceTest):
+    """A poll with nothing new reads no file and writes no run row."""
+
+    def opened(self, fn):
+        paths = []
+        real = builtins.open
+
+        def counting(path, *args, **kwargs):
+            paths.append(str(path))
+            return real(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", counting):
+            fn()
+        return paths
+
+    def test_second_poll_with_no_changes_opens_no_file(self):
+        label = "ws15-exec-quiet"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(FIXTURE.read_bytes())
+        (self.pad / ("out-%s.md" % label)).write_text("PASS\n", encoding="utf-8")
+        self.poll()
+        self.assertEqual(len(self.store.usage), 2)
+        paths = self.opened(lambda: self.poll(1_800_000_002.0))
+        self.assertEqual(paths, [])
+        self.assertEqual(len(self.store.usage), 2)
+
+    def test_growing_stream_is_read_on_the_next_poll(self):
+        label = "ws15-exec-grow"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        stream = self.pad / ("stream-%s.ndjson" % label)
+        stream.write_bytes(FIXTURE.read_bytes())
+        self.poll()
+        self.assertEqual(len(self.store.usage), 2)
+        extra = json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "MORE"}],
+                    "model": DEEPSEEK_ID,
+                    "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0},
+                    "timestamp": 1792679200000,
+                },
+            }
+        ).encode() + b"\n"
+        with stream.open("ab") as fh:
+            fh.write(extra)
+        self.poll(1_800_000_002.0)
+        self.assertEqual(len(self.store.usage), 3)
+        self.assertIn(f"{SID}-3", [mid for _rid, mid in self.store.usage])
+
+    def test_run_folder_and_pi_twin_emit_one_row_per_poll(self):
+        label = "ws15-exec-twin"
+        run_dir = self.scratch / "enc" / SID / "scratchpad"
+        (run_dir / "pi-sessions.tsv").write_text(
+            HEADER + "%s\t%s\t1792000000\t%s\n" % (label, SID, DEEPSEEK), encoding="utf-8"
+        )
+        self.write_tsv([[label, MORPH_SID, 1792000000, MORPH]])
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(MORPH_FIXTURE.read_bytes())
+        (self.pad / ("out-%s.md" % label)).write_text("PASS\n", encoding="utf-8")
+        writes = []
+        real = self.store.upsert_run
+
+        def counting(row):
+            writes.append(row["run_id"])
+            real(row)
+
+        self.store.upsert_run = counting
+        self.poll()
+        self.assertEqual(writes, [self.run_id(label, MORPH_SID)])
+        writes.clear()
+        self.poll(1_800_000_002.0)
+        self.assertEqual(writes, [])
+
+    def test_settled_run_is_not_matched_against_the_process_listing(self):
+        label = "ws15-exec-settled"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / ("out-%s.md" % label)).write_text("PASS\n", encoding="utf-8")
+        calls = []
+        with mock.patch.object(pi, "_process_apply", lambda store, run, procs: calls.append(run["run_id"])):
+            self.poll()
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.runs[self.run_id(label)]["status"], "done")
+
+    def test_open_run_is_still_matched_against_the_process_listing(self):
+        label = "ws15-exec-open"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        calls = []
+        with mock.patch.object(pi, "_process_apply", lambda store, run, procs: calls.append(run["run_id"])):
+            self.poll()
+        self.assertEqual(calls, [self.run_id(label)])
+        self.assertEqual(self.store.runs[self.run_id(label)]["status"], "unknown")
 
 
 class ProcessLivenessTest(unittest.TestCase):

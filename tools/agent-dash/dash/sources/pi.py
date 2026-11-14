@@ -111,8 +111,108 @@ def _poll(store, cfg, now):
     processes = _agent_processes()
     seen = _seen(store)
     per_file, budget = _grok._budgets(cfg)
+    usage: list = []
+    for row, stream_sid, folds in _collapse(rows):
+        budget = _upsert_run(
+            store,
+            row,
+            processes,
+            seen,
+            budget,
+            per_file,
+            now,
+            stream_sid=stream_sid,
+            folds=folds,
+            usage=usage,
+        )
+    _flush_usage(store, usage)
+
+
+_UNSET = object()
+
+
+def _collapse(rows):
+    """One row per run: the launcher's ``pi/`` row beats the run-folder twin.
+
+    ``run_worker.py`` writes a manifest row in the run folder and
+    ``launch_pi.py`` writes one in ``<run_dir>/pi/``. Both resolve to the
+    same stream session id, so they are one run, but their pads differ and
+    the emitted ``out_path``/``started_at``/``tier`` did not: the two rows
+    overwrote one run row twice per poll, so the emit cache never matched
+    and every poll rewrote ~2,250 rows. One row per run is emitted here and
+    its twin's fields fill any gap; a dropped twin's pre-generated session
+    id is still folded onto the stream run.
+    """
+    order = []
+    groups: dict = {}
     for row in rows.values():
-        budget = _upsert_run(store, row, processes, seen, budget, per_file, now)
+        stream_sid = _stream_session(row["pad"], row["label"])
+        sid = stream_sid or row.get("sid") or row["label"]
+        key = "pi:%s:%s" % (sid, row["label"])
+        item = {"row": row, "stream_sid": stream_sid, "sid": sid}
+        if key in groups:
+            groups[key].append(item)
+        else:
+            groups[key] = [item]
+            order.append(key)
+    out = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            item = group[0]
+            out.append((item["row"], item["stream_sid"], ()))
+            continue
+        chosen = max(group, key=_row_rank)
+        others = [item for item in group if item is not chosen]
+        folds = tuple(
+            str(item["row"]["sid"])
+            for item in others
+            if item["row"].get("sid") and item["row"]["sid"] != item["sid"]
+        )
+        out.append(
+            (
+                _merge_twin(chosen["row"], [item["row"] for item in others]),
+                chosen["stream_sid"],
+                folds,
+            )
+        )
+    return out
+
+
+def _row_rank(item):
+    """Sort key for one run's twin rows, matching the order they used to be emitted in.
+
+    The walk yields a run folder before its ``pi/`` subfolder and the
+    manifest rows before the ``running/<label>`` echo, and the last row
+    written won. So a live row outranks a manifest row, and between two
+    manifest rows the one that already names the stream's session wins,
+    since its pad holds the out and stream files.
+    """
+    row = item["row"]
+    return (
+        1 if row.get("live") else 0,
+        1 if row.get("sid") and row["sid"] == item["stream_sid"] else 0,
+        1 if row.get("started") is not None else 0,
+    )
+
+
+def _merge_twin(row, others):
+    """``row`` plus every field a twin row carries and it lacks.
+
+    ``tier`` is deliberately not merged: the run-folder row records the
+    registry tier and the ``pi/`` row falls back to the model family, so
+    merging it would move ~160 stored rows onto a different tier bucket.
+    That correction is a separate, visible change.
+    """
+    merged = dict(row)
+    for other in others:
+        for key in ("started", "model"):
+            if merged.get(key) is None and other.get(key) is not None:
+                merged[key] = other[key]
+        if other.get("live") is True:
+            merged["live"] = True
+            merged["live_pid"] = other.get("live_pid") or merged.get("live_pid")
+    return merged
 
 
 def _outdirs(root):
@@ -470,10 +570,22 @@ def _read_meta(pad, label):
     return meta
 
 
-def _upsert_run(store, row, processes, seen, budget=0, per_file=0, now=None):
+def _upsert_run(
+    store,
+    row,
+    processes,
+    seen,
+    budget=0,
+    per_file=0,
+    now=None,
+    stream_sid=_UNSET,
+    folds=(),
+    usage=None,
+):
     label = row["label"]
     pad = row["pad"]
-    stream_sid = _stream_session(pad, label)
+    if stream_sid is _UNSET:
+        stream_sid = _stream_session(pad, label)
     sid = stream_sid or row.get("sid") or label
     out_path = _first_file(pad, "out-%s.md" % label)
     err_path = _first_file(pad, "err-%s.log" % label)
@@ -519,14 +631,36 @@ def _upsert_run(store, row, processes, seen, budget=0, per_file=0, now=None):
                 run["ended_at"] = _mtime(out_path) or row.get("started")
             else:
                 run["status"] = "unknown"
-    _process_apply(store, run, processes)
-    budget = _apply_stream(store, run, pad, label, budget, per_file, now)
+    if not _settled(run):
+        _process_apply(store, run, processes)
+    budget = _apply_stream(store, run, pad, label, budget, per_file, now, usage)
     _emit_run(store, run, seen)
     if stream_sid and row.get("sid") and row["sid"] != stream_sid:
         # After the emit: the stream run exists, so the fold can move the
         # pre-generated row on this poll instead of the next one.
         _reassign_twin(store, row["sid"], stream_sid, label)
+    for old_sid in folds:
+        _reassign_twin(store, old_sid, sid, label)
     return budget
+
+
+_TERMINAL = ("done", "died_early")
+
+
+def _settled(run) -> bool:
+    """True when liveness cannot change this run's row.
+
+    ``apply_liveness`` only revives an open ``unknown`` row and closes a
+    ``running`` one. A run with a verdict, a failure, or a closed
+    ``unknown`` row is left exactly as the files describe it, so the
+    process listing is not matched against it again. A relaunch under the
+    same label is still seen: it writes ``running/<label>``, which makes
+    the row live and its status ``running``.
+    """
+    status = run.get("status")
+    if status in _TERMINAL:
+        return True
+    return status == "unknown" and run.get("ended_at") is not None
 
 
 def _reassign_twin(store, old_sid, new_sid, label):
@@ -574,7 +708,7 @@ def _first_file(pad, name):
     return alt if os.path.isfile(alt) else path
 
 
-def _apply_stream(store, run, pad, label, budget, per_file, now):
+def _apply_stream(store, run, pad, label, budget, per_file, now, usage=None):
     """Emit usage from the run's stream, byte-cursored per file.
 
     The stream is the authoritative ledger: ``launch_pi.py`` writes its
@@ -609,24 +743,25 @@ def _apply_stream(store, run, pad, label, budget, per_file, now):
     start_index = int(rec[1]) if rec and rec[0] == st.st_ino and not started else 0
     events = parse_stream(raw, stream_sid, default_model=model, start_index=start_index)
     for ev in events:
-        _add_usage(
-            store,
-            {
-                "ts": ev["ts"] if ev["ts"] is not None else now,
-                "session_id": stream_sid,
-                "run_id": run["run_id"],
-                "model": ev["model"] or model,
-                "tool": TOOL,
-                "message_id": ev["message_id"],
-                "input": ev["input"],
-                "output": ev["output"],
-                "cache_read": ev["cache_read"],
-                "cache_write": ev["cache_write"],
-                "cache_write_5m": ev["cache_write_5m"],
-                "cache_write_1h": ev["cache_write_1h"],
-                "reasoning": 0,
-            },
-        )
+        row = {
+            "ts": ev["ts"] if ev["ts"] is not None else now,
+            "session_id": stream_sid,
+            "run_id": run["run_id"],
+            "model": ev["model"] or model,
+            "tool": TOOL,
+            "message_id": ev["message_id"],
+            "input": ev["input"],
+            "output": ev["output"],
+            "cache_read": ev["cache_read"],
+            "cache_write": ev["cache_write"],
+            "cache_write_5m": ev["cache_write_5m"],
+            "cache_write_1h": ev["cache_write_1h"],
+            "reasoning": 0,
+        }
+        if usage is None:
+            _add_usage(store, row)
+        else:
+            usage.append(row)
     if events:
         try:
             store.set_offset(index_key, st.st_ino, start_index + len(events), 0, 0)
@@ -654,6 +789,28 @@ def _add_usage(store, row):
         store.add_usage(row)
     except Exception:
         _fail("usage")
+
+
+def _flush_usage(store, rows):
+    """Write a poll's usage rows in one store call.
+
+    ``add_usage_batch`` holds the store lock and rebuilds each hourly bucket
+    once for the whole batch. The per-row path rebuilds the hour after every
+    row, which is quadratic in a poll's new events: ~190 rows against a
+    ~5,800-event hour cost 16 s of a 18 s poll. A store without the batch
+    method falls back to the per-row call.
+    """
+    if not rows:
+        return
+    batch = getattr(store, "add_usage_batch", None)
+    if callable(batch):
+        try:
+            batch(rows)
+            return
+        except Exception:
+            _fail("usage")
+    for row in rows:
+        _add_usage(store, row)
 
 
 def _process_apply(store, run, processes):
