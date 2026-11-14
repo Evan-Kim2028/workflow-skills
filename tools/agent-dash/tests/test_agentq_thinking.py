@@ -309,3 +309,33 @@ class SkillsArgsTest(unittest.TestCase):
     def test_build_argv_carries_no_skills(self):
         argv = LP.build_argv("lbl", "/ws", "/p.md", "/out", "morph-dsv41flash-1017", None)
         self.assertIn("--no-skills", argv)
+
+
+class ToolOutputTrimArgsTest(unittest.TestCase):
+    """The bash-output trim extension is opt-in: only a positive AGENTQ_TOOL_OUTPUT_CAP loads it."""
+
+    EXT = LP.TOOL_OUTPUT_EXTENSION
+
+    def test_default_is_off(self):
+        self.assertEqual(LP.tool_output_args({}), [])
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": ""}), [])
+
+    def test_zero_and_junk_are_off(self):
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "0"}), [])
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "lots"}), [])
+
+    def test_a_positive_cap_loads_it_by_absolute_path(self):
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "8000"}), ["-e", str(self.EXT)])
+        self.assertTrue(Path(str(self.EXT)).is_absolute())
+        self.assertTrue(self.EXT.is_file())
+
+    def test_a_missing_file_is_skipped_not_passed(self):
+        self.assertEqual(LP.tool_output_args({"AGENTQ_TOOL_OUTPUT_CAP": "8000"}, extension=Path("/nonexistent/trim.ts")), [])
+
+    def test_build_and_resume_argv_follow_the_setting(self):
+        with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": ""}):
+            self.assertNotIn(str(self.EXT), LP.build_argv("lbl", "/ws", "/p.md", "/out", "m", None))
+        with mock.patch.dict(os.environ, {"AGENTQ_TOOL_OUTPUT_CAP": "8000"}):
+            argv = LP.build_argv("lbl", "/ws", "/p.md", "/out", "m", "/pilot.ts")
+            self.assertEqual(argv.count("-e"), 2)
+            self.assertIn(str(self.EXT), LP.build_resume_argv("/s.jsonl", "/out", "m", "/p.md"))
