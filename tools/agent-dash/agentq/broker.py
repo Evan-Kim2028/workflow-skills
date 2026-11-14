@@ -41,6 +41,7 @@ third try; it never falls back to writing in place.
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import fcntl
 import json
@@ -86,7 +87,9 @@ DEFAULT_ADAPTIVE = {
     "urgent_share": 0.7,
     "tests_floor": 4,
     "gauge_ttl_s": 15.0,
+    "relaunch_per_min": 8,
 }
+RELAUNCH_WINDOW_S = 60.0
 DEFAULT_LAPTOP = {
     "tests_max_cpu_busy": 0.80,
     "tests_min_free_pct": 35.0,
@@ -1072,6 +1075,7 @@ class Broker:
         self._inflight: dict[str, concurrent.futures.Future] = {}
         self._saturated_last = False
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
+        self._relaunch_at: collections.deque[float] = collections.deque()
         self._locally_held = 0
         self._plans: dict[str, tuple[Path, Path] | None] = {}
         self._backlog_retry: dict[str, float] = {}
@@ -1224,6 +1228,9 @@ class Broker:
             paced = reason is None and pace is not None and job["tier"] == fill_lib.DS_TIER
             if paced and pace["left"] <= 0 and not (job["lane"] == "urgent" and pace["urgent_free"]):
                 name, reason = "proxy", pace["hold"]
+            relaunch = reason is None and job["attempt"] > 0
+            if relaunch and self._relaunch_room(now, adaptive["relaunch_per_min"]) <= 0:
+                reason = plain_hold("relaunch pacing")
             if reason:
                 holds[job["id"]] = (name, reason)
                 if local_gate and is_real_deepseek(job):
@@ -1245,11 +1252,20 @@ class Broker:
                 launched.append(job["id"])
                 if paced:
                     self._spend_pacing(pace)
+                if relaunch:
+                    self._relaunch_at.append(now)
             self._holds.pop(job["id"], None)
         self._collect_launches(conn, now)
         self._locally_held = locally_held
         self._record_holds(conn, now, ready, holds)
         return launched
+
+    def _relaunch_room(self, now: float, per_min) -> int:
+        """Relaunches (jobs requeued after a death or stall, attempt above zero) this broker may still start in
+        the rolling minute ending now. The window is in memory, so a broker restart starts it empty."""
+        while self._relaunch_at and self._relaunch_at[0] <= now - RELAUNCH_WINDOW_S:
+            self._relaunch_at.popleft()
+        return int(per_min) - len(self._relaunch_at)
 
     def _record_holds(self, conn, now: float, ready: list[dict], holds: dict) -> None:
         """Write each queued job's hold to ``jobs.detail`` and the log.

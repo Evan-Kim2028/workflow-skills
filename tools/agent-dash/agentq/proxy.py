@@ -264,10 +264,11 @@ PROXY_MINUTES_ADDED_COLUMNS = (
     ("inflight_over", "INT"),
     ("ttfb_le_p50_ms", "INT"),
     ("ttfb_gt_p50_ms", "INT"),
+    ("aborted_charge", "INT"),
 )
 MINUTE_SEED_COLUMNS = (
     "req", "ok", "r429", "input", "cache_read", "output", "uncached_est",
-    "upstream_ms_sum", "upstream_n", "in_flight_max", "inflight_over",
+    "upstream_ms_sum", "upstream_n", "in_flight_max", "inflight_over", "aborted_charge",
 )
 
 
@@ -305,11 +306,20 @@ class UpstreamError(Exception):
         self.kind = kind
 
 
+class ClientGone(Exception):
+    """Writing to the client socket failed: the client closed or reset it. Not an upstream failure."""
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(type(cause).__name__)
+        self.cause = cause
+
+
 class KeyMissingError(RuntimeError):
     """The Morph key is not in the Keychain and no override is set."""
 
 
 UPSTREAM_FAILURES = (OSError, ssl.SSLError, asyncio.TimeoutError, UpstreamError, TruncatedBody, EOFError)
+FAILURE_MSG_CHARS = 120
 
 
 def failure_kind(exc: BaseException) -> str:
@@ -320,6 +330,13 @@ def failure_kind(exc: BaseException) -> str:
     if isinstance(exc, UpstreamError):
         return exc.kind
     return "connection"
+
+
+def failure_message(exc: BaseException) -> str:
+    """The exception text as one log token: whitespace becomes underscores, cut to FAILURE_MSG_CHARS, and
+    "-" when empty, so the key=value log line stays parseable."""
+    text = "_".join(str(exc).split())[:FAILURE_MSG_CHARS]
+    return text or "-"
 
 
 def default_log(event: str, **fields: object) -> None:
@@ -700,7 +717,7 @@ def read_lane(db_path: Path, job: str) -> str:
 def empty_minute_row() -> dict:
     return {
         "req": 0, "ok": 0, "r429": 0, "input": 0, "cache_read": 0, "output": 0, "uncached_est": 0,
-        "upstream_ms_sum": 0, "upstream_n": 0, "in_flight_max": 0, "inflight_over": 0,
+        "aborted_charge": 0, "upstream_ms_sum": 0, "upstream_n": 0, "in_flight_max": 0, "inflight_over": 0,
         "waits": [], "upstream_samples": [], "ttfb_samples": [], "ttfb_le_samples": [], "ttfb_gt_samples": [],
     }
 
@@ -775,7 +792,7 @@ MINUTE_ROW_COLUMNS = (
     "minute", "model", "req", "ok", "r429", "input", "cache_read", "output", "uncached_est",
     "wait_p50_ms", "wait_p95_ms", "target", "upstream_ms_sum", "upstream_n", "upstream_p50_ms",
     "upstream_p95_ms", "ttfb_p50_ms", "in_flight_max", "inflight_limit", "inflight_mode", "inflight_arm",
-    "inflight_over", "ttfb_le_p50_ms", "ttfb_gt_p50_ms",
+    "inflight_over", "ttfb_le_p50_ms", "ttfb_gt_p50_ms", "aborted_charge",
 )
 
 
@@ -1183,6 +1200,7 @@ class Ticket:
     flight: bool = False
     over_counted: bool = False
     started_above: bool | None = None
+    sent: bool = False
 
     def blocking_budget(self, now: float) -> str | None:
         """The budget holding this waiting ticket now: the budget its 429 named while it backs off,
@@ -1816,7 +1834,7 @@ class Governor:
             self.in_flight.pop(ticket.model, None)
 
     def release(self, ticket: Ticket) -> None:
-        """Drop a charge that upstream did not bill: a 429, an error, a truncated stream, or a client that left."""
+        """Drop a charge that upstream did not bill: a 429, an error, or a request that never reached upstream."""
         now = self.clock()
         for budget, entry in ticket.holds:
             entry.amount = 0
@@ -1824,6 +1842,29 @@ class Governor:
             entry.at = now
             self.sync_reserve(budget)
         ticket.holds = []
+
+    def settle_aborted(self, ticket: Ticket) -> None:
+        """Settle a request that reached upstream but produced no final usage: the client left, the stream
+        broke or was truncated. Morph bills the prompt it started, so the prompt estimate is charged to every
+        input-counting budget (total and uncached), to the minute's billed total, and to the minute row's
+        input with aborted_charge marking how much of it came from aborted requests. A request that never
+        reached upstream is released, as release does."""
+        if not ticket.sent:
+            self.release(ticket)
+            return
+        now = self.clock()
+        for budget, entry in ticket.holds:
+            entry.amount = {"total": ticket.prompt_est, "uncached": ticket.uncached_est}.get(budget.limit_type, 0)
+            entry.done = True
+            entry.at = now
+            self.sync_reserve(budget)
+        ticket.holds = []
+        charged = ticket.prompt_est
+        self.note_calib_billed(ticket, charged)
+        row = self.row(ticket.model)
+        row["input"] += charged
+        row["aborted_charge"] += charged
+        self.job_counters(ticket)["input"] += charged
 
     def budgets_for_limit(self, limit_type: str, model: str) -> list[Budget]:
         """The budgets that track a stated limit type and apply to the model that was refused."""
@@ -2077,6 +2118,7 @@ class Governor:
                     row["inflight_over"],
                     sample_percentile_ms(row["ttfb_le_samples"], 0.5),
                     sample_percentile_ms(row["ttfb_gt_samples"], 0.5),
+                    row["aborted_charge"],
                 )
             )
         self.dirty = {key for key in self.dirty if ("row", key) in self.pending_seeds}
@@ -2630,9 +2672,17 @@ async def iter_body(reader: asyncio.StreamReader, headers: dict[str, str], idle_
             yield data
 
 
-async def read_all(reader: asyncio.StreamReader, headers: dict[str, str], cap: int, idle_s: float | None = None) -> bytes:
+async def read_all(
+    reader: asyncio.StreamReader,
+    headers: dict[str, str],
+    cap: int,
+    idle_s: float | None = None,
+    on_chunk=None,
+) -> bytes:
     data = bytearray()
     async for chunk in iter_body(reader, headers, idle_s):
+        if on_chunk is not None:
+            on_chunk()
         if len(data) + len(chunk) > cap:
             data += chunk[: max(cap - len(data), 0)]
             break
@@ -2677,6 +2727,16 @@ def _reason(status: int) -> str:
         return "Upstream"
 
 
+async def client_write(client: Client, data: bytes) -> None:
+    """Write to the client and wait for the socket. A socket error here means the client left, so it is
+    raised as ClientGone and never mistaken for an upstream failure."""
+    try:
+        client.writer.write(data)
+        await client.writer.drain()
+    except OSError as exc:
+        raise ClientGone(exc) from exc
+
+
 async def send_head(client: Client, status: int, headers: dict[str, str]) -> None:
     lines = [f"HTTP/1.1 {status} {_reason(status)}"]
     for name, value in headers.items():
@@ -2684,18 +2744,15 @@ async def send_head(client: Client, status: int, headers: dict[str, str]) -> Non
             lines.append(f"{name.title()}: {value}")
     lines += ["Transfer-Encoding: chunked", "Connection: close"]
     client.started = True
-    client.writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace"))
-    await client.writer.drain()
+    await client_write(client, ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace"))
 
 
 async def send_chunk(client: Client, data: bytes) -> None:
-    client.writer.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-    await client.writer.drain()
+    await client_write(client, f"{len(data):x}\r\n".encode() + data + b"\r\n")
 
 
 async def end_chunks(client: Client) -> None:
-    client.writer.write(b"0\r\n\r\n")
-    await client.writer.drain()
+    await client_write(client, b"0\r\n\r\n")
 
 
 async def send_simple(client: Client, status: int, body: bytes, content_type: str = "application/json") -> None:
@@ -2706,8 +2763,7 @@ async def send_simple(client: Client, status: int, body: bytes, content_type: st
         "Connection: close",
     ]
     client.started = True
-    client.writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
-    await client.writer.drain()
+    await client_write(client, ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
 
 
 def held_body(governor: Governor) -> bytes:
@@ -2952,7 +3008,7 @@ class Proxy:
                 await self.forward(method, path, headers, body, client, reader)
             else:
                 await send_simple(client, 404, b'{"error":"not found"}')
-        except (ConnectionError, OSError, EOFError):
+        except (ConnectionError, OSError, EOFError, ClientGone):
             return
         except ValueError as exc:
             self.gov.log("bad_request", kind=type(exc).__name__)
@@ -2973,7 +3029,9 @@ class Proxy:
         with contextlib.suppress(Exception):
             await send_simple(client, status, body)
 
-    async def open_upstream(self, method: str, path: str, headers: dict[str, str], body: bytes) -> Upstream:
+    async def open_upstream(
+        self, method: str, path: str, headers: dict[str, str], body: bytes, ticket: Ticket | None = None
+    ) -> Upstream:
         url = urlsplit(self.upstream_url)
         secure = url.scheme == "https"
         port = url.port or (443 if secure else 80)
@@ -2982,7 +3040,7 @@ class Proxy:
         key = self.upstream_url
         pooled = self.pool.take(key)
         if pooled is not None:
-            return await self._send(pooled[0], pooled[1], key, method, path, headers, body, url, idle_s)
+            return await self._send(pooled[0], pooled[1], key, method, path, headers, body, url, idle_s, ticket)
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
                 url.hostname,
@@ -2992,7 +3050,7 @@ class Proxy:
             ),
             connect_s,
         )
-        return await self._send(reader, writer, key, method, path, headers, body, url, idle_s)
+        return await self._send(reader, writer, key, method, path, headers, body, url, idle_s, ticket)
 
     async def _send(
         self,
@@ -3005,6 +3063,7 @@ class Proxy:
         body: bytes,
         url,
         idle_s: float,
+        ticket: Ticket | None = None,
     ) -> Upstream:
         try:
             target = url.path.rstrip("/") + path[len(UPSTREAM_PREFIX) :]
@@ -3020,6 +3079,8 @@ class Proxy:
                     lines.append(f"{name.title()}: {value}")
             writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body)
             await bounded(writer.drain(), idle_s)
+            if ticket is not None:
+                ticket.sent = True
             status_line = await bounded(reader.readline(), idle_s)
         except BaseException:
             writer.close()
@@ -3137,14 +3198,21 @@ class Proxy:
                 await send_simple(client, 429, held_body(gov), "text/plain")
                 return
             upstream = None
+            ticket.sent = False
             sent_at = gov.clock()
+            last_bytes_at = sent_at
+
+            def upstream_bytes() -> None:
+                nonlocal last_bytes_at
+                last_bytes_at = gov.clock()
+
             gov.upstream_started(ticket)
             ticket.started_above = gov.inflight_above(ticket)
             try:
-                upstream = await self.open_upstream(method, path, headers, body)
+                upstream = await self.open_upstream(method, path, headers, body, ticket)
                 ttfb_s = gov.clock() - sent_at
                 if upstream.status == 429:
-                    raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY, idle_s)
+                    raw = await read_all(upstream.reader, upstream.headers, MAX_429_BODY, idle_s, upstream_bytes)
                     gov.note_upstream(ticket, gov.clock() - sent_at)
                     upstream.close()
                     upstream = None
@@ -3173,6 +3241,7 @@ class Proxy:
                 scanner = UsageScanner(is_event_stream(upstream.headers) or streaming)
                 await send_head(client, upstream.status, upstream.headers)
                 async for chunk in iter_body(upstream.reader, upstream.headers, idle_s):
+                    upstream_bytes()
                     scanner.feed(chunk)
                     await send_chunk(client, chunk)
                 await end_chunks(client)
@@ -3193,16 +3262,30 @@ class Proxy:
                     attempts=ticket.attempts + 1,
                 )
                 return
+            except ClientGone as exc:
+                gov.settle_aborted(ticket)
+                gov.log(
+                    "client_failed",
+                    job=ticket.job,
+                    model=ticket.model,
+                    exc=type(exc.cause).__name__,
+                    sent=ticket.sent,
+                )
+                client.aborted = True
+                return
             except UPSTREAM_FAILURES as exc:
                 kind = failure_kind(exc)
                 gov.count_error(kind)
-                gov.release(ticket)
+                gov.settle_aborted(ticket)
                 gov.log(
                     "upstream_failed",
                     job=ticket.job,
                     model=ticket.model,
                     kind=kind,
                     client_started=client.started,
+                    exc=type(exc).__name__,
+                    msg=failure_message(exc),
+                    idle_s=round(gov.clock() - last_bytes_at, 2),
                 )
                 if client.started:
                     client.aborted = True

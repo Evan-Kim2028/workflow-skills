@@ -1099,6 +1099,57 @@ class AdaptiveAdmissionTests(ProcessCleanup):
 
 
 
+class RelaunchPacingTests(ProcessCleanup):
+    """Requeued jobs (attempt above zero) start at most relaunch_per_min per rolling minute; first attempts do not."""
+
+    def broker(self, clock):
+        return make_broker(self.home, self.fake(), clock=clock, proxy=lambda: None)
+
+    def requeued(self, count):
+        ids = [submit(self.env, self.prompt, label=f"relaunch-{n}") for n in range(count)]
+        conn = db.connect(self.home)
+        conn.executemany("UPDATE jobs SET attempt = 1 WHERE id = ?", [(job_id,) for job_id in ids])
+        conn.commit()
+        conn.close()
+        return ids
+
+    def write_relaunch_limit(self, limit):
+        import json
+
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "broker.json").write_text(
+            json.dumps({"pacing": {"enabled": False}, "adaptive": {"relaunch_per_min": limit}}), encoding="utf-8")
+
+    def test_ninth_relaunch_in_a_minute_is_held_then_starts_when_the_window_clears(self):
+        clock = Clock(1000.0)
+        ids = self.requeued(9)
+        broker = self.broker(clock)
+        self.assertEqual(len(broker.tick()), 8)
+        clock.t = 1010.0
+        self.assertEqual(broker.tick(), [])
+        self.assertEqual(row(self.home, ids[8])["state"], "queued")
+        self.assertIn("relaunch pacing", row(self.home, ids[8])["detail"])
+        clock.t = 1061.0
+        self.assertEqual(broker.tick(), [ids[8]])
+
+    def test_first_attempts_are_not_paced(self):
+        clock = Clock(1000.0)
+        self.requeued(8)
+        broker = self.broker(clock)
+        self.assertEqual(len(broker.tick()), 8)
+        clock.t = 1010.0
+        fresh = [submit(self.env, self.prompt, label=f"fresh-{n}") for n in range(3)]
+        self.assertEqual(broker.tick(), fresh)
+
+    def test_relaunch_per_min_is_read_from_broker_json(self):
+        clock = Clock(1000.0)
+        self.write_relaunch_limit(2)
+        ids = self.requeued(3)
+        broker = self.broker(clock)
+        self.assertEqual(broker.tick(), ids[:2])
+        self.assertIn("relaunch pacing", row(self.home, ids[2])["detail"])
+
+
 def git(cwd, *args):
     """Run git in ``cwd`` with a throwaway identity; fail the test on a non-zero exit."""
     return subprocess.run(

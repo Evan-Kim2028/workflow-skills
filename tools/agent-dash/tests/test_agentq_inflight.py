@@ -22,7 +22,7 @@ def traffic(at: float, *, req: int = 30, billed: int = 3_000_000, ttfb: int = 60
             arm: str | None = "enforce", limit: int | None = 28, in_flight: int = 10) -> tuple:
     values = {
         "minute": minute_stamp(at), "model": DS, "req": req, "ok": req, "r429": 0, "input": billed,
-        "cache_read": 0, "output": 0, "uncached_est": 0, "wait_p50_ms": 0, "wait_p95_ms": 0, "target": 0.98,
+        "cache_read": 0, "output": 0, "uncached_est": 0, "aborted_charge": 0, "wait_p50_ms": 0, "wait_p95_ms": 0, "target": 0.98,
         "upstream_ms_sum": 0, "upstream_n": req, "upstream_p50_ms": ttfb + 1000, "upstream_p95_ms": ttfb + 2000,
         "ttfb_p50_ms": ttfb, "in_flight_max": in_flight, "inflight_limit": limit, "inflight_mode": "enforce",
         "inflight_arm": arm, "inflight_over": over, "ttfb_le_p50_ms": None, "ttfb_gt_p50_ms": None,
