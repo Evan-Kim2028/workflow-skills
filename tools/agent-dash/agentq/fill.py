@@ -355,10 +355,12 @@ class FillController:
         return controller
 
     def tick(self, now: float, *, fill: dict, paused: bool, billed_avg: float, active: int, filler_busy: int,
-             ready_real: int, queued_filler: int, gate: str | None, live_rate: float | None = None) -> FillPlan:
+             ready_real: int, queued_filler: int, gate: str | None, live_rate: float | None = None,
+             locally_held: int = 0) -> FillPlan:
         """One decision. ``billed_avg`` is the window average; ``live_rate`` is the current minute's projection (None
         before LIVE_MIN_ELAPSED_S). ``active`` counts busy DeepSeek workers (real and filler); ``filler_busy`` and
-        ``queued_filler`` count the filler population."""
+        ``queued_filler`` count the filler population. ``locally_held`` of the ``ready_real`` jobs were held by a
+        local gate (slots, workspace, laptop) in the launch pass; they cannot launch, so they do not hold filler."""
         if not fill["enabled"]:
             self.filling = False
             return FillPlan(False, 0, "fill disabled", "disabled")
@@ -381,8 +383,11 @@ class FillController:
             self.gate_since = None
             return FillPlan(False, 0, f"{average} at or above the {high / 1e6:.2f}M high mark; level held at "
                             f"{self.level} filler", "high-mark")
-        if ready_real > 0:
-            return FillPlan(True, 0, f"{ready_real} real DeepSeek jobs ready; they launch before filler", "real-ready")
+        real_ready = max(0, ready_real - locally_held)
+        if real_ready > 0:
+            held = f" ({locally_held} more held by local gates)" if locally_held else ""
+            return FillPlan(True, 0, f"{real_ready} real DeepSeek jobs ready{held}; they launch before filler",
+                            "real-ready")
         if gate is not None:
             if self.gate_since is None:
                 self.gate_since = now
@@ -443,15 +448,17 @@ class Decision:
     pacing_source: str
     pacing_left: int
     pacing_cost: int
+    locally_held: int
 
 
 def decide(
     conn, now: float, *, controller: FillController, fill: dict, pacing: dict, status: dict | None,
     ps_text: str | None, laptop: headroom_lib.Headroom | None, laptop_cfg: dict, paused: bool,
-    measured: int | None,
+    measured: int | None, locally_held: int = 0,
 ) -> Decision:
     """Read the store and return what the controller and pacing would do now. The controller keeps its
-    own history; nothing else is written."""
+    own history; nothing else is written. ``locally_held`` is the launch pass's count of ready real jobs
+    held by local gates (see ``FillController.tick``)."""
     counts = job_counts(conn, now)
     direct = direct_ds_workers(ps_text) if fill["enabled"] else None
     active = counts["running_ds"] + (direct or 0)
@@ -465,7 +472,7 @@ def decide(
     plan = controller.tick(
         now, fill=fill, paused=paused, billed_avg=billed_avg, active=active,
         filler_busy=counts["running_filler"], ready_real=counts["ready_real"], queued_filler=counts["queued_filler"],
-        gate=gate, live_rate=live_rate,
+        gate=gate, live_rate=live_rate, locally_held=locally_held,
     )
     current, source, pending = pacing_inputs(conn, now, status, pacing)
     left, cost = pacing_allowance(current, pending, pacing, measured)
@@ -474,6 +481,7 @@ def decide(
         running_ds=counts["running_ds"], ready_real=counts["ready_real"], queued_filler=counts["queued_filler"],
         running_filler=counts["running_filler"], recent_429=recent, gate=gate, pacing_current=current,
         pacing_pending=pending, pacing_source=source, pacing_left=left, pacing_cost=cost,
+        locally_held=locally_held,
     )
 
 

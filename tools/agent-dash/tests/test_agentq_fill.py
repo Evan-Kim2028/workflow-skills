@@ -371,6 +371,25 @@ class ControllerTests(unittest.TestCase):
     def test_real_work_ready_goes_first(self):
         self.assertEqual(tick(F.FillController(), NOW, 1e6, 10, ready_real=2).key, "real-ready")
 
+    def test_real_jobs_held_only_by_local_gates_do_not_hold_filler(self):
+        plan = F.FillController().tick(NOW, fill=FILL, paused=False, billed_avg=1e6, active=0, filler_busy=0,
+                                       ready_real=10, queued_filler=0, gate=None, locally_held=10)
+        self.assertGreater(plan.submit, 0)
+        self.assertEqual(plan.key, "stepping")
+
+    def test_locally_held_jobs_reduce_the_real_ready_count_and_say_so(self):
+        plan = F.FillController().tick(NOW, fill=FILL, paused=False, billed_avg=1e6, active=0, filler_busy=0,
+                                       ready_real=10, queued_filler=0, gate=None, locally_held=4)
+        self.assertEqual(plan.key, "real-ready")
+        self.assertEqual(plan.submit, 0)
+        self.assertEqual(plan.reason, "6 real DeepSeek jobs ready (4 more held by local gates); "
+                                      "they launch before filler")
+
+    def test_locally_held_never_drives_the_real_ready_count_below_zero(self):
+        plan = F.FillController().tick(NOW, fill=FILL, paused=False, billed_avg=1e6, active=0, filler_busy=0,
+                                       ready_real=3, queued_filler=0, gate=None, locally_held=9)
+        self.assertGreater(plan.submit, 0)
+
     def test_any_gate_holds_filler_with_its_reason(self):
         plan = tick(F.FillController(), NOW, 1e6, 10, gate="Morph slow: in-flight limit 20 reached")
         self.assertEqual(plan.submit, 0)
@@ -863,6 +882,23 @@ class BrokerWiringTest(unittest.TestCase):
             self.tick(self.broker())
             table.assert_not_called()
         self.assertEqual(self.filler_jobs(), [])
+
+    def test_real_work_held_by_a_local_gate_does_not_hold_filler(self):
+        self.set_billed(1_000_000)
+        self.write_json("broker.json", {"fill": {"enabled": True}, "pacing": {"enabled": False},
+                                        "slots": {"light": 0}})
+        real = "real-slots"
+        db.insert_job(self.conn, {
+            "id": real, "lane": "normal", "kind": "read", "res": "light", "tier": "pi-deepseek-flash",
+            "label": "hub-exec-real", "workspace": str(self.ws), "session": "sess-a", "harness": "pi",
+            "prompt_path": str(self.prompt),
+        }, NOW)
+        broker = self.broker()
+        self.tick(broker)
+        self.assertEqual(broker._locally_held, 1)
+        self.assertEqual(db.get_job(self.conn, real)["state"], "queued")
+        self.assertEqual(db.get_job(self.conn, real)["detail"], "hold light: slots full")
+        self.assertGreater(len(self.filler_jobs()), 0)
 
     def test_ready_real_work_holds_filler_even_when_it_cannot_launch(self):
         self.set_billed(1_000_000)
