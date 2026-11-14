@@ -1,0 +1,9 @@
+#!/bin/sh
+# agentq PATH shim for grep: refuses a recursive search whose path is a broad root or a git checkout root (whole-repo greps walk .venv and data). Recursive grep on a subfolder or a file, and plain grep, exec the real binary. The decision is POSIX sh only.
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+if [ "${AGENTQ_GUARD:-1}" != 0 ]; then
+    shim_guard_grep "$@"
+fi
+shim_real grep || exit 127
+exec "$REAL" "$@"

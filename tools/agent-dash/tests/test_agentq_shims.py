@@ -639,6 +639,24 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertIsNone(dispatch.refusal("pytest", [], env))
         self.assertIsNone(dispatch.refusal("uv", ["run", "pyright"], env))
         self.assertIsNone(dispatch.refusal("sleep", ["300"], env))
+        self.assertIsNone(dispatch.refusal("sleep", ["1"], dict(env, AGENTQ_JOB="j", AGENTQ_SLEEP_BUDGET_S="0")))
+
+    def test_sleep_budget_counts_fractional_sleeps_rounded_up(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {"AGENTQ_HOME": home, "AGENTQ_JOB": "j2", "AGENTQ_SLEEP_BUDGET_S": "2"}
+            self.assertIsNone(dispatch.refusal("sleep", ["0.5"], env))
+            dispatch.record_sleep(home, env, ["0.5"])
+            self.assertEqual((Path(home) / "guard" / "sleep-j2").read_text().strip(), "1")
+            self.assertIsNone(dispatch.refusal("sleep", ["1"], env))
+            dispatch.record_sleep(home, env, ["1"])
+            self.assertEqual(dispatch.refusal("sleep", ["0.1"], env)[0], "sleep budget used (3 s of 2 s)")
+
+    def test_sleep_budget_needs_a_job_label(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {"AGENTQ_HOME": home, "AGENTQ_SLEEP_BUDGET_S": "0"}
+            self.assertIsNone(dispatch.refusal("sleep", ["1"], env))
+            dispatch.record_sleep(home, env, ["1"])
+            self.assertFalse((Path(home) / "guard").exists())
 
 
 class GuardShimTests(Base):
@@ -649,12 +667,21 @@ class GuardShimTests(Base):
         self.work = Path(self._tmp.name) / "work"
         (self.work / "tests").mkdir(parents=True)
         self.log = self.home / dispatch.GUARD_LOG
-        for name in ("pytest", "python3", "uv", "sleep"):
+        self.user_home = Path(self._tmp.name) / "userhome"
+        (self.user_home / "Documents" / "worktrees" / "repo-a" / "src").mkdir(parents=True)
+        (self.user_home / "Documents" / "projects").mkdir(parents=True)
+        self.repo = Path(self._tmp.name) / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        (self.repo / "transform" / "scripts").mkdir(parents=True)
+        for name in ("pytest", "python3", "uv", "sleep", "grep", "rg", "find"):
             self.fake_binary(name, f'echo "$@" >> "{self.bin / (name + ".ran")}"\n')
 
-    def run_shim(self, name, args, extra=None):
-        return subprocess.run([str(SHIMS / name), *args], cwd=self.work, env=self.shim_env(extra),
+    def run_shim(self, name, args, extra=None, cwd=None):
+        return subprocess.run([str(SHIMS / name), *args], cwd=cwd or self.work, env=self.shim_env(extra),
                               capture_output=True, text=True, timeout=60)
+
+    def repo_real(self):
+        return os.path.realpath(self.repo)
 
     def ran(self, name):
         return (self.bin / (name + ".ran")).exists()
@@ -733,6 +760,126 @@ class GuardShimTests(Base):
         self.run_shim("sleep", ["300"])
         self.run_shim("pytest", [])
         self.assertEqual(len(self.log_lines()), 2)
+
+    def test_recursive_grep_forms_over_a_repo_root_are_refused_and_logged(self):
+        forms = (["-r", "x", "."], ["-rn", "x", "."], ["-rln", "x"], ["-Rni", "x", "."],
+                 ["--recursive", "x"], ["--dereference-recursive", "x", "."],
+                 ["-d", "recurse", "x", "."], ["--directories=recurse", "x"], ["-drecurse", "x"])
+        for args in forms:
+            with self.subTest(args=args):
+                before = len(self.log_lines())
+                result = self.run_shim("grep", args, {"AGENTQ_JOB": "ws9-exec-x"}, cwd=self.repo)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"BLOCKED: agentq guard: recursive grep over {self.repo_real()} refused; use rg "
+                              "(skips .gitignore'd dirs like .venv and data) or git grep, or grep a specific "
+                              "subfolder", result.stderr)
+                self.assertEqual(len(self.log_lines()), before + 1)
+                self.assertEqual(self.log_lines()[-1].split("\t")[1], "ws9-exec-x")
+        self.assertFalse(self.ran("grep"))
+        self.assertEqual(self.log_lines()[-1].split("\t")[2], f"recursive grep over {self.repo_real()} refused")
+
+    def test_recursive_grep_over_the_repo_root_path_is_refused(self):
+        result = self.run_shim("grep", ["-rn", "x", str(self.repo)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("recursive grep over ", result.stderr)
+
+    def test_recursive_grep_over_home_is_refused(self):
+        result = self.run_shim("grep", ["-r", "x"], {"HOME": str(self.user_home)}, cwd=self.user_home)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("recursive grep over ", result.stderr)
+        self.assertFalse(self.ran("grep"))
+
+    def test_recursive_grep_on_a_subfolder_or_file_of_the_repo_passes(self):
+        scripts = self.repo / "transform" / "scripts"
+        (scripts / "run.sh").write_text("--full-refresh\n", encoding="utf-8")
+        self.assertEqual(self.run_shim("grep", ["-rn", "--include=*.sh", "--", "--full-refresh", str(scripts)],
+                                       cwd=self.repo).returncode, 0)
+        self.assertEqual(self.run_shim("grep", ["-rl", ".", "transform/scripts"], cwd=self.repo).returncode, 0)
+        self.assertEqual(self.run_shim("grep", ["-r", "x", str(scripts / "run.sh")], cwd=self.repo).returncode, 0)
+        self.assertEqual(len((self.bin / "grep.ran").read_text().splitlines()), 3)
+        self.assertEqual(self.log_lines(), [])
+
+    def test_plain_grep_and_option_values_that_look_like_r_pass(self):
+        for args in (["-n", "x", "file.txt"], ["-e", "-r", "file.txt"], ["--", "-r", "file.txt"], ["-i", "--", "-R"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_shim("grep", args).returncode, 0)
+        self.assertEqual(len((self.bin / "grep.ran").read_text().splitlines()), 4)
+        self.assertEqual(self.log_lines(), [])
+
+    def test_rg_and_find_over_broad_roots_are_refused(self):
+        home = self.user_home
+        env = {"HOME": str(home)}
+        cases = (
+            ("rg", ["x", str(home)]),
+            ("rg", ["x", str(home / "Documents" / "worktrees")]),
+            ("rg", ["x", str(home / "Documents" / "worktrees" / "repo-a")]),
+            ("rg", ["x", "/"]),
+            ("find", [str(home), "-name", "x"]),
+            ("find", ["-H", str(home / "Documents" / "projects"), "-name", "x"]),
+            ("find", ["/", "-name", "x"]),
+        )
+        for name, args in cases:
+            with self.subTest(name=name, args=args):
+                result = self.run_shim(name, args, env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"BLOCKED: agentq guard: {name} over ", result.stderr)
+                self.assertIn("refused; search inside your own worktree or a specific folder", result.stderr)
+                self.assertFalse(self.ran(name))
+        self.assertEqual(len(self.log_lines()), len(cases))
+
+    def test_rg_without_a_path_refuses_when_run_from_the_home_folder(self):
+        result = self.run_shim("rg", ["x"], {"HOME": str(self.user_home)}, cwd=self.user_home)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("BLOCKED: agentq guard: rg over ", result.stderr)
+        self.assertFalse(self.ran("rg"))
+
+    def test_rg_and_find_in_a_subfolder_pass(self):
+        src = self.user_home / "Documents" / "worktrees" / "repo-a" / "src"
+        env = {"HOME": str(self.user_home)}
+        self.assertEqual(self.run_shim("rg", ["needle", str(src)], env).returncode, 0)
+        self.assertEqual(self.run_shim("find", [str(src), "-name", "x"], env).returncode, 0)
+        self.assertEqual(self.run_shim("rg", ["needle"], env, cwd=src).returncode, 0)
+        self.assertEqual(self.run_shim("rg", ["needle"], env).returncode, 0)
+        self.assertEqual(len((self.bin / "rg.ran").read_text().splitlines()), 3)
+        self.assertEqual(self.log_lines(), [])
+
+    def test_agentq_guard_zero_runs_broad_searches_and_recursive_grep(self):
+        env = {"AGENTQ_GUARD": "0", "HOME": str(self.user_home)}
+        for name, args, cwd in (("rg", ["x", "/"], None), ("find", ["/", "-name", "x"], None),
+                                ("grep", ["-r", "x", "."], self.repo)):
+            with self.subTest(name=name):
+                result = self.run_shim(name, args, env, cwd=cwd)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.ran(name))
+        self.assertEqual(self.log_lines(), [])
+
+    def test_sleep_budget_refuses_once_the_job_total_would_pass_it(self):
+        extra = {"AGENTQ_JOB": "ws9-exec-x", "AGENTQ_SLEEP_BUDGET_S": "2"}
+        self.assertEqual(self.run_shim("sleep", ["1"], extra).returncode, 0)
+        self.assertEqual(self.run_shim("sleep", ["1"], extra).returncode, 0)
+        result = self.run_shim("sleep", ["1"], extra)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "BLOCKED: agentq guard: sleep budget used (3 s of 2 s); workers never babysit. Launch long work "
+            "detached, write a status file, and report its PID and paths.", result.stderr)
+        self.assertEqual((self.bin / "sleep.ran").read_text().splitlines(), ["1", "1"])
+        self.assertEqual((self.home / "guard" / "sleep-ws9-exec-x").read_text().strip(), "2")
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].split("\t")[1], "ws9-exec-x")
+
+    def test_fractional_sleep_goes_through_the_same_budget(self):
+        extra = {"AGENTQ_JOB": "ws9-exec-x", "AGENTQ_SLEEP_BUDGET_S": "0"}
+        result = self.run_shim("sleep", ["0.5"], extra)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("sleep budget used (1 s of 0 s)", result.stderr)
+        self.assertFalse(self.ran("sleep"))
+
+    def test_sleep_budget_does_nothing_without_a_job(self):
+        for _ in range(3):
+            self.assertEqual(self.run_shim("sleep", ["1"], {"AGENTQ_SLEEP_BUDGET_S": "2"}).returncode, 0)
+        self.assertEqual(len((self.bin / "sleep.ran").read_text().splitlines()), 3)
+        self.assertFalse((self.home / "guard").exists())
 
 
 if __name__ == "__main__":

@@ -1,30 +1,53 @@
-"""Dispatch for the PATH shims ``ssh``, ``pytest``, ``python``, ``python3``, ``uv`` and ``sleep``.
+"""Dispatch for the PATH shims in this folder: ``ssh``, ``pytest``, ``python``, ``python3``, ``uv``, ``sleep``, ``pkill``, ``killall``, ``grep``, ``rg`` and ``find``.
 
-Each shell wrapper in this folder runs ``dispatch.py <its own name> <args>``. The
-real binary is the first match on PATH with this folder removed, so a shim never
-calls itself. Anything that is not a gated run is replaced by the real binary
-with the same argv.
+Each shell wrapper runs ``dispatch.py <its own name> <args>`` only when the sh fast
+path cannot decide. The real binary is the first match on PATH with this folder
+removed, so a shim never calls itself. Anything that is not refused is replaced by
+the real binary with the same argv.
 
-Gated runs:
+Guards (every refusal prints ``BLOCKED: agentq guard: <reason>`` on stderr, exits 2,
+and appends one row to ``guard_blocks.tsv`` under ``AGENTQ_HOME``: epoch, run label,
+reason, command cut to 300 characters). ``AGENTQ_GUARD=0`` turns all of them off.
 
-- ``ssh``: only when the target host is in ``shims.ssh_gated_hosts`` of
-  ``broker.json`` (no default: the production host aliases are set locally, so
-  they stay out of the repo). Every run rewrites ``slots/ssh_hosts`` for the sh fast path. Others, such as git over ssh to github.com, exec
-  the real ssh untouched. Takes an ``ssh`` slot.
+- ``pytest``, ``python[3] -m pytest``, ``uv run pytest``: refused with no test target,
+  a directory target, or more than 25 test files.
+- ``python``, ``python3``, ``uv``: the full gates ``lor-ci-local.sh``, ``ci-local.sh``
+  and ``validate.sh``; ``select_pytests.py --all``; ``pre-commit`` with ``--all-files``
+  or ``-a``; ``pyright`` with no file arguments.
+- ``sleep``: a single sleep over 120 s; and a per-job budget. With ``AGENTQ_JOB`` set,
+  the running total of seconds in ``guard/sleep-<job>`` under ``AGENTQ_HOME`` may not
+  pass ``AGENTQ_SLEEP_BUDGET_S`` (default 600). Fractional sleeps count rounded up to
+  whole seconds. Budget refusals are not recorded in the total.
+- ``grep`` (sh only): a recursive search (``-r``, ``-R``, ``--recursive``,
+  ``--dereference-recursive``, ``-d recurse``, ``--directories=recurse``, or a short
+  flag group holding r or R) whose search path is a broad root or a git checkout root
+  (a directory holding ``.git``). The search paths are the non-option arguments after
+  the pattern, or the current directory when there are none. Recursive grep on a
+  subfolder or a file, and plain grep, pass.
+- ``rg`` and ``find`` (sh only): a search whose root resolves to a broad folder. The
+  broad roots are ``/``, ``/Users``, ``/System``, ``/Library``, ``/private``,
+  ``/Volumes``, the home folder, ``Documents``, ``Documents/projects``,
+  ``Documents/worktrees`` and each direct child of ``Documents/worktrees``, plus one
+  path per line in ``AGENTQ_HOME/guard_broad_roots``. An rg with no path searches the
+  current directory. A find's start paths are the words before its first expression.
+- ``pkill`` and ``killall`` (sh only): always refused.
+
+Gated runs (slots and the memory cap, not refusals):
+
+- ``ssh``: only for hosts in ``shims.ssh_gated_hosts`` of ``broker.json`` (no default:
+  the production host aliases are set locally, so they stay out of the repo). Every
+  run rewrites ``slots/ssh_hosts`` for the sh fast path. Others, such as git over ssh
+  to github.com, exec the real ssh untouched. Takes an ``ssh`` slot.
 - ``pytest``: ``pytest``, ``python[3] -m pytest``, ``uv run pytest`` and
   ``uv run python[3] -m pytest``. Takes a ``pytest`` slot, then runs the real
   command under ``memcap.sh 8192``.
 
-Guard (``refusal``): inside the shims, a worker run that would load a whole suite
-or check the whole repo is refused with exit 2, a ``BLOCKED:`` line on stderr, and
-one line appended to ``guard_blocks.tsv`` under ``AGENTQ_HOME``. Refused: pytest
-with no target, a directory target, or more than 25 test files; the full gates
-``lor-ci-local.sh``, ``ci-local.sh`` and ``validate.sh``; ``select_pytests.py
---all``; ``pre-commit`` with ``--all-files`` or ``-a``; ``pyright`` with no file
-arguments; and ``sleep`` longer than 120 s. A gate script is caught only when a
-python or uv shim sees it as an argument (``uv run scripts/validate.sh``,
-``python3 scripts/validate.sh``). ``bash`` and ``sh`` are not shimmed, so
-``bash scripts/validate.sh`` is not covered. ``AGENTQ_GUARD=0`` turns the guard off.
+A gate script is caught only when a python or uv shim sees it as an argument
+(``uv run scripts/validate.sh``, ``python3 scripts/validate.sh``). ``bash`` and ``sh``
+are not shimmed, so ``bash scripts/validate.sh`` is not covered.
+
+The shell fast paths live in ``shim-lib.sh`` and the wrappers. Only argv they cannot
+settle (a fractional or suffixed sleep, a non-integer budget) reaches this module.
 
 Environment: ``AGENTQ_SHIMS=0`` turns the shims off for pi (set by
 ``launch_pi.py``). ``AGENTQ_SLOT_HELD`` lists the slot kinds this process tree
@@ -40,6 +63,7 @@ shim treats a pytest started under it as already held.
 from __future__ import annotations
 
 import fnmatch
+import math
 import os
 import re
 import shlex
@@ -64,6 +88,10 @@ PYTEST_HELD_ENV = "AGENTQ_PYTEST_SLOT_HELD"
 MEMCAP_ENV = "AGENTQ_MEMCAP"
 GUARD_ENV = "AGENTQ_GUARD"
 GUARD_LOG = "guard_blocks.tsv"
+JOB_ENV = "AGENTQ_JOB"
+SLEEP_BUDGET_ENV = "AGENTQ_SLEEP_BUDGET_S"
+SLEEP_BUDGET_DEFAULT_S = 600
+SLEEP_STATE_DIR = "guard"
 GUARD_COMMAND_CHARS = 300
 PYTEST_FILE_LIMIT = 25
 SLEEP_LIMIT_S = 120
@@ -245,6 +273,61 @@ def _seconds_text(seconds: float) -> str:
     return str(int(seconds)) if seconds == int(seconds) else f"{seconds:.1f}"
 
 
+def job_label(environ) -> str:
+    """The job id a sleep budget is kept under (``AGENTQ_JOB``), or an empty string when unset."""
+    return (environ.get(JOB_ENV) or "").strip()
+
+
+def sleep_budget_s(environ) -> float:
+    """The per-job sleep budget in seconds: ``AGENTQ_SLEEP_BUDGET_S``, else 600."""
+    raw = (environ.get(SLEEP_BUDGET_ENV) or "").strip()
+    try:
+        return float(raw) if raw else float(SLEEP_BUDGET_DEFAULT_S)
+    except ValueError:
+        return float(SLEEP_BUDGET_DEFAULT_S)
+
+
+def sleep_state_path(home, job: str) -> Path:
+    """The file holding a job's running sleep total in whole seconds."""
+    return Path(home) / SLEEP_STATE_DIR / f"sleep-{job}"
+
+
+def sleep_used_s(home, job: str) -> int:
+    """The job's sleep total so far in whole seconds; 0 when there is no counter yet."""
+    try:
+        return int(sleep_state_path(home, job).read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def sleep_budget_refusal(home, environ, seconds: float):
+    """``(reason, message)`` when this sleep would push the job past its budget, else None."""
+    job = job_label(environ)
+    if not job:
+        return None
+    budget = sleep_budget_s(environ)
+    total = sleep_used_s(home, job) + math.ceil(seconds)
+    if total <= budget:
+        return None
+    reason = f"sleep budget used ({_seconds_text(total)} s of {_seconds_text(budget)} s)"
+    return reason, (f"BLOCKED: agentq guard: {reason}; workers never babysit. Launch long work detached, "
+                    "write a status file, and report its PID and paths.")
+
+
+def record_sleep(home, environ, args) -> None:
+    """Add a sleep's seconds (rounded up) to the job's budget counter. Never raises."""
+    job = job_label(environ)
+    seconds = sleep_seconds(args)
+    if not job or seconds is None or (environ.get(GUARD_ENV) or "").strip() == "0":
+        return
+    try:
+        path = sleep_state_path(home, job)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(sleep_used_s(home, job) + math.ceil(seconds)) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
 def refusal(name: str, args, environ):
     """``(reason, message)`` when the guard refuses this shim run, else None.
 
@@ -255,11 +338,13 @@ def refusal(name: str, args, environ):
         return None
     if name == "sleep":
         seconds = sleep_seconds(args)
-        if seconds is None or seconds <= SLEEP_LIMIT_S:
+        if seconds is None:
             return None
-        reason = f"sleep {_seconds_text(seconds)} s refused"
-        return reason, (f"BLOCKED: agentq guard: {reason}; workers never babysit. Launch long work detached, "
-                        "write a status file, and return its PID and paths in your report.")
+        if seconds > SLEEP_LIMIT_S:
+            reason = f"sleep {_seconds_text(seconds)} s refused"
+            return reason, (f"BLOCKED: agentq guard: {reason}; workers never babysit. Launch long work detached, "
+                            "write a status file, and return its PID and paths in your report.")
+        return sleep_budget_refusal(db.home_dir(environ), environ, seconds)
     argv = pytest_argv(name, args)
     if argv is not None:
         reason = pytest_reason(argv)
@@ -370,6 +455,8 @@ def main(argv, environ=None) -> int:
         print(message, file=sys.stderr)
         log_block(home, environ, reason, name, args)
         return 2
+    if name == "sleep":
+        record_sleep(home, environ, args)
     command = [real, *args]
     slots.write_ssh_hosts(home)
     if name == "ssh" and ssh_gated(args, slots.gated_hosts(home)):
