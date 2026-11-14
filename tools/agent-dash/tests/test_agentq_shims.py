@@ -473,12 +473,13 @@ class ShellFastPathTests(Base):
         for name, args in (("uv", ["run", "pyright"]), ("uv", ["run", "scripts/lor-ci-local.sh"]),
                            ("python3", ["scripts/validate.sh"]), ("uv", ["run", "pre-commit", "run", "-a"]),
                            ("uv", ["run", "pyright", "a.py"]), ("python3", ["scripts/select_pytests.py", "--all"]),
-                           ("sleep", ["5"])):
+                           ("sleep", ["600"]), ("sleep", ["2m"])):
             with self.subTest(name=name, args=args):
                 marker.unlink(missing_ok=True)
                 self.run_shim(folder, name, args)
                 self.assertTrue(marker.exists())
-        for name, args in (("uv", ["run", "ruff", "check"]), ("python3", ["scripts/tool.py", "validate"])):
+        for name, args in (("uv", ["run", "ruff", "check"]), ("python3", ["scripts/tool.py", "validate"]),
+                           ("sleep", ["0"]), ("sleep", ["0", "0"])):
             with self.subTest(name=name, args=args):
                 marker.unlink(missing_ok=True)
                 self.run_shim(folder, name, args)
