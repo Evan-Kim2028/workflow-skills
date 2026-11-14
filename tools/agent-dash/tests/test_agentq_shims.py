@@ -83,6 +83,7 @@ class Base(unittest.TestCase):
         env = dict(os.environ)
         env["PATH"] = os.pathsep.join([str(SHIMS), str(self.bin), "/usr/bin", "/bin"])
         env["AGENTQ_HOME"] = str(self.home)
+        env["AGENTQ_REFUSED_SLEEP_PAUSE_S"] = "0"
         env["AGENTQ_SHIM_PYTHON"] = sys.executable
         env["AGENTQ_MEMCAP"] = str(self.memcap_script())
         for key in ("AGENTQ_SLOT_HELD", "AGENTQ_MEMCAPPED", "AGENTQ_RUN", "AGENTQ_JOB"):
@@ -444,6 +445,7 @@ class ShellFastPathTests(Base):
 
     def run_shim(self, folder, name, args, extra=None):
         env = self.shim_env(extra)
+        env["AGENTQ_REFUSED_SLEEP_PAUSE_S"] = "0"
         env["PATH"] = os.pathsep.join([str(folder), str(self.bin), "/usr/bin", "/bin"])
         return subprocess.run([str(folder / name), *args], env=env, capture_output=True, text=True, timeout=60)
 
@@ -904,3 +906,20 @@ class KillShimTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("BLOCKED: agentq guard", result.stderr)
                 self.assertIn(f"{name} refused", log.read_text())
+
+
+class RefusedSleepPaceTests(unittest.TestCase):
+    """A refused sleep still waits a little, so polling loops cannot spin on the shim."""
+
+    def test_refused_sleep_pauses_up_to_the_cap(self):
+        start = time.monotonic()
+        dispatch.pause_refused_sleep(["5"], {"AGENTQ_REFUSED_SLEEP_PAUSE_S": "0.3"})
+        self.assertGreaterEqual(time.monotonic() - start, 0.25)
+
+    def test_zero_cap_does_not_pause(self):
+        start = time.monotonic()
+        dispatch.pause_refused_sleep(["5"], {"AGENTQ_REFUSED_SLEEP_PAUSE_S": "0"})
+        self.assertLess(time.monotonic() - start, 0.2)
+
+    def test_budget_default_is_thirty_minutes(self):
+        self.assertEqual(dispatch.SLEEP_BUDGET_DEFAULT_S, 1800)

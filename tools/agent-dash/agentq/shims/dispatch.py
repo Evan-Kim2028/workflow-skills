@@ -16,7 +16,7 @@ reason, command cut to 300 characters). ``AGENTQ_GUARD=0`` turns all of them off
   or ``-a``; ``pyright`` with no file arguments.
 - ``sleep``: a single sleep over 120 s; and a per-job budget. With ``AGENTQ_JOB`` set,
   the running total of seconds in ``guard/sleep-<job>`` under ``AGENTQ_HOME`` may not
-  pass ``AGENTQ_SLEEP_BUDGET_S`` (default 600). Fractional sleeps count rounded up to
+  pass ``AGENTQ_SLEEP_BUDGET_S`` (default 1800). Fractional sleeps count rounded up to
   whole seconds. Budget refusals are not recorded in the total.
 - ``grep`` (sh only): a recursive search (``-r``, ``-R``, ``--recursive``,
   ``--dereference-recursive``, ``-d recurse``, ``--directories=recurse``, or a short
@@ -90,7 +90,8 @@ GUARD_ENV = "AGENTQ_GUARD"
 GUARD_LOG = "guard_blocks.tsv"
 JOB_ENV = "AGENTQ_JOB"
 SLEEP_BUDGET_ENV = "AGENTQ_SLEEP_BUDGET_S"
-SLEEP_BUDGET_DEFAULT_S = 600
+SLEEP_BUDGET_DEFAULT_S = 1800
+REFUSED_SLEEP_PAUSE_S = 10
 SLEEP_STATE_DIR = "guard"
 GUARD_COMMAND_CHARS = 300
 PYTEST_FILE_LIMIT = 25
@@ -279,7 +280,7 @@ def job_label(environ) -> str:
 
 
 def sleep_budget_s(environ) -> float:
-    """The per-job sleep budget in seconds: ``AGENTQ_SLEEP_BUDGET_S``, else 600."""
+    """The per-job sleep budget in seconds: ``AGENTQ_SLEEP_BUDGET_S``, else 1800."""
     raw = (environ.get(SLEEP_BUDGET_ENV) or "").strip()
     try:
         return float(raw) if raw else float(SLEEP_BUDGET_DEFAULT_S)
@@ -326,6 +327,18 @@ def record_sleep(home, environ, args) -> None:
         path.write_text(str(sleep_used_s(home, job) + math.ceil(seconds)) + "\n", encoding="utf-8")
     except OSError:
         return
+
+
+def pause_refused_sleep(args, environ) -> None:
+    """Sleep up to REFUSED_SLEEP_PAUSE_S (``AGENTQ_REFUSED_SLEEP_PAUSE_S`` overrides) before a refused
+    sleep returns, so a polling loop that ignores the refusal keeps its pace instead of spinning."""
+    seconds = sleep_seconds(args)
+    try:
+        cap = float(environ.get("AGENTQ_REFUSED_SLEEP_PAUSE_S") or REFUSED_SLEEP_PAUSE_S)
+    except ValueError:
+        cap = float(REFUSED_SLEEP_PAUSE_S)
+    if seconds and cap > 0:
+        time.sleep(min(seconds, cap))
 
 
 def refusal(name: str, args, environ):
@@ -454,6 +467,8 @@ def main(argv, environ=None) -> int:
         reason, message = blocked
         print(message, file=sys.stderr)
         log_block(home, environ, reason, name, args)
+        if name == "sleep":
+            pause_refused_sleep(args, environ)
         return 2
     if name == "sleep":
         record_sleep(home, environ, args)
