@@ -21,6 +21,7 @@
 - Dash: the long caption under the capacity charts is removed.
 - Worktree janitor: the rmtree error handler works on Python 3.12+, so worktrees are reclaimed again.
 - Worktree janitor: never reaps agent-dash deploy releases.
+- Staging: `scripts/stage_ab.py` replays finished read jobs with a control and a treatment launcher through the live proxy, outside the live broker (see `docs/agentq-staging.md`). The bash-output trim extension ships opt-in (`AGENTQ_TOOL_OUTPUT_CAP`) after a staging run showed no token win.
 
 ## v0.1.0
 
