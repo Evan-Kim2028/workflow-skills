@@ -295,3 +295,17 @@ class ThinkingReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SkillsArgsTest(unittest.TestCase):
+    """Workers start pi without the skills list unless AGENTQ_PI_SKILLS=1."""
+
+    def test_default_is_no_skills(self):
+        self.assertEqual(LP.skills_args({}), ["--no-skills"])
+
+    def test_opt_in_keeps_skills(self):
+        self.assertEqual(LP.skills_args({"AGENTQ_PI_SKILLS": "1"}), [])
+
+    def test_build_argv_carries_no_skills(self):
+        argv = LP.build_argv("lbl", "/ws", "/p.md", "/out", "morph-dsv41flash-1017", None)
+        self.assertIn("--no-skills", argv)
