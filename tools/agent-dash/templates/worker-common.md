@@ -54,6 +54,12 @@ worker, name it in your report; the lead submits it.
 - Access: if a credential or permission is missing, stop within your first
   few tool calls and return BLOCKED with the exact ask. Never search
   transcripts, other repos or env files for secrets.
+- Laptop guards: a command that prints a line starting `BLOCKED:` (a full
+  pyright refused, pyright or test slots full) was refused to protect the
+  shared laptop. Do not retry it in a loop, wait it out, or work around it
+  (no override variable unless the prompt allows one). Commit your work,
+  then end with the `BLOCKED` verdict and quote that line, so the lead can
+  resubmit with a smaller or later run.
 - Paid or rate-limited APIs: read the free usage or quota endpoint first and
   stay under the cap the prompt gives. Prefer a local dataset when one exists.
 - Remote hosts: leave no scratch files behind; write scratch locally.
