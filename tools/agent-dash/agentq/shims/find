@@ -1,0 +1,24 @@
+#!/bin/sh
+# agentq PATH shim for find: refuses a search whose start path is a broad folder (the system roots, the home folder, its projects or worktrees collection, or a child of the worktrees collection). Start paths are the words before the first expression token; the root check is POSIX sh only.
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+if [ "${AGENTQ_GUARD:-1}" != 0 ]; then
+    _seen=
+    _skip=
+    for _arg in "$@"; do
+        if [ -n "$_skip" ]; then
+            _skip=
+            continue
+        fi
+        case $_arg in
+            -H|-L|-P|-O*) continue ;;
+            -D) _skip=1; continue ;;
+            -*|'('|'!'|',') break ;;
+        esac
+        _seen=1
+        shim_check_root find "$_arg" "$@"
+    done
+    [ -n "$_seen" ] || shim_check_root find . "$@"
+fi
+shim_real find || exit 127
+exec "$REAL" "$@"
