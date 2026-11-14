@@ -3447,7 +3447,7 @@ def fill_near_target(raw: dict[int, dict], until: int, fill: dict | None) -> boo
     return average >= fill["low_frac"] * fill["target_billed_per_min"]
 
 
-FILL_DEFAULTS = {"enabled": False, "target_billed_per_min": 8_000_000, "low_frac": 0.9}
+FILL_DEFAULTS = {"enabled": False, "target_billed_per_min": 9_400_000, "low_frac": 0.9}
 
 
 def read_fill(home: Path) -> dict:

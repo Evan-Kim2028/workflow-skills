@@ -128,7 +128,7 @@ class GovernorReserveTest(unittest.TestCase):
         self.gov = self.make_governor()
 
     def make_governor(self, **overrides) -> Governor:
-        config = merge_config(DEFAULT_CONFIG, {"start_target": 1.0, **overrides})
+        config = merge_config(DEFAULT_CONFIG, {"start_target": 1.0, "target_ceiling": 1.5, **overrides})
         return Governor(self.home, config, clock=lambda: self.wall[0], wall=lambda: self.wall[0], log=quiet)
 
     def ticket(self, estimate: int, *, lane: str = "normal", budget: str = "output", model: str = MODEL_OUT):

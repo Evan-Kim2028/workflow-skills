@@ -61,12 +61,13 @@ estimate.
   `total`. A 429 with no recognisable limit, or with a stated limit that no
   budget for the model tracks, cuts every budget the request touched.
 - With no 429 history a saturated budget climbs the fast ramp: its target rises
-  by `fast_step_up` (0.05) every `fast_interval_s` (10 s) up to `fast_until`
-  (1.5), so from 0.98 it reaches 1.0 in about 10 s and keeps climbing until Morph's
-  first 429. The 429 cut sets the budget's `fast_limit` to the cut target, and the
+  by `fast_step_up` (0.05) every `fast_interval_s` (10 s) up to the lower of
+  `fast_until` (1.5) and `target_ceiling` (0.98 by default). So from 0.98 it
+  stays at the ceiling and only a raised `target_ceiling` lets it climb past 1.0
+  until Morph's first 429. The 429 cut sets the budget's `fast_limit` to the cut target, and the
   fast ramp stops there: above it the slow rule applies, one `target_step_up`
   (0.02) per full minute with no 429 and blocked demand, up to `target_ceiling`
-  (1.5). `fast_limit` clears after 30 minutes with no 429 on that budget, so the
+  (0.98 by default). `fast_limit` clears after 30 minutes with no 429 on that budget, so the
   ramp can try the edge again. It is kept in `proxy_state.json`.
 - Steady state: the proxy sits at the edge it learned. The first 429 sets
   `fast_limit` near Morph's real edge E. The target then probes up by 0.02 a
@@ -74,7 +75,8 @@ estimate.
   0.97 E and E (plus at most one probe step). Between 429s it is at 1.0 of the
   learned edge; right after a cut it is at about 0.97 of it.
 
-Targets may exceed 1.0. The window counts each in-flight request at its full
+Targets may exceed 1.0 only when `target_ceiling` is raised above the default
+0.98. The window counts each in-flight request at its full
 estimate from admission and again at its real usage for 60 s after completion,
 so it overstates what Morph tallies. A budget at 1.0 can therefore stop
 admitting work that Morph would accept. Targets above 1.0 let AIMD find the real
@@ -97,7 +99,12 @@ proxy caps at 32,768 for DeepSeek) hold more than they bill.
 
 Two settings test this. Both default to the current behaviour.
 
-- `window_mode`: `rolling` (default) or `calendar`. In `calendar` mode a budget's
+- `window_mode`: `rolling` or `calendar`. The default budgets are rolling for
+  `total`, which tracks Morph's account-wide 10M tokens/min limit: its first 429
+  of each minute arrived 5-17 s in while the calendar count was far below the
+  limit, so a rolling 60 s window is the model that matches Morph. The other
+  default budgets are `calendar`. The top-level `window_mode` (default `rolling`)
+  applies only to budgets that do not set their own mode. In `calendar` mode a budget's
   usage is the charges admitted in the current UTC minute, and the window resets
   at :00. A request refused by a full calendar budget waits for the next :00 plus
   up to `calendar_jitter_s` (1.5 s) of jitter, instead of the time until
@@ -110,7 +117,9 @@ Two settings test this. Both default to the current behaviour.
   abandoned, because upstream did not bill it. The output budget reserves its
   requested `max_tokens`, and each uncached budget keeps its estimate.
 
-Set either in `$AGENTQ_HOME/proxy.json`, globally or per budget:
+Set either in `$AGENTQ_HOME/proxy.json`. The top-level setting does not reach
+`total` (it is pinned to `rolling` in the defaults), so a calendar `total` needs
+its per-budget entry:
 
 ```json
 {"window_mode": "calendar", "charge_basis": "prompt_plus_max",

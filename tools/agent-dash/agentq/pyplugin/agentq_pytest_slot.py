@@ -143,7 +143,7 @@ def _take_slot(config, environ):
     slots, db = _load_agentq(environ)
     home = db.home_dir(environ)
     limits = slots.load_limits(home)
-    admit = slots.pytest_admission(limits, slots.Gauges(home, ttl_s=limits.gauge_ttl_s))
+    admit = slots.pytest_admission(limits, slots.Gauges(home, settings=limits.gauge_settings))
     command = shlex.join(["pytest", *_pytest_args(config)])
     return slots.acquire("pytest", limit=slots.kind_limit(limits, "pytest"), home=home,
                          label=_run_label(environ), command=command, admit=admit, warn=_note)

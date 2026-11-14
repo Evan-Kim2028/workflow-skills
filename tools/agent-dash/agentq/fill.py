@@ -57,7 +57,7 @@ MINUTE_GATE_BUDGETS = ("output", UNCACHED_BUDGET)
 DEFAULT_FILL = {
     "enabled": False,
     "window_minutes": 2,
-    "target_billed_per_min": 8_000_000,
+    "target_billed_per_min": 9_400_000,
     "max_workers": 64,
     "low_frac": 0.9,
     "high_frac": 0.97,

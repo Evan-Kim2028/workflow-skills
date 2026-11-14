@@ -123,7 +123,7 @@ instead of letting it swing between idle and burst.
 
 - Fill (`broker.json` `fill`, off by default; `"enabled": true` turns it on). While the
   DeepSeek 5-minute billed average (`input + cache_read + output` of DeepSeek rows in
-  `proxy_minutes`) is below `low_frac` (0.9) of `target_billed_per_min` (8M), the
+  `proxy_minutes`) is below `low_frac` (0.9) of `target_billed_per_min` (9.4M), the
   controller grows the filler by up to `step_workers` (4) every `step_interval_s`
   (120 s) while the average is below the low mark. It tracks a `level`,
   the filler population it has reached. Finished filler is replaced up to `level` at

@@ -29,7 +29,14 @@ from agentq import slots  # noqa: E402
 
 PLUGIN_PATH = PLUGIN_DIR / "agentq_pytest_slot.py"
 LIMITS = slots.Limits(
-    ssh=8, pytest=16, adaptive=False, floor=4, min_free_pct=35.0, max_load_per_cpu=1.0, gauge_ttl_s=15.0
+    ssh=8,
+    pytest=16,
+    adaptive=False,
+    floor=4,
+    min_free_pct=35.0,
+    max_cpu_busy=0.80,
+    max_swap_frac=0.90,
+    gauge_settings={"memory_ttl_s": 15.0, "sample_s": 10.0, "tau_s": 60.0},
 )
 
 
@@ -382,7 +389,7 @@ class ShimHandoffTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        result = subprocess.run([str(SHIMS / "pytest"), "-q"], env=self.shim_env(),
+        result = subprocess.run([str(SHIMS / "pytest"), "-q", str(Path(__file__).resolve())], env=self.shim_env(),
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(seen.read_text(), "1")
@@ -392,7 +399,8 @@ class ShimHandoffTests(unittest.TestCase):
         fake = self.bin / "pytest"
         fake.write_text("#!/bin/sh\necho nested-ok\n", encoding="utf-8")
         fake.chmod(0o755)
-        result = subprocess.run([str(SHIMS / "pytest")], env=self.shim_env({"AGENTQ_PYTEST_SLOT_HELD": "1"}),
+        result = subprocess.run([str(SHIMS / "pytest"), str(Path(__file__).resolve())],
+                                env=self.shim_env({"AGENTQ_PYTEST_SLOT_HELD": "1"}),
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("nested-ok", result.stdout)
