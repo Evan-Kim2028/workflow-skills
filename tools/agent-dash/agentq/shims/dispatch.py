@@ -1,4 +1,4 @@
-"""Dispatch for the PATH shims ``ssh``, ``pytest``, ``python``, ``python3`` and ``uv``.
+"""Dispatch for the PATH shims ``ssh``, ``pytest``, ``python``, ``python3``, ``uv`` and ``sleep``.
 
 Each shell wrapper in this folder runs ``dispatch.py <its own name> <args>``. The
 real binary is the first match on PATH with this folder removed, so a shim never
@@ -15,6 +15,17 @@ Gated runs:
   ``uv run python[3] -m pytest``. Takes a ``pytest`` slot, then runs the real
   command under ``memcap.sh 8192``.
 
+Guard (``refusal``): inside the shims, a worker run that would load a whole suite
+or check the whole repo is refused with exit 2, a ``BLOCKED:`` line on stderr, and
+one line appended to ``guard_blocks.tsv`` under ``AGENTQ_HOME``. Refused: pytest
+with no target, a directory target, or more than 25 test files; the full gates
+``lor-ci-local.sh``, ``ci-local.sh`` and ``validate.sh``; ``select_pytests.py
+--all``; ``pre-commit`` with ``--all-files`` or ``-a``; ``pyright`` with no file
+arguments; and ``sleep`` longer than 120 s. A gate script is caught only when a
+python or uv shim sees it as an argument (``uv run scripts/validate.sh``,
+``python3 scripts/validate.sh``). ``bash`` and ``sh`` are not shimmed, so
+``bash scripts/validate.sh`` is not covered. ``AGENTQ_GUARD=0`` turns the guard off.
+
 Environment: ``AGENTQ_SHIMS=0`` turns the shims off for pi (set by
 ``launch_pi.py``). ``AGENTQ_SLOT_HELD`` lists the slot kinds this process tree
 already holds, so a pytest started inside a held pytest does not wait for its
@@ -30,9 +41,11 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SHIMS_DIR = Path(__file__).resolve().parent
@@ -49,6 +62,23 @@ HELD_ENV = "AGENTQ_SLOT_HELD"
 MEMCAPPED_ENV = "AGENTQ_MEMCAPPED"
 PYTEST_HELD_ENV = "AGENTQ_PYTEST_SLOT_HELD"
 MEMCAP_ENV = "AGENTQ_MEMCAP"
+GUARD_ENV = "AGENTQ_GUARD"
+GUARD_LOG = "guard_blocks.tsv"
+GUARD_COMMAND_CHARS = 300
+PYTEST_FILE_LIMIT = 25
+SLEEP_LIMIT_S = 120
+FULL_GATE_SCRIPTS = frozenset({"lor-ci-local.sh", "ci-local.sh", "validate.sh"})
+PYTEST_VALUE_OPTS = frozenset({
+    "-k", "-m", "-p", "-n", "-c", "-o", "-W", "-r", "--maxfail", "--rootdir", "--junitxml", "--durations",
+    "--ignore", "--ignore-glob", "--deselect", "--confcutdir", "--basetemp", "--log-level", "--timeout",
+    "--tb", "--dist",
+})
+PYRIGHT_VALUE_OPTS = frozenset({
+    "-p", "--project", "--pythonpath", "--pythonversion", "--venvpath", "--typeshedpath", "--level",
+})
+SLEEP_UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+SLEEP_ARG = re.compile(r"(\d+(?:\.\d*)?|\.\d+)([smhd]?)")
+PYTEST_HINT = "Run only the test files for the code you changed: pytest <file.py> [...]"
 
 
 class ShimError(RuntimeError):
@@ -118,29 +148,142 @@ def ssh_gated(args, patterns) -> bool:
     return host is not None and any(fnmatch.fnmatchcase(host, pattern.lower()) for pattern in patterns)
 
 
+def pytest_argv(name: str, args):
+    """The argv after the pytest token of a pytest invocation, or None when the invocation is not pytest.
+
+    Covers ``pytest``, ``python[3] -m pytest``, ``uv run [options] pytest`` and
+    ``uv run [options] python[3] -m pytest``.
+    """
+    if name == "pytest":
+        return list(args)
+    if name in PYTHON_NAMES:
+        return list(args[2:]) if list(args[:2]) == ["-m", "pytest"] else None
+    if name == "uv" and args and args[0] == "run":
+        rest = list(args[1:])
+        index = 0
+        while index < len(rest) and rest[index].startswith("-"):
+            index += 1
+        head = rest[index:]
+        if head[:1] == ["pytest"]:
+            return head[1:]
+        if head[:1] in (["python"], ["python3"]) and head[1:3] == ["-m", "pytest"]:
+            return head[3:]
+    return None
+
+
 def is_pytest(name: str, args) -> bool:
     """True for the pytest invocations this shim gates."""
-    if name == "pytest":
-        return True
-    if name in PYTHON_NAMES:
-        return list(args[:2]) == ["-m", "pytest"]
-    if name == "uv":
-        return _uv_runs_pytest(args)
-    return False
+    return pytest_argv(name, args) is not None
 
 
-def _uv_runs_pytest(args) -> bool:
-    """``uv run [options] pytest`` or ``uv run [options] python[3] -m pytest``."""
-    if not args or args[0] != "run":
-        return False
-    rest = list(args[1:])
+def _positionals(args, value_opts) -> list[str]:
+    """The positional words of an argv: options and the values of the options in ``value_opts`` are skipped.
+
+    Everything after a ``--`` is positional.
+    """
+    found = []
+    rest = list(args)
     index = 0
-    while index < len(rest) and rest[index].startswith("-"):
+    while index < len(rest):
+        arg = rest[index]
         index += 1
-    head = rest[index:]
-    if head[:1] == ["pytest"]:
-        return True
-    return head[:1] in (["python"], ["python3"]) and head[1:3] == ["-m", "pytest"]
+        if arg == "--":
+            found.extend(rest[index:])
+            break
+        if arg.startswith("-") and arg != "-":
+            if arg in value_opts:
+                index += 1
+            continue
+        found.append(arg)
+    return found
+
+
+def pytest_reason(argv):
+    """Why a pytest argv is refused, or None when every target is a test file or ``file::node`` id."""
+    targets = _positionals(argv, PYTEST_VALUE_OPTS)
+    if not targets:
+        return "pytest has no test target and would collect the whole repo"
+    files = {target.split("::", 1)[0] for target in targets}
+    for path in sorted(files):
+        if path.endswith("/") or os.path.isdir(path):
+            return f"pytest target {path} is a directory, not a test file"
+    if len(files) > PYTEST_FILE_LIMIT:
+        return f"pytest names {len(files)} test files (limit {PYTEST_FILE_LIMIT})"
+    return None
+
+
+def gate_reason(args):
+    """Why a python or uv argv is refused as a full gate or a whole-repo check, or None."""
+    words = list(args)
+    for index, word in enumerate(words):
+        base = os.path.basename(word)
+        if base in FULL_GATE_SCRIPTS:
+            return f"full gate {base} is not a worker check"
+        if base == "select_pytests.py" and "--all" in words:
+            return "select_pytests.py --all selects the whole suite"
+        if word == "pre-commit" and ("--all-files" in words or "-a" in words):
+            return "pre-commit over all files is a whole-repo check"
+        if base == "pyright" and not _positionals(words[index + 1:], PYRIGHT_VALUE_OPTS):
+            return "pyright with no file arguments checks the whole repo"
+    return None
+
+
+def sleep_seconds(args):
+    """Total seconds of a plain sleep argv (``5``, ``2m``, ``1.5h``), or None for anything else."""
+    if not args:
+        return None
+    total = 0.0
+    for arg in args:
+        match = SLEEP_ARG.fullmatch(arg)
+        if match is None:
+            return None
+        total += float(match.group(1)) * SLEEP_UNIT_S[match.group(2)]
+    return total
+
+
+def _seconds_text(seconds: float) -> str:
+    return str(int(seconds)) if seconds == int(seconds) else f"{seconds:.1f}"
+
+
+def refusal(name: str, args, environ):
+    """``(reason, message)`` when the guard refuses this shim run, else None.
+
+    The message is the stderr line a worker sees; the reason is what ``guard_blocks.tsv`` records.
+    ``AGENTQ_GUARD=0`` turns every refusal off.
+    """
+    if (environ.get(GUARD_ENV) or "").strip() == "0":
+        return None
+    if name == "sleep":
+        seconds = sleep_seconds(args)
+        if seconds is None or seconds <= SLEEP_LIMIT_S:
+            return None
+        reason = f"sleep {_seconds_text(seconds)} s refused"
+        return reason, (f"BLOCKED: agentq guard: {reason}; workers never babysit. Launch long work detached, "
+                        "write a status file, and return its PID and paths in your report.")
+    argv = pytest_argv(name, args)
+    if argv is not None:
+        reason = pytest_reason(argv)
+    elif name in PYTHON_NAMES or name == "uv":
+        reason = gate_reason(args)
+    else:
+        reason = None
+    if reason is None:
+        return None
+    return reason, f"BLOCKED: agentq guard: {reason}. {PYTEST_HINT}"
+
+
+def log_block(home, environ, reason: str, name: str, args) -> None:
+    """Append one refusal to ``guard_blocks.tsv``: epoch, run label, reason, command. Never raises."""
+    try:
+        command = shlex.join([name, *args])[:GUARD_COMMAND_CHARS]
+        fields = [str(int(time.time())), run_label(environ), reason, command]
+        line = "\t".join(field.replace("\t", " ").replace("\n", " ") for field in fields)
+        path = Path(home) / GUARD_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except (OSError, ValueError):
+        return
 
 
 def run_label(environ) -> str:
@@ -221,6 +364,12 @@ def main(argv, environ=None) -> int:
         print(exc, file=sys.stderr)
         return 127
     home = db.home_dir(environ)
+    blocked = refusal(name, args, environ)
+    if blocked is not None:
+        reason, message = blocked
+        print(message, file=sys.stderr)
+        log_block(home, environ, reason, name, args)
+        return 2
     command = [real, *args]
     slots.write_ssh_hosts(home)
     if name == "ssh" and ssh_gated(args, slots.gated_hosts(home)):

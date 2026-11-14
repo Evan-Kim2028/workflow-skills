@@ -1,0 +1,17 @@
+#!/bin/sh
+# agentq PATH shim for sleep. Fast path in sh: whole-second sleeps totalling 120 s or less exec the real sleep; anything else goes to dispatch.py, which refuses sleeps over 120 s.
+case $0 in */*) SHIM_HERE=${0%/*} ;; *) SHIM_HERE=. ;; esac
+. "$SHIM_HERE/shim-lib.sh"
+_total=0
+_fast=1
+for _arg in "$@"; do
+    case $_arg in
+        ''|*[!0-9]*) _fast= ; break ;;
+    esac
+    _total=$((_total + _arg))
+done
+if [ -n "$_fast" ] && [ $# -gt 0 ] && [ "$_total" -le 120 ]; then
+    shim_real sleep || exit 127
+    exec "$REAL" "$@"
+fi
+shim_dispatch sleep "$@"
