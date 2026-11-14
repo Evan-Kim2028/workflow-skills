@@ -104,11 +104,11 @@ shim_check_root() {
 
 shim_sleep_budget() {
     # shim_sleep_budget <seconds> <sleep args...>: refuse when this job's running sleep total would
-    # pass AGENTQ_SLEEP_BUDGET_S (default 600), else add the seconds to the job's counter file.
+    # pass AGENTQ_SLEEP_BUDGET_S (default 1800), else add the seconds to the job's counter file.
     # Returns 1 without deciding when the budget is not a whole number; dispatch.py decides then.
     _secs=$1
     shift
-    _budget=${AGENTQ_SLEEP_BUDGET_S:-600}
+    _budget=${AGENTQ_SLEEP_BUDGET_S:-1800}
     case $_budget in
         *[!0-9]*) return 1 ;;
     esac
@@ -123,6 +123,11 @@ shim_sleep_budget() {
     fi
     _new=$((_used + _secs))
     if [ "$_new" -gt "$_budget" ]; then
+        _pause=${AGENTQ_REFUSED_SLEEP_PAUSE_S:-10}
+        case $_pause in *[!0-9]*) _pause=10 ;; esac
+        if [ "$_pause" -gt 0 ] && shim_real sleep; then
+            "$REAL" "$(( _secs < _pause ? _secs : _pause ))" 2>/dev/null
+        fi
         shim_refuse "sleep budget used ($_new s of $_budget s)" \
             "workers never babysit. Launch long work detached, write a status file, and report its PID and paths." \
             sleep "$@"
