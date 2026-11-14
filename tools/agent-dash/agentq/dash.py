@@ -378,7 +378,6 @@ h3.group { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transfor
 .pair .card { margin-bottom: 0; }
 .pair .card-head { min-height: 58px; align-items: flex-start; }
 .pair .legend { min-height: 18px; }
-.pair .pair-note { grid-column: 1 / -1; margin-top: 0; }
 @media (min-width: 1100px) { .pair { grid-template-columns: 1fr 1fr; } }
 
 .tbl-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin: 2px 0 8px; }
@@ -482,7 +481,6 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         </div>
         <div class="chart" id="c-workers"></div>
       </section>
-      <div class="note-line pair-note">The left chart is total pool tokens per minute as a share of Morph's 10M limit: admitted tokens where the proxy recorded them, completion minutes elsewhere. The faint line is each minute, and the hollow marker at the right edge is the minute in progress, showing its tokens so far. The step line is the average of each complete Eastern clock hour over its minutes, with idle minutes counted as zero; the hour in progress has no step until it completes. The dashed grey line is the 10M limit. Carets mark values above the 120% axis top, and the tooltip shows the true values.</div>
     </div>
   </section>
 

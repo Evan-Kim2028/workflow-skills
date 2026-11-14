@@ -1957,11 +1957,10 @@ class CapacityPairTest(unittest.TestCase):
         start = html.index('registerChart("c-upstream"')
         self.assertIn("margin: PAIR_LAYOUT.margin", html[start:html.index("setText(\"up-note\"", start)])
 
-    def test_shared_note_sits_under_both_columns_and_the_old_claim_is_gone(self) -> None:
+    def test_the_capacity_pair_has_no_explanatory_caption(self) -> None:
         html = dash.PAGE_HTML
-        self.assertIn('class="note-line pair-note"', html)
-        self.assertNotIn("lines are comparable", html)
-        self.assertLess(html.index('id="c-workers"'), html.index('class="note-line pair-note"'))
+        self.assertNotIn("pair-note", html)
+        self.assertNotIn("The left chart is total pool tokens", html)
 
     def test_deepseek_uncached_chart_sits_next_to_kimi_with_a_rejection_subtitle(self) -> None:
         html = dash.PAGE_HTML
