@@ -943,6 +943,44 @@ class TokenChartTest(unittest.TestCase):
         self.assertEqual(week["token_bucket_s"], 1800)
         self.assertEqual(week["token_limit"]["value"], 10_000_000 * 30)
 
+    def test_the_newest_token_bucket_is_partial_with_the_minutes_it_covers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = make_home(Path(tmp))
+            conn = sqlite3.connect(home / "agentq.db")
+            conn.execute(
+                f"INSERT INTO proxy_minutes ({MINUTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (dash.minute_stamp(UNTIL + 120), "morph-dsv41flash-1017", 1, 1, 0, 10, 0, 20, 0, 5, 5, 0.9),
+            )
+            conn.commit()
+            conn.close()
+            summary = dash.build_summary(home, 24, now=NOW + 180, fetch_live=proxy_status, laptop=CALM)
+        last = summary["token_mix"][-1]
+        self.assertEqual(last["minute"], dash.minute_stamp(UNTIL))
+        self.assertIs(last["partial"], True)
+        self.assertEqual(last["minutes"], 3)
+        self.assertEqual(last["bucket_minutes"], 5)
+        self.assertNotIn("partial", summary["token_mix"][-2])
+
+    def test_only_a_newest_bucket_short_of_its_full_minutes_is_marked_partial(self) -> None:
+        def bucket(t: int, covered: int) -> dict:
+            return {"t": t, "minute": dash.minute_stamp(t), "minutes": covered, "cache_read": 1, "input": 2, "output": 3}
+
+        full = dash.token_mix([bucket(0, 5), bucket(300, 5)], 300)
+        self.assertFalse(any("partial" in row for row in full))
+        short = dash.token_mix([bucket(0, 5), bucket(300, 4)], 300)
+        self.assertNotIn("partial", short[0])
+        self.assertEqual(short[1]["partial"], True)
+        self.assertEqual(short[1]["minutes"], 4)
+        self.assertEqual(short[1]["bucket_minutes"], 5)
+        self.assertEqual(short[1]["cumulative"], 12)
+
+    def test_the_page_draws_a_partial_bucket_hollow_and_says_how_far_it_has_got(self) -> None:
+        self.assertIn('"stroke-dasharray": "3 2"', dash.PAGE_HTML)
+        self.assertIn('"So far, " + p.minutes + " of " + p.bucket_minutes + " min"', dash.PAGE_HTML)
+        self.assertIn("var STALE_RETRY_MAX = 5;", dash.PAGE_HTML)
+        self.assertIn("setTimeout(refresh, STALE_RETRY_MS);", dash.PAGE_HTML)
+        self.assertIn("retryIfStale(data);", dash.PAGE_HTML)
+
     def test_left_axis_covers_the_limit_and_1_1_times_the_largest_bucket(self) -> None:
         for hours in (6, 168):
             summary = self.summary(hours)
@@ -2215,28 +2253,37 @@ class SummaryCacheTest(unittest.TestCase):
             self.cache.wait_for_computes()
             self.assertEqual(build.call_count, 9)
 
-    def test_worker_is_idle_once_nobody_has_asked_for_IDLE_AFTER_S(self) -> None:
+    def test_an_idle_worker_recomputes_a_body_only_once_it_is_older_than_IDLE_REFRESH_S(self) -> None:
         with self.counting_build() as build:
             self.cache.touch()
             self.cache.tick()
             self.cache.wait_for_computes()
-            before = build.call_count
+            self.assertEqual(build.call_count, 4)
             self.now += dash.IDLE_AFTER_S + 1
+            self.assertFalse(self.cache.active())
             self.cache.tick()
             self.cache.wait_for_computes()
-            self.assertEqual(build.call_count, before)
-            self.assertFalse(self.cache.active())
+            self.assertEqual(build.call_count, 8)
+            self.now += 30
+            self.cache.tick()
+            self.cache.wait_for_computes()
+            self.assertEqual(build.call_count, 8)
+            self.now += 31
+            self.cache.tick()
+            self.cache.wait_for_computes()
+            self.assertEqual(build.call_count, 12)
+        self.assertEqual(self.cache.bodies[1].generated_at, self.now)
 
-    def test_a_request_after_idle_serves_the_stored_bytes_at_once(self) -> None:
+    def test_a_request_after_idle_gets_a_fresh_body_in_place_of_a_stale_stored_one(self) -> None:
         with self.counting_build() as build:
             self.cache.touch()
             self.cache.tick()
             self.cache.wait_for_computes()
             self.now += 10 * 3600
             body, generated = self.cache.get(1)
-        self.assertEqual(build.call_count, 4)
-        self.assertLess(generated, self.now)
-        self.assertIsNotNone(body)
+        self.assertEqual(build.call_count, 5)
+        self.assertEqual(generated, self.now)
+        self.assertEqual(json.loads(body)["generated_at"], self.now)
 
     def test_a_slow_reader_serves_its_last_value_with_its_age(self) -> None:
         reader = dash.BackgroundReader("probe", lambda: {"ok": True}, lambda: True, clock=lambda: self.now)
@@ -2552,6 +2599,56 @@ class WatchdogTest(unittest.TestCase):
             self.cache.wait_for_computes()
         self.assertEqual(build.call_count, first)
         self.assertNotIn("recomputing", err.getvalue())
+
+
+class StaleRequestTest(unittest.TestCase):
+    """A request for a body older than WATCHDOG_FACTOR x cadence waits up to STALE_WAIT_S for a newer one."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = make_home(Path(self.tmp.name))
+        self.now = 1000.0
+        self.gate = threading.Event()
+        self.cache = dash.SummaryCache(self.home, fetch_live=no_proxy, clock=lambda: self.now)
+        self.stale_at = self.now - dash.WATCHDOG_FACTOR * dash.RANGE_CADENCE_S[1] - 1
+
+    def tearDown(self) -> None:
+        self.gate.set()
+        self.cache.stop()
+        self.cache.wait_for_computes(10)
+        self.tmp.cleanup()
+
+    def store_stale_body(self) -> None:
+        self.cache.bodies[1] = dash.Stored(b'{"generated_at": 0}', self.stale_at, False, 0)
+
+    def test_a_stale_body_is_replaced_by_a_compute_that_stores_within_the_wait(self) -> None:
+        self.store_stale_body()
+        body, generated = self.cache.get(1)
+        self.assertEqual(generated, self.now)
+        self.assertEqual(json.loads(body)["generated_at"], self.now)
+
+    def test_a_compute_slower_than_the_wait_returns_the_stale_body_in_time(self) -> None:
+        self.store_stale_body()
+        real_build = dash.build_summary
+
+        def slow(*args, **kwargs):
+            self.gate.wait(20)
+            return real_build(*args, **kwargs)
+
+        with mock.patch.object(dash, "build_summary", side_effect=slow):
+            started = time.monotonic()
+            body, generated = self.cache.get(1)
+            elapsed = time.monotonic() - started
+        self.assertEqual(generated, self.stale_at)
+        self.assertEqual(body, b'{"generated_at": 0}')
+        self.assertLess(elapsed, dash.STALE_WAIT_S + 1.0, elapsed)
+
+    def test_a_body_within_three_cadences_is_served_without_a_compute(self) -> None:
+        self.cache.bodies[1] = dash.Stored(b"{}", self.now - dash.WATCHDOG_FACTOR * dash.RANGE_CADENCE_S[1], False, 0)
+        with mock.patch.object(dash, "build_summary", wraps=dash.build_summary) as build:
+            body, generated = self.cache.get(1)
+        self.assertEqual(build.call_count, 0)
+        self.assertEqual(body, b"{}")
 
 
 class ComputeCapTest(unittest.TestCase):
