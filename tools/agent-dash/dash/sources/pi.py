@@ -109,23 +109,29 @@ def _poll(store, cfg, now):
             for live in _live_rows(pad):
                 rows[_row_key(live)] = live
     processes = _agent_processes()
+    hints = _process_hints(processes)
     seen = _seen(store)
     per_file, budget = _grok._budgets(cfg)
-    usage: list = []
-    for row, stream_sid, folds in _collapse(rows):
-        budget = _upsert_run(
-            store,
-            row,
-            processes,
-            seen,
-            budget,
-            per_file,
-            now,
-            stream_sid=stream_sid,
-            folds=folds,
-            usage=usage,
-        )
-    _flush_usage(store, usage)
+    pending = {"usage": [], "commits": [], "folds": []}
+    try:
+        for row, stream_sid, folds in _collapse(rows):
+            budget = _upsert_run(
+                store,
+                row,
+                processes,
+                seen,
+                budget,
+                per_file,
+                now,
+                stream_sid=stream_sid,
+                folds=folds,
+                hints=hints,
+                pending=pending,
+            )
+    finally:
+        if _flush_usage(store, pending["usage"]):
+            _commit_cursors(store, pending["commits"])
+            _apply_folds(store, pending["folds"])
 
 
 _UNSET = object()
@@ -580,7 +586,8 @@ def _upsert_run(
     now=None,
     stream_sid=_UNSET,
     folds=(),
-    usage=None,
+    hints=None,
+    pending=None,
 ):
     label = row["label"]
     pad = row["pad"]
@@ -631,36 +638,124 @@ def _upsert_run(
                 run["ended_at"] = _mtime(out_path) or row.get("started")
             else:
                 run["status"] = "unknown"
-    if not _settled(run):
+    if _needs_liveness(store, run, hints):
         _process_apply(store, run, processes)
-    budget = _apply_stream(store, run, pad, label, budget, per_file, now, usage)
+    budget = _apply_stream(store, run, pad, label, budget, per_file, now, pending)
     _emit_run(store, run, seen)
     if stream_sid and row.get("sid") and row["sid"] != stream_sid:
         # After the emit: the stream run exists, so the fold can move the
         # pre-generated row on this poll instead of the next one.
-        _reassign_twin(store, row["sid"], stream_sid, label)
+        _queue_fold(store, pending, row["sid"], stream_sid, label)
     for old_sid in folds:
-        _reassign_twin(store, old_sid, sid, label)
+        _queue_fold(store, pending, old_sid, sid, label)
     return budget
 
 
 _TERMINAL = ("done", "died_early")
 
 
-def _settled(run) -> bool:
-    """True when liveness cannot change this run's row.
+def _process_hints(processes):
+    """``(pids, labels)`` from one process listing, or None when unavailable."""
+    if processes is None:
+        return None
+    pids = set()
+    labels = set()
+    for proc in processes:
+        pid = proc.get("pid")
+        if pid is not None:
+            pids.add(pid)
+        label = proc.get("label")
+        if label:
+            labels.add(label)
+    return pids, labels
 
-    ``apply_liveness`` only revives an open ``unknown`` row and closes a
-    ``running`` one. A run with a verdict, a failure, or a closed
-    ``unknown`` row is left exactly as the files describe it, so the
-    process listing is not matched against it again. A relaunch under the
-    same label is still seen: it writes ``running/<label>``, which makes
-    the row live and its status ``running``.
+
+def _needs_liveness(store, run, hints) -> bool:
+    """True when ``apply_liveness`` can still change this row.
+
+    ``apply_liveness`` only revives an open ``unknown`` row, closes a
+    ``running`` one, or makes a row ``running`` when a live process matches
+    it. A settled row (a verdict, a failure, or a closed ``unknown`` row)
+    is only matched when the listing names its pid or label, or the stored
+    row is still open, so a recent process sample can revive it. Without a
+    listing (``hints is None``) there is nothing to do.
+    """
+    if hints is None:
+        return False
+    if not _settled(run):
+        return True
+    pids, labels = hints
+    pid = run.get("pid")
+    if pid is not None and pid in pids:
+        return True
+    label = run.get("label")
+    if label and label in labels:
+        return True
+    existing = _stored_run(store, run.get("run_id"))
+    if existing is not None and existing.get("status") in ("running", "unknown"):
+        return True
+    return False
+
+
+def _stored_run(store, run_id):
+    getter = getattr(store, "get_run", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(run_id)
+    except Exception:
+        return None
+
+
+def _settled(run) -> bool:
+    """True when this poll's file evidence already ends the run.
+
+    A terminal status, or an ``unknown`` row with ``ended_at``, can only
+    change through liveness, which :func:`_needs_liveness` checks against
+    the listing and the stored row before it runs.
     """
     status = run.get("status")
     if status in _TERMINAL:
         return True
     return status == "unknown" and run.get("ended_at") is not None
+
+
+def _queue_fold(store, pending, old_sid, new_sid, label):
+    """Defer a twin fold until after the poll's usage flush.
+
+    ``reassign_run`` extends a terminal destination's ``ended_at`` to its
+    latest usage timestamp, so the rows it reads must be written first.
+    """
+    if pending is None:
+        _reassign_twin(store, old_sid, new_sid, label)
+        return
+    pending["folds"].append((old_sid, new_sid, label))
+
+
+def _apply_folds(store, folds):
+    done = set()
+    for old_sid, new_sid, label in folds:
+        pair = (old_sid, new_sid, label)
+        if pair in done:
+            continue
+        done.add(pair)
+        _reassign_twin(store, old_sid, new_sid, label)
+
+
+def _commit_cursors(store, cursors):
+    for key, inode, offset, size, mtime in cursors:
+        try:
+            store.set_offset(key, inode, offset, size, mtime)
+        except Exception:
+            _fail("stream-index")
+
+
+def _restore_cursors(store, restores):
+    for key, inode, offset, size, mtime in restores:
+        try:
+            store.set_offset(key, inode, offset, size, mtime)
+        except Exception:
+            _fail("stream-cursor")
 
 
 def _reassign_twin(store, old_sid, new_sid, label):
@@ -708,7 +803,7 @@ def _first_file(pad, name):
     return alt if os.path.isfile(alt) else path
 
 
-def _apply_stream(store, run, pad, label, budget, per_file, now, usage=None):
+def _apply_stream(store, run, pad, label, budget, per_file, now, pending=None):
     """Emit usage from the run's stream, byte-cursored per file.
 
     The stream is the authoritative ledger: ``launch_pi.py`` writes its
@@ -717,11 +812,18 @@ def _apply_stream(store, run, pad, label, budget, per_file, now, usage=None):
     that gap and backfills finished runs from offset 0 on the first poll.
     Usage rows carry the stream's session id (the launcher's lines do too),
     so a run with both readers upserts one row instead of two.
+
+    ``_read_chunk`` commits the byte cursor itself, so its prior position is
+    restored right after the read. Both cursor advances are then deferred to
+    ``pending`` and committed only after the poll's usage flush succeeds, so
+    a failed flush or a crash mid-poll re-reads the same bytes and upserts
+    the same message ids instead of losing the usage.
     """
     path = _stream_file(pad, label)
     if not os.path.isfile(path):
         return budget
     key = "pi:stream:" + path
+    prev = _offset(store, key)
     try:
         raw, budget, started = _grok._read_chunk(store, path, key, budget, per_file)
     except Exception:
@@ -729,6 +831,8 @@ def _apply_stream(store, run, pad, label, budget, per_file, now, usage=None):
         return budget
     if not raw:
         return budget
+    previous = (key, prev[0] if prev else 0, prev[1] if prev else 0, 0, 0)
+    _restore_cursors(store, [previous])
     stream_sid = _stream_session(pad, label) or run.get("session_id")
     model = run.get("model")
     try:
@@ -758,15 +862,18 @@ def _apply_stream(store, run, pad, label, budget, per_file, now, usage=None):
             "cache_write_1h": ev["cache_write_1h"],
             "reasoning": 0,
         }
-        if usage is None:
+        if pending is None:
             _add_usage(store, row)
         else:
-            usage.append(row)
+            pending["usage"].append(row)
+    base = 0 if started else (prev[1] if prev else 0)
+    commits = [(key, st.st_ino, base + len(raw), st.st_size, st.st_mtime)]
     if events:
-        try:
-            store.set_offset(index_key, st.st_ino, start_index + len(events), 0, 0)
-        except Exception:
-            _fail("stream-index")
+        commits.append((index_key, st.st_ino, start_index + len(events), 0, 0))
+    if pending is None:
+        _commit_cursors(store, commits)
+    else:
+        pending["commits"].extend(commits)
     return budget
 
 
@@ -798,19 +905,26 @@ def _flush_usage(store, rows):
     once for the whole batch. The per-row path rebuilds the hour after every
     row, which is quadratic in a poll's new events: ~190 rows against a
     ~5,800-event hour cost 16 s of a 18 s poll. A store without the batch
-    method falls back to the per-row call.
+    method falls back to the per-row call. Returns True when every row was
+    written; a False result keeps the poll's cursors where they were.
     """
     if not rows:
-        return
+        return True
     batch = getattr(store, "add_usage_batch", None)
     if callable(batch):
         try:
             batch(rows)
-            return
+            return True
         except Exception:
             _fail("usage")
+    ok = True
     for row in rows:
-        _add_usage(store, row)
+        try:
+            store.add_usage(row)
+        except Exception:
+            _fail("usage")
+            ok = False
+    return ok
 
 
 def _process_apply(store, run, processes):

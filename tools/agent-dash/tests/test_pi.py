@@ -859,6 +859,50 @@ class IncrementalPollTest(SourceTest):
         self.assertEqual(calls, [self.run_id(label)])
         self.assertEqual(self.store.runs[self.run_id(label)]["status"], "unknown")
 
+    def test_live_process_keeps_a_pass_row_running(self):
+        label = "ws15-exec-live-pass"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / ("out-%s.md" % label)).write_text("PASS\n", encoding="utf-8")
+        procs = [
+            {
+                "pid": 424242,
+                "comm": "python3",
+                "launcher": "pi",
+                "label": label,
+                "started_at": 1792000000.0,
+            }
+        ]
+        original = pi._agent_processes
+        pi._agent_processes = lambda: procs
+        try:
+            self.poll()
+        finally:
+            pi._agent_processes = original
+        run = self.store.runs[self.run_id(label)]
+        self.assertEqual(run["verdict"], "PASS")
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["pid"], 424242)
+
+    def test_usage_is_flushed_when_a_later_run_raises(self):
+        label = "ws15-exec-raises"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(FIXTURE.read_bytes())
+        with mock.patch.object(pi, "_emit_run", side_effect=RuntimeError("boom")):
+            pi.poll(self.store, self.cfg(), 1_800_000_000.0)
+        self.assertEqual(pi.last_error, "poll")
+        self.assertEqual(len(self.store.usage), 2)
+
+    def test_a_failed_flush_leaves_the_stream_to_be_read_again(self):
+        label = "ws15-exec-flush-fails"
+        self.write_tsv([[label, SID, 1792000000, DEEPSEEK]])
+        (self.pad / ("stream-%s.ndjson" % label)).write_bytes(FIXTURE.read_bytes())
+        with mock.patch.object(pi, "_flush_usage", return_value=False):
+            pi.poll(self.store, self.cfg(), 1_800_000_000.0)
+        self.assertEqual(self.store.usage, {})
+        self.assertIsNone(self.store.get_offset("pi:stream-index:" + str(self.pad / ("stream-%s.ndjson" % label))))
+        self.poll(1_800_000_002.0)
+        self.assertEqual(len(self.store.usage), 2)
+
 
 class ProcessLivenessTest(unittest.TestCase):
     def test_pi_label_from_prompt_path(self):
@@ -1277,6 +1321,62 @@ class StreamCostTest(unittest.TestCase):
         self.assertEqual(list(runs), [f"pi:{MORPH_SID}:{label}"])
         self.assertEqual(runs[f"pi:{MORPH_SID}:{label}"]["tokens"], first)
         self.assertEqual(runs[f"pi:{MORPH_SID}:{label}"]["cost_usd"], first_cost)
+
+    def test_fold_after_the_flush_raises_the_end_to_the_usage_ts(self):
+        from dash.store import Store
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        label = "ws15-exec-fold-order"
+        run_dir = Path(tmp.name) / "runs" / label
+        (run_dir / "pi").mkdir(parents=True)
+        (run_dir / "pi-sessions.tsv").write_text(
+            HEADER + f"{label}\t{SID}\t1792000000\t{MORPH}\n", encoding="utf-8"
+        )
+        (run_dir / "pi" / "pi-sessions.tsv").write_text(
+            HEADER + f"{label}\t{MORPH_SID}\t1792000000\t{MORPH}\n", encoding="utf-8"
+        )
+        stream = run_dir / "pi" / f"stream-{label}.ndjson"
+        stream.write_bytes(
+            b"\n".join(
+                [
+                    json.dumps({"type": "session", "id": MORPH_SID}).encode(),
+                    json.dumps(
+                        {
+                            "type": "message_end",
+                            "timestamp": 200,
+                            "message": {
+                                "role": "assistant",
+                                "model": MORPH,
+                                "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0},
+                            },
+                        }
+                    ).encode(),
+                ]
+            )
+            + b"\n"
+        )
+        out = run_dir / "pi" / f"out-{label}.md"
+        out.write_text("PASS\n", encoding="utf-8")
+        os.utime(out, (100, 100))
+        store = Store(Path(tmp.name) / "dash.sqlite")
+        self.addCleanup(store.close)
+        store.upsert_run(
+            {
+                "run_id": f"pi:{SID}:{label}",
+                "source": "pi",
+                "label": label,
+                "session_id": SID,
+                "status": "done",
+                "started_at": 1792000000.0,
+                "ended_at": 100.0,
+            }
+        )
+        pi._tsv_cache.clear()
+        cfg = {"roots": {"scratchpads": [str(Path(tmp.name) / "runs")]}, "read_budgets": {}}
+        pi.poll(store, cfg, 1_800_000_000.0)
+        self.assertIsNone(store.get_run(f"pi:{SID}:{label}"))
+        self.assertEqual(store.get_run(f"pi:{MORPH_SID}:{label}")["ended_at"], 200.0)
 
 
 class NonAnthropicPricingUnchangedTest(unittest.TestCase):
