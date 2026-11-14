@@ -306,7 +306,11 @@ def revalidate_rows(rows: list[dict], path: str, artifact_age_s: float, now: flo
 
 
 def remove_tree(path: str | Path) -> bool:
-    """Delete one directory tree, retrying read-only entries. Never raises."""
+    """Delete one directory tree, retrying read-only entries. Never raises.
+
+    On Python 3.12+ ``rmtree`` can pass ``os.open`` (which needs flags) to the handler, so a retry
+    that cannot be repeated with the path alone is skipped instead of crashing the janitor.
+    """
 
     def _retry(func, target, _exc):
         try:
@@ -316,7 +320,7 @@ def remove_tree(path: str | Path) -> bool:
             pass
         try:
             func(target)
-        except OSError:
+        except (OSError, TypeError):
             pass
 
     try:
