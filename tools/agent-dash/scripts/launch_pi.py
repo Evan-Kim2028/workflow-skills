@@ -390,6 +390,23 @@ def skills_args(environ=None):
     return [] if (environ.get(SKILLS_ENV) or "").strip() == "1" else ["--no-skills"]
 
 
+TOOL_OUTPUT_ENV = "AGENTQ_TOOL_OUTPUT_CAP"
+TOOL_OUTPUT_EXTENSION = ROOT / "agentq" / "pi-ext" / "trim-tool-output.ts"
+
+
+def tool_output_args(environ=None, extension=TOOL_OUTPUT_EXTENSION):
+    """``-e`` for the bash-output trim extension; nothing when ``AGENTQ_TOOL_OUTPUT_CAP=0`` or the file is absent.
+
+    The extension replaces a bash result longer than the cap with its head and tail and keeps the full text
+    under ``$AGENT_SCRATCH/tool-output/``. A checkout without the file (the main checkout before this lands)
+    launches without it instead of failing on a missing extension.
+    """
+    environ = os.environ if environ is None else environ
+    if (environ.get(TOOL_OUTPUT_ENV) or "").strip() == "0":
+        return []
+    return ["-e", str(extension)] if extension.is_file() else []
+
+
 def build_argv(label, workspace, prompt_file, outdir, model, extension=None, thinking=None):
     """The exact pi command line. ``stdin`` is closed by the caller."""
     return [
@@ -404,6 +421,7 @@ def build_argv(label, workspace, prompt_file, outdir, model, extension=None, thi
         *thinking_args(thinking),
         *skills_args(),
         *extension_args(extension),
+        *tool_output_args(),
         *brief_args(prompt_file),
         BRIEF_MESSAGE,
     ]
@@ -449,6 +467,7 @@ def build_resume_argv(session_file, outdir, model, prompt_file, extension=None, 
         *thinking_args(thinking),
         *skills_args(),
         *extension_args(extension),
+        *tool_output_args(),
         *brief_args(prompt_file),
         RESUME_PROMPT,
     ]
