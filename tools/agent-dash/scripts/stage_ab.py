@@ -45,17 +45,15 @@ LABEL_CHECKER = Path.home() / ".claude" / "tools" / "agent-dash" / "agent_dash.p
 FORBIDDEN_TERMS = (
     "ssh ",
     "psql",
-    "lake-vps",
-    "lor-main",
     "git push",
     "gh pr",
-    "lor_merge",
     "merge",
     "deploy",
     "systemctl",
     "--apply",
     "migrate",
 )
+LOCAL_FORBIDDEN_FILE = Path.home() / ".config" / "agent-dash" / "stage-forbidden-terms.txt"
 JOB_KINDS = ("read", "review")
 BACKLOG_LANE = "backlog"
 ARMS = ("control", "treatment")
@@ -97,14 +95,25 @@ def tier_model(tier):
     return TIER_MODELS.get(tier or "")
 
 
-def forbidden_term(prompt_text):
-    """The first forbidden term the prompt contains (case-insensitive), or None."""
-    lowered = prompt_text.lower()
-    for term in FORBIDDEN_TERMS:
-        if term in lowered:
+def local_forbidden_terms(path=LOCAL_FORBIDDEN_FILE):
+    """Extra terms, one per line, from a machine-local file (production host names stay out of the repo)."""
+    try:
+        return tuple(line.strip() for line in Path(path).read_text().splitlines() if line.strip())
+    except OSError:
+        return ()
+
+
+def forbidden_term(prompt_text, extra=None):
+    """The first forbidden term the prompt contains (case-insensitive), or None.
+
+    The built-in list plus ``extra`` (default: the lines of ``LOCAL_FORBIDDEN_FILE``).
+    """
+    low = prompt_text.lower()
+    terms = FORBIDDEN_TERMS + (local_forbidden_terms() if extra is None else tuple(extra))
+    for term in terms:
+        if term.lower() in low:
             return term
     return None
-
 
 def is_git_checkout(path):
     """True when ``path`` is a directory inside a git work tree that has an ``origin/main`` ref."""

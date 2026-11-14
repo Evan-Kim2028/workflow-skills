@@ -69,12 +69,14 @@ class StoreCase(unittest.TestCase):
 
 class ForbiddenTermTests(unittest.TestCase):
     def test_each_listed_term_is_caught_case_insensitively(self):
-        for term in ("ssh ", "psql", "lake-vps", "lor-main", "git push", "gh pr", "lor_merge", "merge",
-                     "deploy", "systemctl", "--apply", "migrate"):
-            self.assertIsNotNone(SA.forbidden_term(f"please {term.upper()} now"), term)
+        for term in SA.FORBIDDEN_TERMS:
+            self.assertIsNotNone(SA.forbidden_term(f"please {term.upper()} now", extra=()), term)
+
+    def test_local_extra_terms_are_caught(self):
+        self.assertEqual(SA.forbidden_term("talk to prod-host-1 now", extra=("prod-host-1",)), "prod-host-1")
 
     def test_a_clean_prompt_passes(self):
-        self.assertIsNone(SA.forbidden_term("Read the sweep summary and list anomalies."))
+        self.assertIsNone(SA.forbidden_term("Read the sweep summary and list anomalies.", extra=()))
 
 
 class ChooseJobsTests(StoreCase):
