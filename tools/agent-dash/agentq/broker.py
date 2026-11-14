@@ -930,6 +930,12 @@ def is_filler(job: dict) -> bool:
     return job["session"] == backlog_lib.SESSION and filler_lib.is_filler_label(job["label"])
 
 
+def is_real_deepseek(job: dict) -> bool:
+    """True for a real DeepSeek job: urgent or normal lane, not filler. These are the jobs the fill planner counts as
+    ready real (``fill.job_counts``)."""
+    return job["tier"] == fill_lib.DS_TIER and job["lane"] in ("urgent", "normal") and not is_filler(job)
+
+
 def branch_for(job_id: str) -> str:
     """The branch a job's auto worktree is created on."""
     return f"agentq/{job_id}"
@@ -1066,6 +1072,7 @@ class Broker:
         self._inflight: dict[str, concurrent.futures.Future] = {}
         self._saturated_last = False
         self._holds: dict[str, tuple[tuple[str, str], float]] = {}
+        self._locally_held = 0
         self._plans: dict[str, tuple[Path, Path] | None] = {}
         self._backlog_retry: dict[str, float] = {}
         self._controller: fill_lib.FillController | None = None
@@ -1169,10 +1176,11 @@ class Broker:
         fetched: set[Path] = set()
         holds: dict[str, tuple[str, tuple[str, str]]] = {}
         launched: list[str] = []
+        locally_held = 0
         for job in order_queue(ready, now):
             if len(self._inflight) >= MAX_CONCURRENT_LAUNCHES:
                 break
-            name, reason = job["res"], None
+            name, reason, local_gate = job["res"], None, False
             if on:
                 gate_lane = job["lane"]
                 if queue_rank(job, now) == 0 or (
@@ -1201,15 +1209,16 @@ class Broker:
                     self._worktree_failed(conn, job, now, exc)
                     continue
             if reason is None and plan is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
-                reason = plain_hold("workspace busy")
+                reason, local_gate = plain_hold("workspace busy"), True
             if reason is None and slots_free.get(job["res"], 0) <= 0:
-                reason = plain_hold("slots full")
+                reason, local_gate = plain_hold("slots full"), True
             tier_cap = cfg["tiers"].get(job["tier"])
             if reason is None and tier_cap is not None and tier_used.get(job["tier"], 0) >= tier_cap:
                 name, reason = job["tier"], plain_hold("tier cap full")
             if reason is None and on and job["res"] in LAPTOP_GATED:
                 reason = laptop_hold(job["res"], laptop(), res_used.get("tests", 0), laptop_cfg,
                                      adaptive["tests_floor"])
+                local_gate = reason is not None
             if reason is None and filler_paused and (is_filler(job) or job["id"] in paused_filler_ids):
                 name, reason = "filler", plain_hold("filler paused")
             paced = reason is None and pace is not None and job["tier"] == fill_lib.DS_TIER
@@ -1217,6 +1226,8 @@ class Broker:
                 name, reason = "proxy", pace["hold"]
             if reason:
                 holds[job["id"]] = (name, reason)
+                if local_gate and is_real_deepseek(job):
+                    locally_held += 1
                 continue
             if plan is not None:
                 job = self._prepare_worktree(conn, job, plan, now, fetched)
@@ -1236,6 +1247,7 @@ class Broker:
                     self._spend_pacing(pace)
             self._holds.pop(job["id"], None)
         self._collect_launches(conn, now)
+        self._locally_held = locally_held
         self._record_holds(conn, now, ready, holds)
         return launched
 
@@ -1403,6 +1415,7 @@ class Broker:
             conn, now, controller=self._controller, fill=fill_cfg, pacing=pacing, status=status,
             ps_text=ps_text, laptop=laptop, laptop_cfg=cfg["laptop"],
             paused=filler_lib.paused(conn), measured=self._measured_cost(conn, now, pacing),
+            locally_held=self._locally_held,
         )
         self._log_fill(decision.plan)
         state = self._controller.state()
