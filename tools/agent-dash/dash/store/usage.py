@@ -50,10 +50,17 @@ class UsageMixin:
             rebuilds, instead of one transaction per row. Duplicate
             ``(tool, session_id, message_id)`` rows keep last-wins, matching
             the single-row path.
+
+            Each touched hour is rebuilt once, after the inserts, not after
+            every row: ``_rebuild_hour`` re-prices every event of the hour, so
+            a per-row rebuild was quadratic in a poll's new events (188 rows
+            against a ~5,800-event hour took 16 s). The final bucket is the
+            same, since a rebuild is a pure function of the hour's events.
             """
             if not rows:
                 return
             with self._lock:
+                hours = set()
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     for row in rows:
@@ -84,6 +91,15 @@ class UsageMixin:
                         )
                         if isinstance(run_id, str) and _manifest_family(run_id) is not None:
                             run_id = self._resolve_alias_locked(run_id)
+                        previous = self._one(
+                            """SELECT ts FROM usage_events
+                               WHERE tool=? AND session_id=? AND message_id=?""",
+                            (tool, session_id, message_id),
+                        )
+                        if previous and previous["ts"] is not None:
+                            hours.add(_hour(previous["ts"]))
+                        if ts is not None:
+                            hours.add(_hour(ts))
                         self._conn.execute(
                             """INSERT INTO usage_events(
                                    tool, session_id, message_id, ts, run_id, model,
@@ -117,11 +133,8 @@ class UsageMixin:
                         )
                         if isinstance(run_id, str):
                             self._bump_usage_run(run_id)
-                        hours = set()
-                        if ts is not None:
-                            hours.add(_hour(ts))
-                        for hour in hours:
-                            self._rebuild_hour(hour)
+                    for hour in sorted(hours):
+                        self._rebuild_hour(hour)
                     self._conn.execute("COMMIT")
                 except Exception:
                     try:
