@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agentq.proxy import (
     BLOCK_CHARS,
+    FAILURE_MSG_CHARS,
+    Upstream,
+    failure_message,
     DEFAULT_CONFIG,
     EX_CONFIG,
     PREFIX_STORE_JOBS,
@@ -300,6 +303,9 @@ class ProxyCase(unittest.IsolatedAsyncioTestCase):
     def total_used(self) -> int:
         return self.gov.budgets["total"].used(self.gov.clock(), self.window)
 
+    def aborted_charged(self) -> int:
+        return sum(row["aborted_charge"] for row in self.gov.minute_rows.values())
+
 
 class PassthroughTest(ProxyCase):
     async def test_streams_through_and_captures_usage(self) -> None:
@@ -491,31 +497,41 @@ class TruncationTest(ProxyCase):
         self.fake.script = [{"truncate": "chunked"}]
         outcome = await asyncio.to_thread(post_raw_status, self.port, self.chat(MODEL_OUT))
         self.assertEqual(outcome, "cut: IncompleteRead")
-        self.assertEqual(self.total_used(), 0)
+        self.assertGreater(self.aborted_charged(), 0)
+        self.assertEqual(self.total_used(), self.aborted_charged())
         self.assertEqual(self.gov.errors, {"truncated": 1})
+        rows = list(self.gov.minute_rows.values())
+        self.assertEqual(sum(r["input"] + r["cache_read"] for r in rows), self.aborted_charged())
+        self.assertLessEqual(sum(r["input"] for r in rows), self.aborted_charged())
         self.assertIn("upstream_failed", self.events())
 
     async def test_length_delimited_body_cut_short_is_not_completed(self) -> None:
         self.fake.script = [{"truncate": "length"}]
         outcome = await asyncio.to_thread(post_raw_status, self.port, self.chat(MODEL_OUT, stream=False))
         self.assertTrue(isinstance(outcome, str) and outcome.startswith("cut"), outcome)
-        self.assertEqual(self.total_used(), 0)
+        self.assertGreater(self.aborted_charged(), 0)
+        self.assertEqual(self.total_used(), self.aborted_charged())
         self.assertEqual(self.gov.errors, {"truncated": 1})
 
 
 class UpstreamFailureTest(ProxyCase):
-    async def test_upstream_closes_before_status_line_releases_charge(self) -> None:
+    async def test_upstream_closes_before_status_line_charges_the_sent_prompt(self) -> None:
         self.fake.script = [{"close_now": True}]
         status, text = await self.post(self.chat(MODEL_OUT), job="early-close")
         self.assertEqual(status, 502)
-        self.assertEqual(self.total_used(), 0)
+        self.assertGreater(self.aborted_charged(), 0)
+        self.assertEqual(self.total_used(), self.aborted_charged())
         self.assertEqual(self.gov.errors, {"bad_status_line": 1})
+        failed = next(fields for event, fields in self.logs if event == "upstream_failed")
+        self.assertEqual(failed["exc"], "UpstreamError")
+        self.assertEqual(failed["msg"], "bad_status_line")
+        self.assertIn("idle_s", failed)
 
 
 class IdleTimeoutTest(ProxyCase):
     overrides = {"upstream_idle_s": 0.3}
 
-    async def test_idle_upstream_returns_504_and_releases_charge(self) -> None:
+    async def test_idle_upstream_returns_504_and_charges_the_sent_prompt(self) -> None:
         hold = asyncio.Event()
         self.fake.script = [{"hold": hold}]
         try:
@@ -523,7 +539,8 @@ class IdleTimeoutTest(ProxyCase):
         finally:
             hold.set()
         self.assertEqual(status, 504)
-        self.assertEqual(self.total_used(), 0)
+        self.assertGreater(self.aborted_charged(), 0)
+        self.assertEqual(self.total_used(), self.aborted_charged())
         self.assertEqual(self.gov.errors, {"timeout": 1})
 
 
@@ -1565,6 +1582,94 @@ class MaxTokensCapEndToEndTest(ProxyCase):
 WALL_MINUTE_START = 1_700_000_040.0
 
 
+class ClientWriteFailureTest(unittest.IsolatedAsyncioTestCase):
+    """A client socket that dies mid-response is client_failed: not an upstream error, and the prompt the
+    upstream already started is charged."""
+
+    class DeadWriter:
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("client reset")
+
+    async def test_client_write_failure_is_client_failed_and_the_sent_prompt_is_charged(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        logs: list[tuple[str, dict]] = []
+        gov = Governor(Path(tmp.name), config_with(), log=lambda event, **fields: logs.append((event, fields)))
+        proxy = Proxy(gov, "http://127.0.0.1:9/v1", KEY)
+        ticket = make_ticket(gov, job="reader", max_tokens=800, text="hello " * 200)
+        ticket.future = asyncio.get_running_loop().create_future()
+        admit(gov, ticket)
+
+        upstream_reader = asyncio.StreamReader()
+        upstream_reader.feed_data(b"5\r\nhello\r\n0\r\n\r\n")
+        upstream_reader.feed_eof()
+        upstream = Upstream(upstream_reader, mock.Mock(), 200, {"transfer-encoding": "chunked"})
+
+        async def fake_open(method, path, headers, body, ticket=None):
+            ticket.sent = True
+            return upstream
+
+        client_reader = asyncio.StreamReader()
+        with mock.patch.object(proxy, "open_upstream", new=fake_open):
+            await proxy._serve(ticket, client_reader, Client(self.DeadWriter()), "POST",
+                               "/v1/chat/completions", {}, b"{}", True)
+
+        events = [event for event, _ in logs]
+        self.assertIn("client_failed", events)
+        self.assertNotIn("upstream_failed", events)
+        self.assertEqual(gov.errors, {})
+        failed = next(fields for event, fields in logs if event == "client_failed")
+        self.assertEqual(failed["exc"], "ConnectionResetError")
+        self.assertIs(failed["sent"], True)
+        self.assertEqual(gov.budgets["total"].used(gov.clock(), gov.window), ticket.prompt_est)
+        self.assertGreater(ticket.prompt_est, 0)
+
+
+class AbortedChargeTest(unittest.TestCase):
+    """settle_aborted charges the prompt estimate of a request that was sent, and releases one that was not."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.gov, self.clocks = timed_governor(Path(self.tmp.name), WALL_MINUTE)
+
+    def test_a_sent_request_charges_its_prompt_to_total_the_minute_and_the_calib_billed_total(self) -> None:
+        ticket = make_ticket(self.gov, job="a", model=MODEL_OUT, text="x" * 4000, max_tokens=800)
+        admit(self.gov, ticket)
+        ticket.sent = True
+        self.gov.settle_aborted(ticket)
+
+        self.assertEqual(ticket.holds, [])
+        self.assertEqual(self.gov.budgets["total"].used(self.gov.clock(), self.gov.window), ticket.prompt_est)
+        self.assertGreater(ticket.prompt_est, 0)
+        columns = dict(zip(MINUTE_ROW_COLUMNS, next(
+            row for row in self.gov.take_minute_rows() if row[1] == MODEL_OUT)))
+        self.assertEqual(columns["input"], ticket.prompt_est)
+        self.assertEqual(columns["aborted_charge"], ticket.prompt_est)
+        self.assertEqual(columns["ok"], 0)
+        calib = self.gov.calib[minute_stamp(self.gov.wall())]["overall"]
+        self.assertEqual(calib["billed"], ticket.prompt_est)
+
+    def test_a_request_that_never_reached_upstream_is_released_not_charged(self) -> None:
+        ticket = make_ticket(self.gov, job="a", model=MODEL_OUT, text="x" * 4000, max_tokens=800)
+        admit(self.gov, ticket)
+        self.gov.settle_aborted(ticket)
+
+        self.assertEqual(self.gov.budgets["total"].used(self.gov.clock(), self.gov.window), 0)
+        self.assertEqual(self.gov.minute_rows.get((minute_stamp(self.gov.wall()), MODEL_OUT), {}).get(
+            "aborted_charge", 0), 0)
+
+
+class FailureLogTest(unittest.TestCase):
+    def test_message_is_one_token_cut_to_120_characters(self) -> None:
+        self.assertEqual(failure_message(ValueError("connection\nreset  by peer")), "connection_reset_by_peer")
+        self.assertEqual(failure_message(ValueError("")), "-")
+        self.assertEqual(len(failure_message(ValueError("x" * 500))), FAILURE_MSG_CHARS)
+
+
 class Clocks:
     """A monotonic clock and a wall clock that move together, so a test can cross a UTC :00."""
 
@@ -2343,7 +2448,7 @@ class InflightMigrationTest(unittest.TestCase):
         connection.execute("INSERT INTO proxy_minutes (minute, model, req) VALUES ('2026-11-01T00:00', 'morph-dsv41flash-1017', 7)")
         connection.commit()
         connection.close()
-        row = ("2026-11-01T00:01", MODEL_OUT) + (1, 1, 0, 10, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, "enforce", "enforce", 2, None, 250)
+        row = ("2026-11-01T00:01", MODEL_OUT) + (1, 1, 0, 10, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, "enforce", "enforce", 2, None, 250, 0)
         write_minute_rows(path, [row])
         write_minute_rows(path, [row])
         connection = sqlite3.connect(path)
@@ -2696,7 +2801,7 @@ class SeedOffLoopTest(ProxyCase):
 
     def stored_minute(self, req: int, minute: str | None = None) -> str:
         minute = minute or minute_stamp(self.gov.wall())
-        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, req, req, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, req, req, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None, 0)])
         return minute
 
     async def test_counting_starts_at_once_and_the_seed_is_read_on_a_writer_thread(self) -> None:
@@ -3020,7 +3125,7 @@ class CloseDrainsSeedsTest(ProxyCase):
 
     async def test_close_waits_for_a_pending_row_seed_and_writes_the_sum(self) -> None:
         minute = minute_stamp(self.gov.wall())
-        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None, 0)])
         row = self.gov.row(MODEL_OUT)
         row["req"] += 2
         await self.proxy.close()
@@ -3128,7 +3233,7 @@ class SharedShutdownDeadlineTest(ProxyCase):
 
     async def test_both_writer_threads_stuck_still_persist_the_in_memory_counts_in_time(self) -> None:
         minute = minute_stamp(self.gov.wall())
-        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None)])
+        write_minute_rows(self.gov.db_path, [(minute, MODEL_OUT, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0.98, 0, 0, 0, 0, 0, 0, None, None, None, 0, None, None, 0)])
         write_calib_rows(self.gov.db_path, [(minute, 3, 0, 0, 0, None, 0)])
         gate = threading.Event()
 
