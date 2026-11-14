@@ -1846,8 +1846,9 @@ class Governor:
     def settle_aborted(self, ticket: Ticket) -> None:
         """Settle a request that reached upstream but produced no final usage: the client left, the stream
         broke or was truncated. Morph bills the prompt it started, so the prompt estimate is charged to every
-        input-counting budget (total and uncached), to the minute's billed total, and to the minute row's
-        input with aborted_charge marking how much of it came from aborted requests. A request that never
+        input-counting budget (total and uncached), to the minute's billed total, and to the minute row split
+        into input (the uncached estimate) and cache_read (the rest), with aborted_charge marking how much of
+        the row came from aborted requests. A request that never
         reached upstream is released, as release does."""
         if not ticket.sent:
             self.release(ticket)
@@ -1860,11 +1861,15 @@ class Governor:
             self.sync_reserve(budget)
         ticket.holds = []
         charged = ticket.prompt_est
+        uncached = min(ticket.uncached_est, charged)
         self.note_calib_billed(ticket, charged)
         row = self.row(ticket.model)
-        row["input"] += charged
+        row["input"] += uncached
+        row["cache_read"] += charged - uncached
         row["aborted_charge"] += charged
-        self.job_counters(ticket)["input"] += charged
+        counters = self.job_counters(ticket)
+        counters["input"] += uncached
+        counters["cache_read"] += charged - uncached
 
     def budgets_for_limit(self, limit_type: str, model: str) -> list[Budget]:
         """The budgets that track a stated limit type and apply to the model that was refused."""

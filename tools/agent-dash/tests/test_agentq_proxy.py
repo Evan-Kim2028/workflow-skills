@@ -500,6 +500,9 @@ class TruncationTest(ProxyCase):
         self.assertGreater(self.aborted_charged(), 0)
         self.assertEqual(self.total_used(), self.aborted_charged())
         self.assertEqual(self.gov.errors, {"truncated": 1})
+        rows = list(self.gov.minute_rows.values())
+        self.assertEqual(sum(r["input"] + r["cache_read"] for r in rows), self.aborted_charged())
+        self.assertLessEqual(sum(r["input"] for r in rows), self.aborted_charged())
         self.assertIn("upstream_failed", self.events())
 
     async def test_length_delimited_body_cut_short_is_not_completed(self) -> None:
