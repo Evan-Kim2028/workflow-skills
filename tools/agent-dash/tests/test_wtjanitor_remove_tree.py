@@ -20,6 +20,22 @@ class RemoveTreeTest(unittest.TestCase):
         os.chmod(locked, 0o500)
         self.assertTrue(wtjanitor.remove_tree(root))
 
+    def test_removes_a_plain_file(self):
+        root = Path(tempfile.mkdtemp())
+        target = root / "stale.log"
+        target.write_text("x")
+        self.assertTrue(wtjanitor.remove_tree(target))
+        self.assertFalse(target.exists())
+        os.rmdir(root)
+
+    def test_removes_a_symlink(self):
+        root = Path(tempfile.mkdtemp())
+        target = root / "link"
+        target.symlink_to(root / "missing")
+        self.assertTrue(wtjanitor.remove_tree(target))
+        self.assertFalse(target.is_symlink())
+        os.rmdir(root)
+
     def test_handler_given_os_open_does_not_raise(self):
         original = wtjanitor.shutil.rmtree
 

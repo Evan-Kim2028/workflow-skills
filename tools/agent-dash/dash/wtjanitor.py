@@ -306,7 +306,11 @@ def revalidate_rows(rows: list[dict], path: str, artifact_age_s: float, now: flo
 
 
 def remove_tree(path: str | Path) -> bool:
-    """Delete one directory tree, retrying read-only entries. Never raises.
+    """Delete one directory tree or plain file, retrying read-only entries. Never raises.
+
+    ``rmtree`` refuses a plain file, and the temp janitor hands it plenty (it sweeps every stale
+    entry under ``/private/tmp``, most of them single files), so a non-directory is unlinked
+    directly.
 
     On Python 3.12+ ``rmtree`` can pass ``os.open`` (which needs flags) to the handler, so a retry
     that cannot be repeated with the path alone is skipped instead of crashing the janitor.
@@ -324,13 +328,15 @@ def remove_tree(path: str | Path) -> bool:
             pass
 
     try:
-        if sys.version_info >= (3, 12):
+        if os.path.islink(str(path)) or not os.path.isdir(str(path)):
+            _retry(os.unlink, str(path), None)
+        elif sys.version_info >= (3, 12):
             shutil.rmtree(str(path), onexc=_retry)
         else:
             shutil.rmtree(str(path), onerror=_retry)
     except OSError:
         pass
-    return not os.path.exists(str(path))
+    return not os.path.lexists(str(path))
 
 
 def _human_bytes(count: int) -> str:
