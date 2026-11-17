@@ -191,6 +191,73 @@ class ReapDecisionsTest(unittest.TestCase):
         )
         self.assertTrue(Path(path).exists())
 
+    def test_purge_age_removes_a_dirty_unmerged_lane(self):
+        """Past --purge-age a lane goes even when it never merged and is dirty."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-abandoned")
+        commit_in(path, "lane.txt")
+        (Path(path) / "dirty.txt").write_text("uncommitted\n")
+        make_old(path, hours=6)
+        archive = Path(tempfile.mkdtemp())
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(archive)], check=False)
+        with mock.patch.object(worktrees, "salvage", wraps=worktrees.salvage) as spy:
+            with mock.patch("dash.dataroot.state_dir", return_value=archive):
+                top, rows = worktrees.collect(
+                    str(repo), worktrees.DEFAULT_MIN_AGE_S, set(), time.time(), 4 * 3600.0
+                )
+                row = rows_by_path(rows)[os.path.realpath(path)]
+                self.assertEqual(row["decision"], "reap")
+                self.assertTrue(row.get("purge"))
+                rows = worktrees.apply_reaps(top, rows, False)
+            self.assertTrue(spy.called)
+        self.assertFalse(Path(path).exists())
+        saved = archive / "wt-salvage"
+        folders = list(saved.rglob("status.txt"))
+        self.assertTrue(folders, "the dirty tree should be archived")
+        self.assertIn("dirty.txt", folders[0].read_text())
+        self.assertTrue(git(repo, "branch", "--list", "lane-abandoned").strip())
+
+    def test_purge_age_keeps_a_young_lane(self):
+        """--purge-age does not shorten --min-age for a lane written just now."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-live")
+        commit_in(path, "lane.txt")
+        top, rows = worktrees.collect(str(repo), 4 * 3600.0, set(), time.time(), 4 * 3600.0)
+        row = rows_by_path(rows)[os.path.realpath(path)]
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("younger", row["reason"])
+
+    def test_purge_age_keeps_a_skip_listed_lane(self):
+        """The skip list still wins over the purge cutoff."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-pinned")
+        commit_in(path, "lane.txt")
+        make_old(path, hours=9)
+        top, rows = worktrees.collect(
+            str(repo), worktrees.DEFAULT_MIN_AGE_S, {"lane-pinned"}, time.time(), 4 * 3600.0
+        )
+        row = rows_by_path(rows)[os.path.realpath(path)]
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("skip list", row["reason"])
+
+    def test_purge_age_reaches_the_cli(self):
+        """`worktrees reap --purge-age` reaps a dirty unmerged lane."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-cli-purge")
+        commit_in(path, "lane.txt")
+        (Path(path) / "dirty.txt").write_text("uncommitted\n")
+        make_old(path, hours=8)
+        archive = Path(tempfile.mkdtemp())
+        self.addCleanup(subprocess.run, ["rm", "-rf", str(archive)], check=False)
+        with mock.patch("dash.dataroot.state_dir", return_value=archive):
+            self.assertEqual(
+                cmd_worktrees(
+                    ["reap", "--repo", str(repo), "--purge-age", "4h", "--apply"]
+                ),
+                0,
+            )
+        self.assertFalse(Path(path).exists())
+
     def test_merged_with_commits_is_removed(self):
         """Dry-run lists the merged worktree; apply removes it and the branch."""
         repo = self._repo()

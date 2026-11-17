@@ -50,15 +50,18 @@ from dash import dataroot, errors, worktrees
 JANITOR_USAGE = """agent-dash worktrees janitor
 
   python3 agent_dash.py worktrees janitor --repo <path> [--apply]
-      [--min-age 4h] [--artifact-age 24h] [--pressure-pct 12]
-      [--pressure-age 6h] [--skip <path-or-branch>] [--daily-maintenance]
-      [--apply-cooldown <dur>] [--state-file <path>] [--json]
+      [--min-age 4h] [--purge-age <dur>] [--artifact-age 24h]
+      [--pressure-pct 12] [--pressure-age 6h] [--skip <path-or-branch>]
+      [--daily-maintenance] [--apply-cooldown <dur>] [--state-file <path>] [--json]
 
 Dry-run by default: prints what would go, removes nothing. Pass --apply
 to reap merged worktrees (as `worktrees reap` does) and delete stale
 regenerable artifact folders (.venv, node_modules, tool caches) from the
 worktrees that remain. A worktree counts as untouched when no source
-file in it changed inside --artifact-age (default 24h). When free space
+file in it changed inside --artifact-age (default 24h). --purge-age is the
+owner's idle cutoff: past it a worktree goes even when its branch never
+merged and its tree is dirty. The branch is kept and a dirty tree is
+archived under <state>/wt-salvage/ before removal. When free space
 on the volume is below --pressure-pct (default 12%), the artifact age
 drops to --pressure-age (default 6h) and the run says so. A worktree
 with a live process inside it is never touched, and nothing git tracks
@@ -509,6 +512,7 @@ def cmd_janitor(argv: list[str]) -> int:
     json_mode = False
     daily = False
     min_age_raw = "4h"
+    purge_age_raw = ""
     artifact_age_raw = "24h"
     pressure_age_raw = "6h"
     pressure_raw = str(DEFAULT_PRESSURE_PCT)
@@ -547,6 +551,9 @@ def cmd_janitor(argv: list[str]) -> int:
         elif token == "--pressure-pct" and index + 1 < len(args):
             pressure_raw = args[index + 1]
             index += 2
+        elif token == "--purge-age" and index + 1 < len(args):
+            purge_age_raw = args[index + 1]
+            index += 2
         elif token == "--state-file" and index + 1 < len(args):
             state_file = args[index + 1]
             index += 2
@@ -564,6 +571,7 @@ def cmd_janitor(argv: list[str]) -> int:
         )
         return errors.USAGE
     min_age_s = worktrees.parse_duration(min_age_raw)
+    purge_age_s = worktrees.parse_duration(purge_age_raw) if purge_age_raw else None
     artifact_age_s = worktrees.parse_duration(artifact_age_raw)
     pressure_age_s = worktrees.parse_duration(pressure_age_raw)
     pressure_pct = _parse_pct(pressure_raw)
@@ -580,12 +588,20 @@ def cmd_janitor(argv: list[str]) -> int:
                 "bad " + label + " " + repr(
                     {"--min-age": min_age_raw, "--artifact-age": artifact_age_raw,
                      "--pressure-age": pressure_age_raw, "--pressure-pct": pressure_raw,
+                     "--purge-age": purge_age_raw,
                      "--apply-cooldown": cooldown_raw}[label]
                 ) + ". Durations look like 30s, 90m, 3h, 2d; the percentage is 0-100. "
                 "Run: python3 agent_dash.py worktrees janitor --repo <path>",
                 file=sys.stderr,
             )
             return errors.USAGE
+    if purge_age_raw and purge_age_s is None:
+        print(
+            "bad --purge-age " + repr(purge_age_raw) + ". Durations look like 30s, 90m, 3h, 2d. "
+            "Run: python3 agent_dash.py worktrees janitor --repo <path>",
+            file=sys.stderr,
+        )
+        return errors.USAGE
     top = worktrees.toplevel_of(repo)
     if top is None:
         print(
@@ -617,7 +633,7 @@ def cmd_janitor(argv: list[str]) -> int:
             % (free_pct, pressure_pct, _human_duration(artifact_age_s), _human_duration(pressure_age_s))
         )
 
-    _, rows = worktrees.collect(top, min_age_s, skips, now)
+    _, rows = worktrees.collect(top, min_age_s, skips, now, purge_age_s)
     for row in rows:
         if row.get("decision") == "reap":
             row["bytes"] = dir_size_bytes(row["path"]) or 0
