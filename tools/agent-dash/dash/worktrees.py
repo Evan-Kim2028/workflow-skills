@@ -154,11 +154,68 @@ def list_worktrees(repo: str | Path) -> list[dict]:
     return found
 
 
-def worktree_age_s(path: str, now: float | None = None) -> float | None:
-    """Age of the worktree directory in seconds, or None when unknown."""
+AGE_WALK_MAX_FILES = 50_000
+AGE_WALK_DEADLINE_S = 2.0
+AGE_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".codegraph",
+        "__pycache__",
+        "node_modules",
+    }
+)
+
+
+def newest_mtime(path: str, deadline_s: float = AGE_WALK_DEADLINE_S) -> float | None:
+    """Newest mtime anywhere under ``path``, or None when nothing can be read.
+
+    A directory's own mtime only moves when a direct child is added or removed, so a worktree
+    whose lane only edited ``api/src/...`` looked hours younger than it was and every reaper age
+    gate let it through. The folder mtime is therefore ignored: the seed is the worktree's ``.git``
+    pointer file (written when the worktree was added), and every file under the worktree except
+    ``.git`` itself counts. The scan prunes the regenerable and index folders and stops at a file
+    count or a deadline: an early stop can only under-report the newest mtime, which keeps the
+    worktree, so the failure direction is the safe one.
+    """
+    if not os.path.isdir(path):
+        return None
+    newest: float | None = None
     try:
-        stamp = os.stat(path).st_mtime
+        git_file = os.path.join(path, ".git")
+        if os.path.isfile(git_file):
+            newest = os.stat(git_file).st_mtime
     except OSError:
+        newest = None
+    deadline = time.monotonic() + deadline_s
+    seen = 0
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [name for name in dirs if name not in AGE_SKIP_DIRS]
+        for name in files:
+            if name == ".git":
+                continue
+            seen += 1
+            try:
+                stamp = os.stat(os.path.join(root, name)).st_mtime
+            except OSError:
+                continue
+            if newest is None or stamp > newest:
+                newest = stamp
+            if seen >= AGE_WALK_MAX_FILES or time.monotonic() > deadline:
+                return newest
+        if time.monotonic() > deadline:
+            return newest
+    return newest
+
+
+def worktree_age_s(path: str, now: float | None = None) -> float | None:
+    """Age of the worktree's newest activity in seconds, or None when unknown."""
+    stamp = newest_mtime(path)
+    if stamp is None:
         return None
     moment = time.time() if now is None else now
     return moment - stamp

@@ -74,14 +74,76 @@ def merge_into_main(repo, branch):
 
 
 def make_old(path, hours=5):
-    """Backdate a worktree directory past the default minimum age."""
+    """Backdate a worktree's whole tree past the default minimum age.
+
+    The reaper measures the newest file anywhere under the worktree, not the worktree folder's
+    own mtime, so backdating only the folder no longer makes it look old.
+    """
     stamp = time.time() - hours * 3600.0
+    for root, dirs, files in os.walk(path):
+        for name in files + dirs:
+            try:
+                os.utime(os.path.join(root, name), (stamp, stamp))
+            except OSError:
+                pass
     os.utime(path, (stamp, stamp))
 
 
 def rows_by_path(rows):
     """Decision rows keyed by worktree path string."""
     return {row["path"]: row for row in rows}
+
+
+class WorktreeAgeTest(unittest.TestCase):
+    """The age gate reads the newest file anywhere under the worktree."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", str(self.root)], check=False, timeout=30)
+
+    def test_deep_recent_edit_makes_the_worktree_young(self):
+        deep = self.root / "api" / "src" / "lor_api"
+        deep.mkdir(parents=True)
+        old = time.time() - 72 * 3600.0
+        (self.root / ".git").write_text("gitdir: somewhere\n")
+        os.utime(self.root / ".git", (old, old))
+        touched = deep / "route.py"
+        touched.write_text("x")
+        age = worktrees.worktree_age_s(str(self.root))
+        self.assertIsNotNone(age)
+        self.assertLess(age, 60)
+
+    def test_stale_tree_with_a_live_folder_mtime_reads_as_old(self):
+        deep = self.root / "api"
+        deep.mkdir()
+        (deep / "route.py").write_text("x")
+        old = time.time() - 72 * 3600.0
+        os.utime(deep / "route.py", (old, old))
+        os.utime(deep, (old, old))
+        (self.root / ".git").write_text("gitdir: somewhere\n")
+        os.utime(self.root / ".git", (old, old))
+        os.utime(self.root, (time.time(), time.time()))
+        age = worktrees.worktree_age_s(str(self.root))
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 71 * 3600.0)
+
+    def test_regenerable_folders_do_not_count_as_activity(self):
+        (self.root / "src").mkdir()
+        (self.root / "src" / "a.py").write_text("x")
+        cache = self.root / ".venv" / "lib"
+        cache.mkdir(parents=True)
+        (cache / "b.py").write_text("x")
+        old = time.time() - 48 * 3600.0
+        for target in (self.root / "src" / "a.py", self.root / "src", self.root):
+            os.utime(target, (old, old))
+        age = worktrees.worktree_age_s(str(self.root))
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 47 * 3600.0)
+
+    def test_missing_path_has_no_age(self):
+        self.assertIsNone(worktrees.worktree_age_s(str(self.root / "gone")))
 
 
 class ReapDecisionsTest(unittest.TestCase):
