@@ -6,6 +6,12 @@ no live process sitting in it or naming it, older than the minimum age,
 and absent from the skip list. Dry-run by default; nothing is removed
 without ``--apply``.
 
+``--purge-age`` is the owner's override for lanes nobody came back to: past
+that idle cutoff a worktree is removed whether or not its branch merged and
+whether or not the tree is clean. The branch survives, and an uncommitted
+tree is archived under ``<state>/wt-salvage/`` first. Busy, locked, skipped,
+release and main-checkout entries are still kept.
+
 Merged means the branch tip is an ancestor of the main ref and the
 tip sits off the main ref first-parent line, so a worktree created fresh
 from the main ref with no commits of its own is kept even though its tip
@@ -46,8 +52,8 @@ from dash import errors
 
 WORKTREES_USAGE = """agent-dash worktrees reaper and disk janitor
 
-  python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
-  python3 agent_dash.py worktrees janitor --repo <path> [--apply] [--min-age 4h] [--artifact-age 24h] [--pressure-pct 12] [--daily-maintenance] [--json]
+  python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--purge-age <dur>] [--json]
+  python3 agent_dash.py worktrees janitor --repo <path> [--apply] [--min-age 4h] [--purge-age <dur>] [--artifact-age 24h] [--pressure-pct 12] [--daily-maintenance] [--json]
 
 Dry-run by default: prints what would go, removes nothing. Pass --apply
 to remove worktrees and delete their branches. Every guard must hold:
@@ -55,6 +61,12 @@ clean status, branch merged into origin/main with a real contribution
 (or a merged pull request; a detached HEAD on origin/main), no process
 cwd or command line points at it, older than --min-age (default 3h, the
 worker timeout), and not on the skip list. Durations look like 30s, 90m, 3h, 2d, or bare seconds.
+
+--purge-age overrides the merge and clean guards: a worktree idle past
+that cutoff is removed even when its branch never merged or the tree is
+dirty. The branch is kept, and an uncommitted tree is archived under
+<state>/wt-salvage/ first. Busy, locked, skipped, release and main
+entries are still kept.
 
 `janitor` runs the same reap, then deletes stale regenerable artifact
 folders (.venv, node_modules, tool caches) from the worktrees that
@@ -530,8 +542,15 @@ def decide(
     skips: set[str],
     now: float,
     busy_reason: str = "",
+    purge_age_s: float | None = None,
 ) -> dict:
-    """One decision row for a worktree entry. Keeps on any doubt."""
+    """One decision row for a worktree entry. Keeps on any doubt.
+
+    ``purge_age_s`` is the owner's idle cutoff: past it a worktree goes whether or not its branch
+    merged and whether or not the tree is clean. The branch is kept, and the caller archives an
+    uncommitted tree before removing it. Busy, locked, skipped, release and main entries still
+    stay.
+    """
     path = entry.get("path", "")
     branch = entry.get("branch")
     row = {"path": path, "branch": branch or "-", "decision": "keep", "reason": ""}
@@ -553,10 +572,6 @@ def decide(
     if main_now is not None and branch == main_now:
         row["reason"] = "branch is checked out in the main checkout"
         return row
-    clean, grime = is_clean(path)
-    if not clean:
-        row["reason"] = grime
-        return row
     if busy_reason.startswith("process holds") or busy_reason.startswith("worktree path"):
         row["reason"] = busy_reason
         return row
@@ -566,6 +581,15 @@ def decide(
     age = worktree_age_s(path, now)
     if age is None:
         row["reason"] = "worktree age is unknown"
+        return row
+    if purge_age_s is not None and age >= purge_age_s:
+        row["decision"] = "reap"
+        row["purge"] = True
+        row["reason"] = "idle past the purge age (branch kept, uncommitted tree archived)"
+        return row
+    clean, grime = is_clean(path)
+    if not clean:
+        row["reason"] = grime
         return row
     if age < min_age_s:
         row["reason"] = "younger than the minimum age"
@@ -582,16 +606,41 @@ def decide(
     return row
 
 
-def remove_worktree(repo: str | Path, path: str) -> tuple[bool, str]:
-    """Remove one worktree without force. Reports ok plus detail."""
+def remove_worktree(repo: str | Path, path: str, force: bool = False) -> tuple[bool, str]:
+    """Remove one worktree, without force by default. Reports ok plus detail."""
+    args = ["worktree", "remove"] + (["--force"] if force else []) + [path]
     try:
-        proc = _run_git(repo, "worktree", "remove", path)
+        proc = _run_git(repo, *args)
     except (OSError, subprocess.TimeoutExpired):
         return False, "git worktree remove did not finish"
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip().splitlines()
         return False, "git worktree remove refused: " + (detail[0] if detail else "unknown error")
     return True, "worktree removed"
+
+
+def salvage(path: str, root: Path | None = None) -> str | None:
+    """Write an uncommitted worktree's state under the state dir. Returns the folder."""
+    if root is None:
+        from dash import dataroot
+
+        root = dataroot.state_dir() / "wt-salvage" / time.strftime("%Y%m%d-%H%M%S")
+    target = Path(root) / (os.path.basename(path) or "worktree")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        files = (
+            ("status.txt", ("status", "--porcelain=v1", "--untracked-files=all")),
+            ("head.txt", ("rev-parse", "HEAD")),
+            ("branch.txt", ("rev-parse", "--abbrev-ref", "HEAD")),
+            ("untracked.txt", ("ls-files", "--others", "--exclude-standard")),
+            ("diff.patch", ("diff", "HEAD", "--diff-filter=AMRT")),
+        )
+        for name, git_args in files:
+            proc = _run_git(path, *git_args)
+            (target / name).write_text(proc.stdout or "")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return str(target)
 
 
 def delete_branch(repo: str | Path, branch: str) -> tuple[bool, str]:
@@ -606,7 +655,13 @@ def delete_branch(repo: str | Path, branch: str) -> tuple[bool, str]:
     return True, "branch deleted"
 
 
-def collect(repo: str | Path, min_age_s: float, skips: set[str], now: float) -> tuple[str | None, list[dict]]:
+def collect(
+    repo: str | Path,
+    min_age_s: float,
+    skips: set[str],
+    now: float,
+    purge_age_s: float | None = None,
+) -> tuple[str | None, list[dict]]:
     """Toplevel path plus one decision row per worktree. Empty on no git."""
     top = toplevel_of(repo)
     if top is None:
@@ -620,7 +675,9 @@ def collect(repo: str | Path, min_age_s: float, skips: set[str], now: float) -> 
     rows: list[dict] = []
     for entry in entries:
         path = str(entry.get("path", ""))
-        rows.append(decide(top, entry, top, main_now, min_age_s, skips, now, busy.get(path, "")))
+        rows.append(
+            decide(top, entry, top, main_now, min_age_s, skips, now, busy.get(path, ""), purge_age_s)
+        )
     rows.sort(key=lambda item: item.get("path", ""))
     return top, rows
 
@@ -633,7 +690,14 @@ def apply_reaps(top: str, rows: list[dict], dry_run: bool) -> list[dict]:
         if dry_run:
             row["reason"] = row.get("reason", "") + " (would remove; rerun with --apply)"
             continue
-        ok, detail = remove_worktree(top, row["path"])
+        if row.get("purge"):
+            clean, _ = is_clean(row["path"])
+            if not clean:
+                saved = salvage(row["path"])
+                row["salvaged"] = saved or "archive failed"
+            ok, detail = remove_worktree(top, row["path"], force=True)
+        else:
+            ok, detail = remove_worktree(top, row["path"])
         if not ok:
             row["decision"] = "keep"
             row["reason"] = detail
@@ -647,6 +711,8 @@ def apply_reaps(top: str, rows: list[dict], dry_run: bool) -> list[dict]:
             row["reason"] = "removed worktree and deleted branch"
         else:
             row["reason"] = "removed worktree; " + gone
+        if row.get("salvaged"):
+            row["reason"] += "; uncommitted tree archived at " + str(row["salvaged"])
     return rows
 
 
@@ -691,6 +757,7 @@ def cmd_worktrees(argv: list[str]) -> int:
     apply = False
     json_mode = False
     min_age_raw = "3h"
+    purge_age_raw = ""
     skips: set[str] = set()
     index = 1
     while index < len(args):
@@ -711,6 +778,9 @@ def cmd_worktrees(argv: list[str]) -> int:
         elif token == "--min-age" and index + 1 < len(args):
             min_age_raw = args[index + 1]
             index += 2
+        elif token == "--purge-age" and index + 1 < len(args):
+            purge_age_raw = args[index + 1]
+            index += 2
         else:
             print(WORKTREES_USAGE, end="", file=sys.stderr)
             return errors.USAGE
@@ -728,7 +798,15 @@ def cmd_worktrees(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return errors.USAGE
-    top, rows = collect(repo, min_age_s, skips, time.time())
+    purge_age_s = parse_duration(purge_age_raw) if purge_age_raw else None
+    if purge_age_raw and purge_age_s is None:
+        print(
+            "bad --purge-age " + repr(purge_age_raw) + ". Use like 4h, 2d. "
+            "Run: python3 agent_dash.py worktrees reap --repo <path>",
+            file=sys.stderr,
+        )
+        return errors.USAGE
+    top, rows = collect(repo, min_age_s, skips, time.time(), purge_age_s)
     if top is None:
         print(
             "repo not found: " + str(repo) + ". Run: python3 agent_dash.py worktrees reap --repo <path>",
