@@ -138,6 +138,52 @@ class JanitorTest(unittest.TestCase):
         self.assertNotEqual(git(repo, "branch", "--list", "lane-open"), "")
         self.assertNotEqual(answer_field(text, "freed_bytes"), "0")
 
+    def test_report_separates_apparent_size_from_physical_reclaim(self):
+        """A run that frees 1 GB of clones says how much the disk gave back."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-clones")
+        commit_in(path, "lane.txt")
+        add_venv(path)
+        make_old_tree(path, 30)
+        reads = iter([10_000_000_000, 10_400_000_000])
+        with mock.patch.object(
+            worktrees, "disk_free_bytes", side_effect=lambda _p: next(reads)
+        ):
+            code, text = run_janitor(repo, "--apply")
+        self.assertEqual(code, 0)
+        self.assertNotEqual(answer_field(text, "freed_bytes"), "0")
+        self.assertEqual(answer_field(text, "disk_freed_bytes"), "400000000")
+        self.assertIn("reclaimed on disk", text)
+
+    def test_shared_blocks_are_called_out(self):
+        """A big apparent total with a small disk delta names the sharing."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-shared")
+        commit_in(path, "lane.txt")
+        add_venv(path)
+        make_old_tree(path, 30)
+        reads = iter([10_000_000_000, 10_003_000_000])
+        with mock.patch.object(
+            wtjanitor, "dir_size_bytes", return_value=5 * 1024**3
+        ):
+            with mock.patch.object(
+                worktrees, "disk_free_bytes", side_effect=lambda _p: next(reads)
+            ):
+                code, text = run_janitor(repo, "--apply")
+        self.assertEqual(code, 0)
+        self.assertIn("was never occupying the volume", text)
+
+    def test_dry_run_reports_no_physical_reclaim(self):
+        """A dry run removes nothing, so it claims no disk reclaim."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-dry")
+        commit_in(path, "lane.txt")
+        add_venv(path)
+        make_old_tree(path, 30)
+        code, text = run_janitor(repo)
+        self.assertEqual(code, 0)
+        self.assertEqual(answer_field(text, "disk_freed_bytes"), "unknown")
+
     def test_recent_worktree_is_untouched(self):
         """A worktree with fresh source files keeps its artifacts."""
         repo = self._repo()
