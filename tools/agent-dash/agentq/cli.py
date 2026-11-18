@@ -122,6 +122,21 @@ def answer(ctx: Context, text: str, code: int) -> int:
     return code
 
 
+def repo_top_of(workspace: str) -> str:
+    """The top folder of the git checkout holding ``workspace``, or ``workspace`` outside git.
+
+    A write job submitted from a subfolder of a main checkout would otherwise miss its
+    auto worktree and queue behind every other write job on that subfolder.
+    """
+    probe = subprocess.run(
+        ["git", "-C", workspace, "rev-parse", "--show-cdup"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if probe.returncode != 0:
+        return workspace
+    return os.path.normpath(os.path.join(workspace, probe.stdout.strip()))
+
+
 def cmd_submit(args, ctx: Context) -> int:
     prompt = Path(args.prompt_file).expanduser()
     if not prompt.is_file():
@@ -133,6 +148,8 @@ def cmd_submit(args, ctx: Context) -> int:
         return answer(ctx, "label make refused; pass --label", 1)
     tier = args.tier or db.default_tier(args.kind)
     workspace = os.path.abspath(os.path.expanduser(args.workspace or os.getcwd()))
+    if args.kind == "write" and not args.in_place:
+        workspace = repo_top_of(workspace)
     conn = db.connect(ctx.home)
     dest = db.job_dir(ctx.home, job_id) / "prompt.md"
     dest.parent.mkdir(parents=True, exist_ok=True)

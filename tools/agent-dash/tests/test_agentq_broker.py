@@ -1344,6 +1344,22 @@ class AutoWorktreeTests(ProcessCleanup):
         code, out = run_cli(self.env, ["ls", "--mine"])
         self.assertIn(f"worktree {job['workspace']}", out)
 
+    def test_write_submitted_from_a_subfolder_gets_its_own_worktree(self):
+        sub = self.main / "reports" / "prompts"
+        sub.mkdir(parents=True)
+        first = self.submit_write(sub, label="sub1")
+        second = self.submit_write(sub, label="sub2")
+        self.assertEqual(row(self.home, first)["workspace"], str(self.main))
+        launched = make_broker(self.home, self.fake(live_s=30)).tick()
+        self.assertEqual(launched, [first, second])
+        self.assertEqual(row(self.home, second)["orig_workspace"], str(self.main))
+
+    def test_in_place_write_from_a_subfolder_keeps_the_subfolder(self):
+        sub = self.main / "reports"
+        sub.mkdir()
+        job_id = self.submit_write(sub, "--in-place", label="ip-sub")
+        self.assertEqual(row(self.home, job_id)["workspace"], str(sub))
+
     def test_submit_records_in_place_as_zero_by_default(self):
         job_id = self.submit_write(self.main, label="default")
         self.assertEqual(row(self.home, job_id)["in_place"], 0)
