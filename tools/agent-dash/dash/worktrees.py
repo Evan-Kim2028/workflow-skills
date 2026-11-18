@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -477,6 +478,91 @@ def _command_table(pids: list[int]) -> dict[int, str] | None:
     return table
 
 
+def path_size_bytes(path: str | Path) -> int | None:
+    """Apparent size of one path via ``du -sk``, or None when it cannot tell.
+
+    Apparent, not physical: blocks shared with a copy-on-write clone or a
+    hardlink are counted here at full size. Use ``disk_free_bytes`` before
+    and after a run for what the volume really gave back.
+    """
+    try:
+        proc = subprocess.run(
+            ["du", "-skx", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    first = (proc.stdout or "").strip().split()
+    if not first:
+        return None
+    try:
+        return int(first[0]) * 1024
+    except ValueError:
+        return None
+
+
+def disk_free_bytes(path: str | Path) -> int | None:
+    """Free bytes on the volume holding ``path``, or None when it cannot tell.
+
+    This is the physical number. Summing the apparent size of removed files
+    overstates it wherever copies share blocks (APFS clones, reflinks,
+    hardlinks), so a report that frees a cloned ``.venv`` per worktree can
+    claim a hundred gigabytes while the volume gives back three.
+    """
+    try:
+        usage = shutil.disk_usage(str(path))
+    except OSError:
+        return None
+    return int(usage.free)
+
+
+def disk_reclaimed(before: int | None, after: int | None) -> int | None:
+    """Bytes the volume actually gave back between two free-space reads.
+
+    None when either read failed or the volume lost space (other writers can
+    take space during a run, so a negative delta is not a reclaim).
+    """
+    if before is None or after is None:
+        return None
+    delta = after - before
+    return delta if delta > 0 else None
+
+
+def human_bytes(count: int) -> str:
+    """Bytes as a short human string."""
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return ("%d %s" % (value, unit)) if unit == "B" else ("%.1f %s" % (value, unit))
+        value /= 1024.0
+    return "%d B" % count
+
+
+def reclaim_note(apparent: int, on_disk: int | None) -> str:
+    """One line separating apparent size from what the disk gave back."""
+    if on_disk is None:
+        return (
+            "apparent %s removed; physical reclaim could not be measured "
+            "here (a copy-on-write clone or hardlink can share those blocks)"
+            % human_bytes(apparent)
+        )
+    if apparent >= 1024 * 1024 * 1024 and on_disk * 10 < apparent:
+        return (
+            "apparent %s removed, %s reclaimed on disk: most of it was shared "
+            "blocks (copy-on-write clone or hardlink), so the apparent total "
+            "was never occupying the volume" % (human_bytes(apparent), human_bytes(on_disk))
+        )
+    return "apparent %s removed, %s reclaimed on disk" % (
+        human_bytes(apparent),
+        human_bytes(on_disk),
+    )
+
+
 def busy_map(paths: list[str]) -> dict[str, str]:
     """Worktree paths holding a live process, each mapped to its reason."""
     targets = {os.path.realpath(path): path for path in paths}
@@ -690,6 +776,8 @@ def apply_reaps(top: str, rows: list[dict], dry_run: bool) -> list[dict]:
         if dry_run:
             row["reason"] = row.get("reason", "") + " (would remove; rerun with --apply)"
             continue
+        if not row.get("bytes"):
+            row["bytes"] = path_size_bytes(row["path"])
         if row.get("purge"):
             clean, _ = is_clean(row["path"])
             if not clean:
@@ -813,12 +901,26 @@ def cmd_worktrees(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return errors.NOT_FOUND
+    free_before = disk_free_bytes(top) if apply else None
     rows = apply_reaps(top, rows, not apply)
+    on_disk = disk_reclaimed(free_before, disk_free_bytes(top)) if apply else None
+    apparent = sum(int(row.get("bytes") or 0) for row in rows if row.get("decision") == "reap")
     if json_mode:
-        errors.emit_json({"repo": top, "apply": apply, "worktrees": rows})
+        errors.emit_json(
+            {
+                "repo": top,
+                "apply": apply,
+                "worktrees": rows,
+                "apparent_bytes": apparent,
+                "disk_reclaimed_bytes": on_disk,
+            }
+        )
         return errors.OK
     if not rows:
         errors.emit_human("no linked worktrees under " + top, json_mode)
         return errors.OK
-    errors.emit_human(format_table(rows), json_mode)
+    text = format_table(rows)
+    if on_disk is not None or (apply and apparent):
+        text += "\n" + reclaim_note(apparent, on_disk)
+    errors.emit_human(text, json_mode)
     return errors.OK

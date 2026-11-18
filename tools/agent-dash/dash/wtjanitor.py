@@ -54,6 +54,13 @@ JANITOR_USAGE = """agent-dash worktrees janitor
       [--pressure-pct 12] [--pressure-age 6h] [--skip <path-or-branch>]
       [--daily-maintenance] [--apply-cooldown <dur>] [--state-file <path>] [--json]
 
+Sizes in the report are apparent (`du`-style): a folder that shares blocks
+with a copy-on-write clone or a hardlink reports its full size while the
+volume holds one copy, so a set of cloned .venv folders can read as a
+hundred gigabytes and give back three. The ANSWER line therefore carries
+both numbers: freed_bytes/freed (apparent) and disk_freed_bytes/disk_freed
+(the real free-space delta measured across the apply run).
+
 Dry-run by default: prints what would go, removes nothing. Pass --apply
 to reap merged worktrees (as `worktrees reap` does) and delete stale
 regenerable artifact folders (.venv, node_modules, tool caches) from the
@@ -111,26 +118,14 @@ def disk_free_pct(path: str | Path) -> float | None:
 
 
 def dir_size_bytes(path: str | Path) -> int | None:
-    """Apparent size of one path via ``du -sk``, or None when it cannot tell."""
-    try:
-        proc = subprocess.run(
-            ["du", "-skx", str(path)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=DU_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    first = (proc.stdout or "").strip().split()
-    if not first:
-        return None
-    try:
-        return int(first[0]) * 1024
-    except ValueError:
-        return None
+    """Apparent size of one path via ``du -sk``, or None when it cannot tell.
+
+    Apparent, not physical: a copy that shares blocks (APFS clone, reflink,
+    hardlink) reports its full size here while the volume holds one copy.
+    Used to rank and report rows; the run's real reclaim comes from the
+    free-space delta in the ANSWER line.
+    """
+    return worktrees.path_size_bytes(path)
 
 
 def source_mtime(path: str | Path, deadline: float) -> float | None:
@@ -637,6 +632,7 @@ def cmd_janitor(argv: list[str]) -> int:
     for row in rows:
         if row.get("decision") == "reap":
             row["bytes"] = dir_size_bytes(row["path"]) or 0
+    free_before = None if dry_run else worktrees.disk_free_bytes(top)
     rows = worktrees.apply_reaps(top, rows, dry_run)
     reaped = [row for row in rows if row.get("decision") == "reap" and row.get("bytes")]
     for row in reaped:
@@ -691,6 +687,9 @@ def cmd_janitor(argv: list[str]) -> int:
     artifact_bytes = sum(int(row.get("bytes") or 0) for row in artifact_rows if row["decision"] == "delete")
     artifact_worktrees = len({row["path"] for row in artifact_rows if row["decision"] == "delete"})
     freed_bytes = reaped_bytes + artifact_bytes
+    disk_freed = (
+        None if dry_run else worktrees.disk_reclaimed(free_before, worktrees.disk_free_bytes(top))
+    )
 
     maintenance: list[dict] = []
     if daily:
@@ -722,13 +721,22 @@ def cmd_janitor(argv: list[str]) -> int:
             "artifacts": artifact_count,
             "worktrees": artifact_worktrees,
             "freed_bytes": freed_bytes,
+            "apparent_bytes": freed_bytes,
+            "disk_freed_bytes": disk_freed,
         },
     }
     if json_mode:
         errors.emit_json(payload)
         return errors.OK
+    if disk_freed is None:
+        disk_freed_field = "disk_freed_bytes=unknown disk_freed=unknown"
+    else:
+        disk_freed_field = "disk_freed_bytes=%d disk_freed=%s" % (
+            disk_freed,
+            _human_bytes(disk_freed),
+        )
     answer = (
-        "ANSWER: reaped=%d artifacts=%d worktrees=%d freed_bytes=%d freed=%s "
+        "ANSWER: reaped=%d artifacts=%d worktrees=%d freed_bytes=%d freed=%s %s "
         "pressure=%d artifact_age=%ds apply=%d"
         % (
             reaped_count,
@@ -736,11 +744,14 @@ def cmd_janitor(argv: list[str]) -> int:
             artifact_worktrees,
             freed_bytes,
             _human_bytes(freed_bytes),
+            disk_freed_field,
             1 if pressure else 0,
             int(effective_age_s),
             1 if apply else 0,
         )
     )
+    if not dry_run and freed_bytes:
+        lines.append(worktrees.reclaim_note(freed_bytes, disk_freed))
     lines.append(answer)
     print("\n".join(lines))
     return errors.OK

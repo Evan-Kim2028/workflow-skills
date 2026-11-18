@@ -12,6 +12,8 @@ os.environ.setdefault(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures", "bundles"),
 )
 
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -257,6 +259,40 @@ class ReapDecisionsTest(unittest.TestCase):
                 0,
             )
         self.assertFalse(Path(path).exists())
+
+    def test_reap_reports_the_disk_delta_not_only_apparent_size(self):
+        """A reaped lane reports what the volume gave back, not its du size."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-delta")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "lane-delta")
+        make_old(path)
+        reads = iter([10_000_000_000, 10_050_000_000])
+        out = io.StringIO()
+        with mock.patch.object(
+            worktrees, "disk_free_bytes", side_effect=lambda _p: next(reads)
+        ):
+            with contextlib.redirect_stdout(out):
+                code = cmd_worktrees(["reap", "--repo", str(repo), "--min-age", "0s", "--apply"])
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertFalse(Path(path).exists())
+        self.assertIn("reclaimed on disk", text)
+        self.assertIn("47.7 MB", text)
+
+    def test_reap_dry_run_claims_no_disk_reclaim(self):
+        """A dry run prints no reclaim figure because nothing was removed."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-dryrun")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "lane-dryrun")
+        make_old(path)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cmd_worktrees(["reap", "--repo", str(repo)])
+        self.assertEqual(code, 0)
+        self.assertNotIn("reclaimed on disk", out.getvalue())
+        self.assertTrue(Path(path).exists())
 
     def test_merged_with_commits_is_removed(self):
         """Dry-run lists the merged worktree; apply removes it and the branch."""
