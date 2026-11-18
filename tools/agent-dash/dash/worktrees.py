@@ -524,13 +524,14 @@ def disk_free_bytes(path: str | Path) -> int | None:
 def disk_reclaimed(before: int | None, after: int | None) -> int | None:
     """Bytes the volume actually gave back between two free-space reads.
 
-    None when either read failed or the volume lost space (other writers can
-    take space during a run, so a negative delta is not a reclaim).
+    None only when a read failed. Zero is a real answer: removing a set of
+    clone copies can give back nothing, and the report has to say so rather
+    than fall back to the apparent size. Other writers can take space during
+    a run, so a negative delta reports as zero.
     """
     if before is None or after is None:
         return None
-    delta = after - before
-    return delta if delta > 0 else None
+    return max(0, after - before)
 
 
 def human_bytes(count: int) -> str:
@@ -545,17 +546,25 @@ def human_bytes(count: int) -> str:
 
 def reclaim_note(apparent: int, on_disk: int | None) -> str:
     """One line separating apparent size from what the disk gave back."""
+    shared = (
+        "those blocks were shared with a copy-on-write clone or a hardlink, "
+        "or other writers took the space during the run"
+    )
     if on_disk is None:
         return (
-            "apparent %s removed; physical reclaim could not be measured "
-            "here (a copy-on-write clone or hardlink can share those blocks)"
-            % human_bytes(apparent)
+            "apparent %s removed; physical reclaim could not be measured here "
+            "(a copy-on-write clone or hardlink can share those blocks)" % human_bytes(apparent)
         )
-    if apparent >= 1024 * 1024 * 1024 and on_disk * 10 < apparent:
+    if on_disk == 0:
+        return "apparent %s removed, 0 B reclaimed on disk: %s" % (
+            human_bytes(apparent),
+            shared,
+        )
+    if apparent >= 100 * 1024 * 1024 and on_disk * 2 < apparent:
         return (
             "apparent %s removed, %s reclaimed on disk: most of it was shared "
-            "blocks (copy-on-write clone or hardlink), so the apparent total "
-            "was never occupying the volume" % (human_bytes(apparent), human_bytes(on_disk))
+            "blocks, so the apparent total was never occupying the volume"
+            % (human_bytes(apparent), human_bytes(on_disk))
         )
     return "apparent %s removed, %s reclaimed on disk" % (
         human_bytes(apparent),

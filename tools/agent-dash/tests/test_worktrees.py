@@ -280,6 +280,29 @@ class ReapDecisionsTest(unittest.TestCase):
         self.assertIn("reclaimed on disk", text)
         self.assertIn("47.7 MB", text)
 
+    def test_reap_reports_zero_when_clones_give_nothing_back(self):
+        """Removing clone copies can free no disk space; say zero, not unknown."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-clones")
+        commit_in(path, "lane.txt")
+        merge_into_main(repo, "lane-clones")
+        make_old(path)
+        out = io.StringIO()
+        with mock.patch.object(worktrees, "disk_free_bytes", return_value=10_000_000_000):
+            with contextlib.redirect_stdout(out):
+                code = cmd_worktrees(["reap", "--repo", str(repo), "--min-age", "0s", "--apply"])
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("0 B reclaimed on disk", text)
+        self.assertIn("copy-on-write clone", text)
+
+    def test_disk_reclaimed_treats_a_loss_as_zero(self):
+        """Other writers can eat the space; a negative delta is not a reclaim."""
+        self.assertEqual(worktrees.disk_reclaimed(1000, 900), 0)
+        self.assertEqual(worktrees.disk_reclaimed(1000, 1000), 0)
+        self.assertEqual(worktrees.disk_reclaimed(1000, 1500), 500)
+        self.assertIsNone(worktrees.disk_reclaimed(None, 1500))
+
     def test_reap_dry_run_claims_no_disk_reclaim(self):
         """A dry run prints no reclaim figure because nothing was removed."""
         repo = self._repo()
