@@ -173,6 +173,19 @@ class JanitorTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("was never occupying the volume", text)
 
+    def test_report_says_zero_when_a_clone_frees_nothing(self):
+        """A 1 GB apparent removal that frees no disk space says 0 B."""
+        repo = self._repo()
+        path = add_worktree(repo, "wt", "lane-zero")
+        commit_in(path, "lane.txt")
+        add_venv(path)
+        make_old_tree(path, 30)
+        with mock.patch.object(worktrees, "disk_free_bytes", return_value=10_000_000_000):
+            code, text = run_janitor(repo, "--apply")
+        self.assertEqual(code, 0)
+        self.assertEqual(answer_field(text, "disk_freed_bytes"), "0")
+        self.assertIn("0 B reclaimed on disk", text)
+
     def test_dry_run_reports_no_physical_reclaim(self):
         """A dry run removes nothing, so it claims no disk reclaim."""
         repo = self._repo()
