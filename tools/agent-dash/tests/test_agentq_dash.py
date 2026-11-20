@@ -3137,3 +3137,19 @@ class HeadlineCleanTest(unittest.TestCase):
         self.assertNotIn("\n", room["text"])
 
 
+class HoldKindTest(unittest.TestCase):
+    """A hold's group and key: the kind of wait, with its live numbers left out."""
+
+    def test_pytest_slot_pressure_is_one_slot_key_whatever_the_counts(self) -> None:
+        self.assertEqual(dash.hold_kind("tests", "pytest slots busy (16 held, 3 waiting)"),
+                         ("slots", "pytest slots busy"))
+        self.assertEqual(dash.hold_kind("tests", "pytest slots busy (2 held, 0 waiting)"),
+                         ("slots", "pytest slots busy"))
+
+    def test_the_tests_ceiling_is_its_own_slot_key(self) -> None:
+        self.assertEqual(dash.hold_kind("tests", "tests ceiling full (20 of 20)"),
+                         ("slots", "tests ceiling"))
+
+    def test_the_fixed_cap_keeps_its_per_resource_key(self) -> None:
+        self.assertEqual(dash.hold_kind("tests", "slots full"), ("slots", "tests slots"))
+        self.assertEqual(dash.hold_kind("ssh", "slots full"), ("ssh", "ssh slots"))
