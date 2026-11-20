@@ -38,7 +38,10 @@ The key covers, all of it (a miss is cheap, a false hit is a lie):
 - the interpreter path (``.venv`` vs ``uv run --package <name>``);
 - for a test file that reads the whole tree (``SCAN_ROOTS``, ``git ls-files``,
   ``rglob``, ``os.walk``, ``.glob(``), the whole tree sha: index blobs from
-  ``git ls-files -s`` plus content shas for the dirty and untracked paths.
+  ``git ls-files -s`` plus content shas for the dirty and untracked paths. A closure over
+  ``MAX_CLOSURE_FILES`` is not walked to the end and keys on the whole tree instead, which
+  is the same answer for a test that reaches everything and costs one ``git ls-files``
+  rather than a parse of the repo.
 
 A run that cannot be keyed (no target, a missing target, an import that names a repo
 module but does not resolve, a whole-tree test with no git tree sha) is not cached and
