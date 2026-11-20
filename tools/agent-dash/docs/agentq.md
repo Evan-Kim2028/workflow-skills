@@ -494,9 +494,10 @@ and several such runs at 44-71% CPU each were seen on a laptop at load 38-44 on 
   the shims (`slots.pytest_admission`, `slots.acquire`). The record names `AGENTQ_RUN`
   (else `AGENTQ_JOB`, else `-`) and the pytest arguments. `pytest_unconfigure` releases it.
 - **Where it is loaded.** `launch_pi.py` sets, on the pi child unless `AGENTQ_SHIMS=0`:
-  `PYTHONPATH` (plugin folder prepended), `PYTEST_ADDOPTS` (`-p agentq_pytest_slot` appended),
-  and `PYTEST_XDIST_AUTO_NUM_WORKERS=2` and `LOR_CI_XDIST=2` when unset. Any project venv
-  then loads the plugin with no change to the project.
+  `PYTHONPATH` (plugin folder prepended), `PYTEST_ADDOPTS` (`-p agentq_pytest_slot` and
+  `-p agentq_pytest_cache` appended), and `PYTEST_XDIST_AUTO_NUM_WORKERS=2` and
+  `LOR_CI_XDIST=2` when unset. Any project venv then loads the plugins with no change to
+  the project.
 - **xdist worker cap.** `LOR_CI_XDIST` (default 2) is the cap, and the plugin enforces it on
   xdist's parsed worker count, not on the environment: its `pytest_cmdline_main` runs after
   xdist's `tryfirst` one, which resolves `-n auto` / `-n logical` (from
@@ -520,6 +521,59 @@ Tests: `tests/test_agentq_pytest_plugin.py` (slot acquire and release, skips, er
 a live `sys.executable -m pytest` run that checks the slot is held during the run, shim
 handoff, launcher env composition, and real xdist runs that count the workers created for
 `-n 8`, `-n auto` with `PYTEST_XDIST_AUTO_NUM_WORKERS=8`, `-n logical` and a raised cap).
+
+## Pytest result cache (repeat runs)
+
+A pi worker re-runs the same one-file pytest command many times per job. Measured over the
+last 300 `pi-deepseek-flash` write jobs: 3012 invocations, 12.3 per job, median one file;
+85 % of jobs re-ran an identical file set, and 85 % of those repeats had no edit at all in
+between (24.9 h of 57.6 h of pytest wall time). 98 % of invocations pass, so a pass-keyed
+cache hits almost always. `agentq/pyplugin/agentq_pytest_cache.py` turns such a repeat into
+one line and exit 0.
+
+- **Where it is enforced.** The same plugin folder and `PYTEST_ADDOPTS` as the slot plugin,
+  so it also covers the 31 % of invocations that run a venv interpreter by absolute path and
+  never reach the PATH shims.
+- **Hook.** `pytest_cmdline_main`, before collection, because the expensive part of the top
+  files is a module-level import (a deselect after collection would save nothing). When every
+  positional target is a recorded pass it prints one line to stderr and returns 0:
+  `agentq pytest cache: 2 file(s) unchanged since a recorded pass on this tree, skipped
+  (a.py, b.py); re-run with LOR_PYTEST_CACHE=0, or change a file they import`.
+- **The key** covers the target files' content shas, every repo module in their transitive
+  import closure (a stdlib AST import walk, cached per file under the agentq home keyed by
+  that file's content sha), every `conftest.py` up to the repo root, `uv.lock` and every
+  `pyproject.toml` / `pytest.ini` / `setup.cfg` / `tox.ini`, the whole pytest argv, the
+  environment the suites read (`PYTHONPATH`, `LOR_DBT_MANIFEST`, `DATA_ROOT`, `LAKE_STORE`,
+  `PYTEST_ADDOPTS`, every `PG*` and `LOR_*`), the interpreter path, and for a test file that
+  reads the whole tree (`SCAN_ROOTS`, `git ls-files`, `rglob`, `os.walk`, `.glob(`) the whole
+  tree sha. A miss is cheap; a false hit is a lie, so anything that cannot be keyed (no
+  target, a missing target, an unresolved repo import, a tree test with no git tree sha) runs
+  normally and is not cached.
+- **Recorded only on exit 0** with at least one passed test, in the main process only. A
+  failure, an error, a skip-only run and a `-x` early exit write nothing.
+- **The guard, folded in.** The shim's `pytest_reason` refusals (a bare pytest, a directory
+  target, more than 25 files) are applied here too, with the shim's message and exit 2, so the
+  absolute-path invocations the shim never sees get them. `AGENTQ_GUARD=0` turns that off.
+- **Off outside a worker.** It does nothing unless `AGENTQ_JOB` or `AGENTQ_RUN` is set, and
+  `LOR_PYTEST_CACHE=0` turns it off. The gate and CI must set that variable explicitly (an
+  attestation has to be a real run), not rely on `AGENTQ_JOB` being unset.
+- **Never fails a run.** Any error prints one `agentq pytest cache:` line to stderr and pytest
+  runs normally. Stdlib only, Python 3.9+, and it imports nothing from agentq: the home is
+  `$AGENTQ_HOME` or `~/.local/state/agentq`, and it appends the event row itself.
+- **Visibility.** One row per decision in `slots/events.jsonl` with `cache=hit|miss` (and
+  `why` when a run could not be keyed), counted per label by `agentq slots --history`.
+- **Entries** live under `$AGENTQ_HOME/pytest-cache/`: `entries/<xx>/<key>.json` (a recorded
+  pass), `closures/<xx>.json` (a test file's import closure with every member's blob, so a
+  repeat re-hashes the members and walks only what changed) and `imports/store.json` (the
+  per-file import lists, keyed by content sha and shared across worktrees). Entries and
+  closures are pruned by age (30 days) and count (20 000) at most once an hour. The first
+  walk of a large closure parses every file in it once (a thousand files for a test that
+  imports a whole monorepo); after that the store answers from memory.
+
+Tests: `tests/test_agentq_pytest_cache.py` (key material and each miss trigger, the import
+cache, the event rows, gating, the guard, the never-fails paths, and real
+`sys.executable -m pytest` runs for a hit, an edit, a failing run, a skip-only run and the
+switches).
 
 ## Known limits
 

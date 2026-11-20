@@ -366,6 +366,7 @@ def _slots_history(args, ctx: Context) -> int:
     totals = report["totals"]
     return answer(ctx, f"{totals['runs']} slot run(s) over {backlog_lib.format_duration(since_s)}; "
                        f"{totals['reruns']} identical re-run(s) with no release in between; "
+                       f"pytest cache {totals['cache_hits']} hit(s), {totals['cache_misses']} miss(es); "
                        f"hold {slots_lib.format_ms(totals['hold_ms'])}, "
                        f"wait {slots_lib.format_ms(totals['wait_ms'])}", 0)
 

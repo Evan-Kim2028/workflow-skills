@@ -268,7 +268,9 @@ class XdistCapTests(unittest.TestCase):
 
     Each run is ``sys.executable -m pytest`` on a temp module of 8 trivial tests that append
     their ``PYTEST_XDIST_WORKER`` to a file, so the distinct values are the workers created.
-    ``AGENTQ_PYTEST_SLOT_HELD=1`` keeps the slot out of these runs; the cap is a separate hook.
+    The module is named on the command line, since the guard (and the cache plugin that
+    carries it) refuses a bare pytest. ``AGENTQ_PYTEST_SLOT_HELD=1`` keeps the slot out of
+    these runs; the cap is a separate hook.
     """
 
     def setUp(self):
@@ -316,39 +318,39 @@ class XdistCapTests(unittest.TestCase):
         return workers
 
     def test_explicit_n_eight_is_capped_at_two(self):
-        result = self.run_pytest(["-n", "8"], self.env())
+        result = self.run_pytest(["test_workers.py", "-n", "8"], self.env())
         self.assert_capped(result, 2)
         self.assertIn("xdist workers lowered from 8 to 2 (LOR_CI_XDIST)", result.stderr)
         self.assertEqual(result.stderr.count("xdist workers lowered"), 1)
 
     def test_n_auto_with_a_large_environment_value_is_capped(self):
-        result = self.run_pytest(["-n", "auto"], self.env({"PYTEST_XDIST_AUTO_NUM_WORKERS": "8"}))
+        result = self.run_pytest(["test_workers.py", "-n", "auto"], self.env({"PYTEST_XDIST_AUTO_NUM_WORKERS": "8"}))
         self.assert_capped(result, 2)
         self.assertIn("xdist workers lowered from 8 to 2 (LOR_CI_XDIST)", result.stderr)
 
     def test_n_logical_is_capped(self):
-        result = self.run_pytest(["-n", "logical"], self.env())
+        result = self.run_pytest(["test_workers.py", "-n", "logical"], self.env())
         self.assert_capped(result, 2)
 
     def test_cap_is_configurable_through_the_launcher_variable(self):
-        result = self.run_pytest(["-n", "8"], self.env({"LOR_CI_XDIST": "3"}))
+        result = self.run_pytest(["test_workers.py", "-n", "8"], self.env({"LOR_CI_XDIST": "3"}))
         self.assert_capped(result, 3)
         self.assertIn("xdist workers lowered from 8 to 3 (LOR_CI_XDIST)", result.stderr)
 
     def test_n_one_and_no_n_are_left_alone(self):
-        one = self.run_pytest(["-n", "1"], self.env())
+        one = self.run_pytest(["test_workers.py", "-n", "1"], self.env())
         self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
         self.assertEqual(self.workers(), ["gw0"])
         self.assertNotIn("xdist workers lowered", one.stderr)
         self.out.unlink()
-        plain = self.run_pytest([], self.env())
+        plain = self.run_pytest(["test_workers.py"], self.env())
         self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
         self.assertEqual(self.workers(), ["main"])
         self.assertNotIn("xdist workers lowered", plain.stderr)
 
     def test_without_the_plugin_the_same_run_creates_more_than_two_workers(self):
         """Control: the worker count above is real, not an artefact of the temp module."""
-        result = self.run_pytest(["-n", "4"], self.env(plugin=False))
+        result = self.run_pytest(["test_workers.py", "-n", "4"], self.env(plugin=False))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.workers()), 4, self.workers())
 
@@ -424,15 +426,22 @@ class LaunchPiPluginEnvTests(unittest.TestCase):
         once = self.env({"PATH": "/bin"})
         twice = launch.shim_environ(dict(once), shims_dir=SHIMS, python="/py", plugin_dir=PLUGIN_DIR)
         self.assertEqual(twice["PYTHONPATH"].split(os.pathsep).count(str(PLUGIN_DIR)), 1)
-        self.assertEqual(twice["PYTEST_ADDOPTS"].count("-p agentq_pytest_slot"), 1)
+        for name in launch.PYTEST_PLUGINS:
+            self.assertEqual(twice["PYTEST_ADDOPTS"].count(f"-p {name}"), 1)
 
-    def test_addopts_keep_the_existing_value_and_gain_the_plugin(self):
+    def test_addopts_keep_the_existing_value_and_gain_the_plugins(self):
         env = self.env({"PATH": "/bin", "PYTEST_ADDOPTS": "-q --maxfail=1"})
-        self.assertEqual(env["PYTEST_ADDOPTS"], "-q --maxfail=1 -p agentq_pytest_slot")
+        self.assertEqual(env["PYTEST_ADDOPTS"],
+                         "-q --maxfail=1 -p agentq_pytest_slot -p agentq_pytest_cache")
 
-    def test_addopts_are_just_the_plugin_when_unset(self):
+    def test_addopts_are_just_the_plugins_when_unset(self):
         env = self.env({"PATH": "/bin"})
-        self.assertEqual(env["PYTEST_ADDOPTS"], "-p agentq_pytest_slot")
+        self.assertEqual(env["PYTEST_ADDOPTS"], "-p agentq_pytest_slot -p agentq_pytest_cache")
+
+    def test_both_plugins_are_in_the_plugin_folder(self):
+        self.assertEqual(launch.PYTEST_PLUGINS, ("agentq_pytest_slot", "agentq_pytest_cache"))
+        for name in launch.PYTEST_PLUGINS:
+            self.assertTrue((PLUGIN_DIR / f"{name}.py").is_file(), name)
 
     def test_xdist_cap_defaults_to_two_and_keeps_an_explicit_cap(self):
         env = self.env({"PATH": "/bin"})

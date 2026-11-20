@@ -11,6 +11,8 @@
   "map": {
     "agentq/gc.py": ["test_agentq_gc"],
     "agentq/proxy.py": ["test_agentq_proxy"],
+    "agentq/slots.py": ["test_agentq_shims"],
+    "agentq/pyplugin/**": ["test_agentq_pytest_plugin", "test_agentq_pytest_cache"],
     "scripts/perf_probe.py": ["test_perf_stage3", "test_perf_stage2"],
     "agent_dash.py": [
       "test_server",

@@ -56,13 +56,15 @@ passes the registry tier name with ``--tier``, so a DeepSeek run reads
 ``pi-deepseek`` and a Beam run ``pi-beam`` instead of the bare harness
 name. Without ``--tier`` the tier comes from the model family.
 
-Pytest slots (``agentq/pyplugin/agentq_pytest_slot.py``), unless ``AGENTQ_SHIMS=0``.
-The PATH shims only see ``pytest`` typed by name, so a worker that runs a venv
-interpreter by absolute path (``<venv>/bin/python -m pytest``) gets the slot from
-the plugin instead. ``shim_environ`` sets, on the pi child:
+Pytest plugins (``agentq/pyplugin/``), unless ``AGENTQ_SHIMS=0``. The PATH shims only
+see ``pytest`` typed by name, so a worker that runs a venv interpreter by absolute
+path (``<venv>/bin/python -m pytest``) gets the slot and the result cache from the
+plugins instead. ``shim_environ`` sets, on the pi child:
 
 - ``PYTHONPATH``: the plugin folder prepended to any existing value.
-- ``PYTEST_ADDOPTS``: ``-p agentq_pytest_slot`` appended to any existing value.
+- ``PYTEST_ADDOPTS``: ``-p agentq_pytest_slot -p agentq_pytest_cache`` appended to any
+  existing value. The cache plugin is inert unless ``AGENTQ_JOB`` or ``AGENTQ_RUN`` is
+  set, and ``LOR_PYTEST_CACHE=0`` turns it off.
 - ``PYTEST_XDIST_AUTO_NUM_WORKERS=2`` and ``LOR_CI_XDIST=2``, each only when unset.
   ``LOR_CI_XDIST`` is the worker cap the plugin enforces on xdist's parsed count
   (explicit ``-n``, ``-n auto``, ``-n logical``), so a shared laptop is not
@@ -540,7 +542,7 @@ SHIMS_ENV = "AGENTQ_SHIMS"
 SHIM_PYTHON_ENV = "AGENTQ_SHIM_PYTHON"
 SHIMS_DIR = ROOT / "agentq" / "shims"
 PYTEST_PLUGIN_DIR = ROOT / "agentq" / "pyplugin"
-PYTEST_PLUGIN = "agentq_pytest_slot"
+PYTEST_PLUGINS = ("agentq_pytest_slot", "agentq_pytest_cache")
 XDIST_DEFAULTS = (("PYTEST_XDIST_AUTO_NUM_WORKERS", "2"), ("LOR_CI_XDIST", "2"))
 
 
@@ -571,8 +573,10 @@ def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable, plugin_dir
     pythonpath = [part for part in (environ.get("PYTHONPATH") or "").split(os.pathsep) if part and part != plugin]
     environ["PYTHONPATH"] = os.pathsep.join([plugin, *pythonpath])
     addopts = (environ.get("PYTEST_ADDOPTS") or "").strip()
-    if f"-p {PYTEST_PLUGIN}" not in addopts:
-        environ["PYTEST_ADDOPTS"] = " ".join(part for part in (addopts, f"-p {PYTEST_PLUGIN}") if part)
+    for name in PYTEST_PLUGINS:
+        if f"-p {name}" not in addopts:
+            addopts = " ".join(part for part in (addopts, f"-p {name}") if part)
+    environ["PYTEST_ADDOPTS"] = addopts
     for key, value in XDIST_DEFAULTS:
         if not (environ.get(key) or "").strip():
             environ[key] = value
