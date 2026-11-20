@@ -328,6 +328,7 @@ def cmd_status(args, ctx: Context) -> int:
     ctx.print(f"filler: {filler_state}; filler jobs running: {filler_running}")
     proxy = broker_lib.proxy_status()
     ctx.print(f"proxy: {'reachable' if proxy is not None else 'unreachable (static slots)'}")
+    ctx.print(slots_lib.status_hint(ctx.home, now=ctx.now()))
     daemon = "not running" if pid is None else f"running (pid {pid or '?'})"
     total_running = sum(count for _, _, count in running)
     summary = f"daemon {daemon}; queued {sum(depth.values())}; running {total_running}"
@@ -335,17 +336,38 @@ def cmd_status(args, ctx: Context) -> int:
 
 
 def cmd_slots(args, ctx: Context) -> int:
+    if getattr(args, "history", False):
+        return _slots_history(args, ctx)
     limits = slots_lib.load_limits(ctx.home)
     parts = []
     for kind in slots_lib.KINDS:
         limit = slots_lib.kind_limit(limits, kind)
         held = slots_lib.holders(ctx.home, kind, limit, clock=ctx.now)
-        ctx.print(f"{kind}: {len(held)} of {limit} held")
+        waiting = slots_lib.reap_waiters(ctx.home, kind, clock=ctx.now)
+        ctx.print(f"{kind}: {len(held)} of {limit} held, {waiting} waiting")
         for item in held:
             ctx.print(f"  slot {item['slot']}  pid {item['pid']}  held {item['held_s']}s  "
                       f"label {item['label'] or '-'}  {item['command']}")
         parts.append(f"{kind} {len(held)}/{limit}")
     return answer(ctx, "slots held: " + "; ".join(parts), 0)
+
+
+def _slots_history(args, ctx: Context) -> int:
+    """``agentq slots --history``: per-label slot totals from ``slots/events.jsonl``."""
+    try:
+        since_s = backlog_lib.parse_duration(args.since) if args.since else slots_lib.HISTORY_SINCE_S
+    except ValueError as exc:
+        return answer(ctx, str(exc), 1)
+    report = slots_lib.history(ctx.home, since_s=since_s, now=ctx.now())
+    if args.json:
+        ctx.print(json.dumps(report, indent=2))
+    else:
+        ctx.print(slots_lib.format_history(report))
+    totals = report["totals"]
+    return answer(ctx, f"{totals['runs']} slot run(s) over {backlog_lib.format_duration(since_s)}; "
+                       f"{totals['reruns']} identical re-run(s) with no release in between; "
+                       f"hold {slots_lib.format_ms(totals['hold_ms'])}, "
+                       f"wait {slots_lib.format_ms(totals['wait_ms'])}", 0)
 
 
 def cmd_inflight_report(args, ctx: Context) -> int:
@@ -517,7 +539,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = inflight.add_parser("report", help="throughput and latency per limiter arm, from proxy_minutes (read-only)")
     p.add_argument("--hours", type=float, default=4.0)
     p.set_defaults(func=cmd_inflight_report)
-    sub.add_parser("slots", help="ssh and pytest slots held by pi workers, with holder pid and label").set_defaults(func=cmd_slots)
+    p = sub.add_parser("slots", help="ssh and pytest slots held by pi workers, with holder pid and label")
+    p.add_argument("--history", action="store_true",
+                   help="per-label slot totals from the recorded events instead of the holders")
+    p.add_argument("--since", metavar="DURATION", help="history window: 30m, 6h, 1d (default 6h)")
+    p.add_argument("--json", action="store_true", help="print the history as JSON")
+    p.set_defaults(func=cmd_slots)
 
     p = sub.add_parser("gc", help="reclaim stream files of finished jobs (dry run unless --apply)")
     p.add_argument("--runs-older-than", default=gc_lib.DEFAULT_DURATION, metavar="DURATION",

@@ -3325,6 +3325,10 @@ def hold_kind(gate: str, reason: str) -> tuple[str, str]:
                 return "laptop", f"{gate} {kind}"
     if reason == "slots full":
         return "slots", f"{gate} slots"
+    if reason.startswith("pytest slots busy"):
+        return "slots", "pytest slots busy"
+    if reason.startswith("tests ceiling full"):
+        return "slots", "tests ceiling"
     if reason == "tier cap full":
         return "tier", f"{gate} tier cap"
     return "other", re.sub(r"[\d,.]+", "N", f"{gate}: {reason}" if gate else reason)

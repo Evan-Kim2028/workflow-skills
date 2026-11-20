@@ -13,14 +13,30 @@ headroom (``pytest_admission``). A holder that waits longer than its max wait
 runs anyway, unslotted, and logs an overrun, so a stuck slot can slow a worker
 but never deadlock it. Limits come from ``broker.json`` with the broker's keys
 and defaults. Stdlib only.
+
+A run that has to wait registers a waiter file, ``slots/<kind>/waiters/<pid>``,
+so the broker can see the queue as well as the holders (``live_state``). The file
+is dropped on acquire, on timeout and on any exit, and a waiter whose pid is gone
+is reaped by the next reader and recorded as ``reaped``.
+
+Every acquire, release, timeout and reaped waiter appends one row to
+``slots/events.jsonl``: epoch, kind, label, pid, wait and hold milliseconds, the
+outcome and the test file paths of the command (never an environment value).
+``history`` aggregates those rows per label and ``status_hint`` turns the last
+hour into one line for ``agentq status``. The file is jsonl rather than a table
+in ``agentq.db`` because this module is loaded by file path in arbitrary
+interpreters and must never fail a run: an append cannot block on the broker's
+write lock.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import random
+import shlex
 import sys
 import time
 from dataclasses import dataclass
@@ -33,6 +49,15 @@ from agentq import headroom as headroom_lib
 KINDS = ("ssh", "pytest")
 DEFAULT_GATED_HOSTS: tuple[str, ...] = ()
 SSH_HOSTS_FILE = "ssh_hosts"
+WAITERS_DIR = "waiters"
+EVENTS_FILE = "events.jsonl"
+EVENTS_MAX_BYTES = 8 * 1024 * 1024
+EVENT_ARGV_PATHS = 3
+EVENT_ARGV_CHARS = 120
+HISTORY_SINCE_S = 6 * 3600.0
+STATUS_WINDOW_S = 3600.0
+RECOMMEND_WAIT_MS = 60_000.0
+RECOMMEND_STEP = 4
 PYTEST_CEILING = 16
 MAX_WAIT_S = 1800.0
 BACKOFF_MIN_S = 0.5
@@ -61,13 +86,36 @@ class GaugeReader(Protocol):
         """Current headroom."""
 
 
+@dataclass(frozen=True)
+class SlotState:
+    """What one slot kind looks like right now: its cap, its holders and its waiters."""
+
+    kind: str
+    limit: int
+    held: int
+    waiting: int
+
+    @property
+    def busy(self) -> int:
+        """Holders plus waiters: the pressure a new run would add to."""
+        return self.held + self.waiting
+
+
 class Holder:
     """A held slot (``index`` set), or an unslotted run after the max wait (``index`` None)."""
 
-    def __init__(self, kind: str, index: Optional[int], fd: Optional[int]):
+    def __init__(self, kind: str, index: Optional[int], fd: Optional[int], *, home=None, label: str = "-",
+                 argv: str = "", started: Optional[float] = None, wait_ms: Optional[int] = None,
+                 clock=time.time):
         self.kind = kind
         self.index = index
         self.fd = fd
+        self.home = home
+        self.label = label
+        self.argv = argv
+        self.started = started
+        self.wait_ms = wait_ms
+        self.clock = clock
 
     @property
     def slotted(self) -> bool:
@@ -75,10 +123,18 @@ class Holder:
         return self.fd is not None
 
     def release(self) -> None:
-        """Drop the slot lock by closing its descriptor. Safe to call twice."""
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        """Drop the slot lock by closing its descriptor and record the hold. Safe to call twice."""
+        if self.fd is None:
+            return
+        os.close(self.fd)
+        self.fd = None
+        if self.home is None:
+            return
+        hold_ms = None
+        if self.started is not None:
+            hold_ms = int(max(0.0, self.clock() - self.started) * 1000)
+        record_event(self.home, kind=self.kind, label=self.label, pid=os.getpid(), wait_ms=self.wait_ms,
+                     hold_ms=hold_ms, outcome="released", argv=self.argv, clock=self.clock)
 
     def __enter__(self) -> "Holder":
         return self
@@ -207,25 +263,47 @@ def acquire(kind: str, *, limit: int, home, label: str = "-", command: str = "",
             warn: Optional[Callable[[str], None]] = None) -> Holder:
     """Take a ``kind`` slot, waiting with jittered backoff (0.5 s growing to 5 s).
 
-    After ``max_wait_s`` the run goes ahead unslotted and an overrun is logged.
+    A run that has to wait registers a waiter file, so ``live_state`` counts it. The file is
+    dropped on acquire, on timeout and on any exit. After ``max_wait_s`` the run goes ahead
+    unslotted and an overrun is logged. Each acquire, release and timeout writes one history row.
     """
     directory = slots_dir(home, kind)
     directory.mkdir(parents=True, exist_ok=True)
     count = max(1, int(limit))
     record = {"kind": kind, "pid": os.getpid(), "label": label, "command": command[:COMMAND_CHARS]}
-    deadline = clock() + max_wait_s
+    argv = test_paths(command)
+    started = clock()
+    deadline = started + max_wait_s
     delay = BACKOFF_MIN_S
-    while True:
-        holder = _take(kind, directory, count, admit, record, clock)
-        if holder is not None:
-            return holder
-        if clock() >= deadline:
-            message = f"agentq slots: {kind} wait exceeded {max_wait_s:g}s; running {label} unslotted"
-            (warn or _warn)(message)
-            _log(home, message)
-            return Holder(kind, None, None)
-        sleep(delay * (0.8 + 0.4 * jitter()))
-        delay = min(delay * 1.5, BACKOFF_MAX_S)
+    waiter: Optional[Path] = None
+    try:
+        while True:
+            holder = _take(kind, directory, count, admit, record, clock)
+            if holder is not None:
+                if waiter is not None:
+                    _drop_waiter(waiter)
+                    waiter = None
+                wait_ms = int(max(0.0, clock() - started) * 1000)
+                holder.home, holder.label, holder.argv = home, label, argv
+                holder.started, holder.wait_ms, holder.clock = clock(), wait_ms, clock
+                record_event(home, kind=kind, label=label, pid=os.getpid(), wait_ms=wait_ms,
+                             hold_ms=None, outcome="acquired", argv=argv, clock=clock)
+                return holder
+            if waiter is None:
+                waiter = _register_waiter(home, kind, record, started)
+            if clock() >= deadline:
+                message = f"agentq slots: {kind} wait exceeded {max_wait_s:g}s; running {label} unslotted"
+                (warn or _warn)(message)
+                _log(home, message)
+                record_event(home, kind=kind, label=label, pid=os.getpid(),
+                             wait_ms=int(max(0.0, clock() - started) * 1000), hold_ms=None,
+                             outcome="timeout", argv=argv, clock=clock)
+                return Holder(kind, None, None)
+            sleep(delay * (0.8 + 0.4 * jitter()))
+            delay = min(delay * 1.5, BACKOFF_MAX_S)
+    finally:
+        if waiter is not None:
+            _drop_waiter(waiter)
 
 
 def holders(home, kind: str, limit: int, *, clock=time.time) -> list[dict]:
@@ -250,6 +328,298 @@ def holders(home, kind: str, limit: int, *, clock=time.time) -> list[dict]:
     return found
 
 
+def waiters_dir(home, kind: str) -> Path:
+    """Folder holding one file per process waiting for a ``kind`` slot."""
+    return slots_dir(home, kind) / WAITERS_DIR
+
+
+def live_state(home, kind: str, limit: Optional[int] = None, *, clock=time.time) -> SlotState:
+    """Held and waiting counts for ``kind`` right now. Dead waiters are reaped first."""
+    if limit is None:
+        limit = kind_limit(load_limits(home), kind)
+    count = max(1, int(limit))
+    return SlotState(kind=kind, limit=count, held=_busy_count(slots_dir(home, kind), count),
+                     waiting=reap_waiters(home, kind, clock=clock))
+
+
+def reap_waiters(home, kind: str, *, clock=time.time) -> int:
+    """Live waiter files of ``kind``. A waiter whose pid is gone is removed and recorded as reaped."""
+    directory = waiters_dir(home, kind)
+    try:
+        paths = list(directory.iterdir())
+    except OSError:
+        return 0
+    alive = 0
+    for path in paths:
+        record = _read_json(path)
+        record = record if isinstance(record, dict) else {}
+        pid = record.get("pid")
+        if isinstance(pid, int) and _pid_alive(pid):
+            alive += 1
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        since = record.get("since")
+        wait_ms = int(max(0.0, clock() - since) * 1000) if isinstance(since, (int, float)) else 0
+        record_event(home, kind=kind, label=record.get("label") or "-", pid=pid, wait_ms=wait_ms,
+                     hold_ms=None, outcome="reaped", argv=record.get("argv") or "", clock=clock)
+    return alive
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when ``pid`` exists. A permission error means it exists and belongs to someone else."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _register_waiter(home, kind: str, record: dict, since: float) -> Optional[Path]:
+    """Write this process's waiter file. Best effort: a failure only hides the wait from the broker."""
+    path = waiters_dir(home, kind) / str(os.getpid())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(dict(record, since=since), sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return None
+    return path
+
+
+def _drop_waiter(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def events_path(home) -> Path:
+    """The slot history file: one JSON row per line, next to the slot folders."""
+    return Path(home) / "slots" / EVENTS_FILE
+
+
+def record_event(home, *, kind: str, label: str, pid, wait_ms, hold_ms, outcome: str, argv: str = "",
+                 clock=time.time) -> None:
+    """Append one slot event to ``slots/events.jsonl``. Best effort: a failure never fails a run."""
+    row = {"ts": round(clock(), 3), "kind": kind, "label": label or "-", "pid": pid,
+           "wait_ms": wait_ms, "hold_ms": hold_ms, "outcome": outcome, "argv": argv}
+    path = events_path(home)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_events(path)
+        line = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _rotate_events(path: Path) -> None:
+    """Move a full history file to ``events.jsonl.1``, replacing the previous one. Best effort."""
+    try:
+        if path.stat().st_size < EVENTS_MAX_BYTES:
+            return
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    except OSError:
+        pass
+
+
+def read_events(home, *, since: Optional[float] = None) -> list[dict]:
+    """History rows at or after ``since``, oldest first. A bad line is skipped, never raised."""
+    path = events_path(home)
+    rows = []
+    for candidate in (path.with_name(f"{path.name}.1"), path):
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or not isinstance(row.get("ts"), (int, float)):
+                continue
+            if since is not None and row["ts"] < since:
+                continue
+            rows.append(row)
+    rows.sort(key=lambda row: row["ts"])
+    return rows
+
+
+def percentile(values, pct: float) -> Optional[float]:
+    """The nearest-rank percentile of ``values``, or None when there are none."""
+    ordered = sorted(value for value in values if isinstance(value, (int, float)))
+    if not ordered:
+        return None
+    rank = max(1, min(len(ordered), math.ceil(pct / 100.0 * len(ordered))))
+    return float(ordered[rank - 1])
+
+
+def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
+    """Per-label slot totals over the last ``since_s`` seconds.
+
+    Each label gets ``runs`` (acquires), ``timeouts``, ``reaped``, total ``hold_ms`` and
+    ``wait_ms``, their p50 and p95, and ``reruns``: an acquire whose test paths are identical to
+    a run of the same label that is still holding, so the same command ran twice with no release
+    in between. ``totals`` sums the labels.
+    """
+    since = (time.time() if now is None else now) - max(0.0, float(since_s))
+    labels: dict[str, dict] = {}
+    holding: dict[str, list[str]] = {}
+    all_holds: list[float] = []
+    all_waits: list[float] = []
+    for row in read_events(home, since=since):
+        label = row.get("label") or "-"
+        entry = labels.setdefault(label, {"label": label, "runs": 0, "timeouts": 0, "reaped": 0,
+                                          "hold_ms": 0.0, "wait_ms": 0.0,
+                                          "holds": [], "waits": []})
+        outcome = row.get("outcome")
+        argv = row.get("argv") or ""
+        if outcome == "acquired":
+            entry["runs"] += 1
+            open_argvs = holding.setdefault(label, [])
+            if argv and argv in open_argvs:
+                entry["reruns"] = entry.get("reruns", 0) + 1
+            else:
+                open_argvs.append(argv)
+        elif outcome == "released":
+            open_argvs = holding.get(label) or []
+            if argv in open_argvs:
+                open_argvs.remove(argv)
+        elif outcome == "timeout":
+            entry["timeouts"] += 1
+        elif outcome == "reaped":
+            entry["reaped"] += 1
+        else:
+            continue
+        wait = row.get("wait_ms")
+        if isinstance(wait, (int, float)):
+            entry["wait_ms"] += wait
+            entry["waits"].append(wait)
+            all_waits.append(wait)
+        hold = row.get("hold_ms")
+        if isinstance(hold, (int, float)):
+            entry["hold_ms"] += hold
+            entry["holds"].append(hold)
+            all_holds.append(hold)
+    entries = []
+    for entry in labels.values():
+        entry["reruns"] = entry.get("reruns", 0)
+        entry["hold_p50_ms"] = percentile(entry["holds"], 50)
+        entry["hold_p95_ms"] = percentile(entry["holds"], 95)
+        entry["wait_p50_ms"] = percentile(entry["waits"], 50)
+        entry["wait_p95_ms"] = percentile(entry["waits"], 95)
+        del entry["holds"], entry["waits"]
+        entries.append(entry)
+    entries.sort(key=lambda entry: (-entry["hold_ms"], entry["label"]))
+    totals = {"runs": sum(entry["runs"] for entry in entries),
+              "timeouts": sum(entry["timeouts"] for entry in entries),
+              "reaped": sum(entry["reaped"] for entry in entries),
+              "reruns": sum(entry["reruns"] for entry in entries),
+              "hold_ms": sum(entry["hold_ms"] for entry in entries),
+              "wait_ms": sum(entry["wait_ms"] for entry in entries),
+              "hold_p50_ms": percentile(all_holds, 50),
+              "hold_p95_ms": percentile(all_holds, 95),
+              "wait_p50_ms": percentile(all_waits, 50),
+              "wait_p95_ms": percentile(all_waits, 95)}
+    return {"since": since, "now": time.time() if now is None else now, "labels": entries, "totals": totals}
+
+
+def format_history(report: dict) -> str:
+    """The ``agentq slots --history`` table: one row per label, then the totals."""
+    lines = [f"slot history {_stamp(report['since'])} to {_stamp(report['now'])}"]
+    if not report["labels"]:
+        lines.append("no slot events in the window")
+        return "\n".join(lines)
+    lines.append(f"{'label':<28} {'runs':>4} {'hold':>8} {'wait':>8} {'p50':>7} {'p95':>7} {'reruns':>6}")
+    for entry in [*report["labels"], dict(report["totals"], label="total")]:
+        lines.append(f"{entry['label'][:28]:<28} {entry['runs']:>4} {format_ms(entry['hold_ms']):>8} "
+                     f"{format_ms(entry['wait_ms']):>8} {format_ms(entry['wait_p50_ms']):>7} "
+                     f"{format_ms(entry['wait_p95_ms']):>7} {entry['reruns']:>6}")
+    return "\n".join(lines)
+
+
+def status_hint(home, *, now=None, gauges: Optional[GaugeReader] = None,
+                since_s: float = STATUS_WINDOW_S) -> str:
+    """One line for ``agentq status``: pytest slot utilization, median wait and a cap hint.
+
+    Utilization is held time over capacity (``slots.tests`` slots times the window). The cap is
+    only recommended up when the median wait is at or above ``RECOMMEND_WAIT_MS`` and the laptop
+    has headroom at the tests bars. Nothing is changed here: the line is a hint for the owner.
+    """
+    limits = load_limits(home)
+    cap = max(1, limits.pytest)
+    now = time.time() if now is None else now
+    rows = read_events(home, since=now - since_s)
+    held_ms = sum(row["hold_ms"] for row in rows
+                  if row.get("outcome") == "released" and isinstance(row.get("hold_ms"), (int, float)))
+    waits = [row["wait_ms"] for row in rows
+             if row.get("outcome") in ("acquired", "timeout") and isinstance(row.get("wait_ms"), (int, float))]
+    utilization = held_ms / (since_s * 1000.0 * cap)
+    median = percentile(waits, 50)
+    text = (f"slots: pytest {utilization:.0%} utilized over {_window(since_s)} (cap {cap}), "
+            f"median wait {format_ms(median)}")
+    if not waits:
+        return text + "; no waits recorded"
+    if median < RECOMMEND_WAIT_MS:
+        return text + f"; keep slots.tests at {cap}"
+    reader = gauges or Gauges(home, settings=limits.gauge_settings)
+    breach = headroom_lib.pressure(reader.read(), max_cpu_busy=limits.max_cpu_busy,
+                                   min_free_pct=limits.min_free_pct, max_swap_frac=limits.max_swap_frac)
+    if breach is not None:
+        return text + f"; keep slots.tests at {cap} ({breach[1]})"
+    ceiling = broker.load_config(home)["tests_ceiling"]
+    target = min(ceiling, cap + RECOMMEND_STEP)
+    if target <= cap:
+        return text + f"; keep slots.tests at {cap} (ceiling {ceiling})"
+    return text + f"; waits high with headroom: raise slots.tests to {target} (ceiling {ceiling})"
+
+
+def test_paths(command: str, *, limit: int = EVENT_ARGV_PATHS, chars: int = EVENT_ARGV_CHARS) -> str:
+    """The test file paths in a pytest command line, for the history row.
+
+    Only arguments that name a test file (``.py``, or a ``file.py::test`` node id) are kept, at
+    most ``limit`` of them, joined and cut to ``chars``. Options, their values and every
+    environment value stay out of the record.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    paths = [word for word in words[1:] if not word.startswith("-") and ".py" in word]
+    return " ".join(paths[:limit])[:chars]
+
+
+def format_ms(ms) -> str:
+    """A millisecond count as a short duration, or ``-`` when there is none."""
+    if not isinstance(ms, (int, float)):
+        return "-"
+    seconds = ms / 1000.0
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _window(seconds: float) -> str:
+    return format_ms(seconds * 1000.0)
+
+
+def _stamp(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
 def _take(kind, directory: Path, count: int, admit, record: dict, clock) -> Optional[Holder]:
     """One pass: admission first, then the first free slot. None when none is free."""
     if admit is not None and not admit(_busy_count(directory, count)):
@@ -263,6 +633,8 @@ def _take(kind, directory: Path, count: int, admit, record: dict, clock) -> Opti
 
 
 def _busy_count(directory: Path, count: int) -> int:
+    if not directory.is_dir():
+        return 0
     return sum(1 for index in range(count) if _is_busy(directory / f"slot-{index}"))
 
 

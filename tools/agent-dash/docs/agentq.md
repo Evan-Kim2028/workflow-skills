@@ -315,7 +315,14 @@ high, xhigh or max). Unset means pi's own default, which real work keeps unless 
     `hold tests: cpu 84% busy >= 80%`. The dashboard's Laptop verdict appears only when the broker
     holds a ready DeepSeek job on one of these bars; raw pressure without a hold is shown in the
     secondary line.
-  - The `tests` ceiling is `slots.tests`. Recommended: 16 (the owner's setting is 10).
+  - The `tests` ceiling is `slots.tests` for a harness without the shims. A pi job runs its
+    pytest under the shims, so its `tests` jobs are admitted on live pytest slot pressure
+    instead: `slots.tests` is the floor (always admit below it), `slots.tests_ceiling`
+    (default `slots.light`) is the hard stop, and between them a job launches while the
+    pytest slots have room, that is while held plus waiting stays below the pytest cap.
+    A hold reads `hold tests: pytest slots busy (16 held, 3 waiting)` or
+    `hold tests: tests ceiling full (20 of 20)`. An unreadable slot state falls back to the
+    fixed cap. Recommended: `slots.tests` 16, `slots.tests_ceiling` 20.
   - `"adaptive": {"enabled": false}` restores the fixed caps exactly, including the
     old rule that a `saturated` proxy holds backlog jobs.
 - A held job records why it waits in `jobs.detail` (for example
@@ -429,8 +436,9 @@ Without that file, ssh is not gated, so the launch step matters.
 - **pytest**: `pytest`, `python[3] -m pytest`, `uv run pytest` and `uv run python -m pytest`
   hold one of the pytest slots, then run the real command under `memcap.sh 8192`.
   The ceiling is `slots.tests` when `broker.json` sets it, else 16. The broker's own
-  `tests` cap of 6 governs broker jobs and is not reused. A new run starts at once
-  while fewer than `adaptive.tests_floor` (4) are busy. Above that it also needs memory
+  `tests` cap is the floor for a pi job, not its ceiling: above the floor the broker admits a
+  `tests` job while these slots have room (see Adaptive admission above). A new run starts at
+  once while fewer than `adaptive.tests_floor` (4) are busy. Above that it also needs memory
   free of at least `laptop.tests_min_free_pct` (35), CPU busy under `laptop.tests_max_cpu_busy`
   (0.80) and swap used under `laptop.max_swap_frac` (0.90). The readings are the same ones the
   broker uses (see Laptop above). An unreadable measure adds no gate, as in the broker.
@@ -442,7 +450,22 @@ Without that file, ssh is not gated, so the launch step matters.
   deadlocks it.
 - A pytest started inside a held slot (a test that runs pytest) skips the gate, through
   `AGENTQ_SLOT_HELD`, so it cannot wait on its parent's slot.
-- `agentq slots` lists the holders per kind and ends with an `ANSWER:` line.
+- A run that has to wait writes `slots/<kind>/waiters/<pid>` and drops it on acquire, on
+  timeout and on any exit, so the broker sees the queue as well as the holders. A waiter
+  whose pid is gone is reaped by the next reader and recorded as `reaped`.
+- Every acquire, release, timeout and reaped waiter appends one row to
+  `slots/events.jsonl` (rotated to `events.jsonl.1` at 8 MB): epoch, kind, label, pid, wait
+  and hold milliseconds, outcome, and the test file paths of the command (at most three,
+  cut to 120 characters; never an environment value). It is jsonl rather than a table in
+  `agentq.db` because `slots.py` is loaded by file path in arbitrary interpreters and must
+  never fail a run.
+- `agentq slots` lists the holders and waiters per kind and ends with an `ANSWER:` line.
+  `agentq slots --history [--since 6h] [--json]` prints per-label totals (runs, hold and
+  wait time, p50/p95) and the count of identical re-runs with no release in between.
+- `agentq status` prints one slot line from the last hour: pytest utilization (held time
+  over capacity), median wait, and a cap hint. It recommends raising `slots.tests` only when
+  the median wait is at or above 60 s and the laptop has headroom at the tests bars, and it
+  never changes the config.
 
 Not enforced:
 

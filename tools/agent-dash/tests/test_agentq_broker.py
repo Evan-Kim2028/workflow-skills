@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 from agentq import broker as B  # noqa: E402
 from agentq import cli, db  # noqa: E402
 from agentq import headroom as H  # noqa: E402
+from agentq import slots as S  # noqa: E402
 
 
 class Clock:
@@ -81,6 +82,11 @@ def dead_pid():
 
 def env_for(home, session="sess-a"):
     return {"AGENTQ_HOME": str(home), "AGENTQ_SESSION": session, "PATH": os.environ["PATH"]}
+
+
+def pi_env(home, session="sess-pi"):
+    """A pi worker's environment: the harness whose workers run under the agentq PATH shims."""
+    return dict(env_for(home, session), AGENTQ_HARNESS="pi")
 
 
 def write_prompt(tmp, name="prompt.md"):
@@ -165,10 +171,10 @@ class InlinePool:
         return future
 
 
-def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None):
+def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None, slot_state=None):
     return B.Broker(home, launcher=launcher or FakeLauncher(), now=clock or time.time,
                     proxy=proxy or (lambda: None), gauges=gauges or FakeGauges(),
-                    launch_pool=launch_pool or InlinePool())
+                    launch_pool=launch_pool or InlinePool(), slot_state=slot_state)
 
 
 def write_config(home, slots=None, tiers=None):
@@ -1097,6 +1103,101 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         log_path = self.home / "logs" / "broker.log"
         self.assertEqual(log_path.read_text().count("hold pi-deepseek-flash"), 2)
 
+
+class AdaptiveTestsAdmissionTests(ProcessCleanup):
+    """A pi ``tests`` job is admitted on live pytest slot pressure, not on the fixed job cap.
+
+    ``slots.tests`` is the floor, ``slots.tests_ceiling`` (default ``slots.light``) the hard stop,
+    and between them the job launches while the pytest slots have room for it. A harness without
+    the shims keeps the fixed cap.
+    """
+
+    def broker(self, slot_state, gauges=None):
+        return make_broker(self.home, self.fake(live_s=30), gauges=gauges, slot_state=lambda home: slot_state)
+
+    def write_broker_json(self, data):
+        import json
+
+        self.home.mkdir(parents=True, exist_ok=True)
+        data.setdefault("pacing", {"enabled": False})
+        (self.home / "broker.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def pi_tests_jobs(self, count):
+        env = pi_env(self.home)
+        return [submit(env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(count)]
+
+    def test_a_pi_tests_job_launches_past_the_fixed_cap_while_pytest_slots_are_free(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = self.pi_tests_jobs(3)
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 2, 0)).tick(), jobs)
+
+    def test_a_pi_tests_job_holds_when_pytest_slots_are_busy_with_waiters(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = self.pi_tests_jobs(3)
+        launched = self.broker(S.SlotState("pytest", 16, 16, 3)).tick()
+        self.assertEqual(launched, jobs[:2])
+        self.assertEqual(row(self.home, jobs[2])["detail"],
+                         "hold tests: pytest slots busy (16 held, 3 waiting)")
+
+    def test_a_waiter_alone_holds_the_next_pi_tests_job(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 1, "ssh": 8}})
+        jobs = self.pi_tests_jobs(2)
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 15, 1)).tick(), jobs[:1])
+        self.assertEqual(row(self.home, jobs[1])["detail"],
+                         "hold tests: pytest slots busy (15 held, 1 waiting)")
+
+    def test_the_tests_ceiling_holds_even_with_free_pytest_slots(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8, "tests_ceiling": 3}})
+        jobs = self.pi_tests_jobs(4)
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 0, 0)).tick(), jobs[:3])
+        self.assertEqual(row(self.home, jobs[3])["detail"], "hold tests: tests ceiling full (3 of 3)")
+
+    def test_the_ceiling_defaults_to_the_light_cap(self):
+        self.write_broker_json({"slots": {"light": 12, "tests": 2, "ssh": 8}})
+        self.assertEqual(B.load_config(self.home)["tests_ceiling"], 12)
+        self.assertNotIn("tests_ceiling", B.load_config(self.home)["slots"])
+
+    def test_an_explicit_ceiling_overrides_the_light_cap(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8, "tests_ceiling": 20}})
+        self.assertEqual(B.load_config(self.home)["tests_ceiling"], 20)
+
+    def test_laptop_bars_still_hold_a_pi_tests_job_above_the_floor(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = self.pi_tests_jobs(5)
+        launched = self.broker(S.SlotState("pytest", 16, 0, 0), gauges=FakeGauges(free=31.0, cpu=0.2)).tick()
+        self.assertEqual(launched, jobs[:4])
+        self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: memory free 31% < 35%")
+
+    def test_a_harness_without_shims_keeps_the_fixed_cap(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(3)]
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 0, 0)).tick(), jobs[:2])
+        self.assertEqual(row(self.home, jobs[2])["detail"], "hold tests: slots full")
+
+    def test_adaptive_off_keeps_the_fixed_cap_for_pi(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8},
+                                "adaptive": {"enabled": False}})
+        jobs = self.pi_tests_jobs(3)
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 0, 0)).tick(), jobs[:2])
+        self.assertEqual(row(self.home, jobs[2])["detail"], "hold tests: slots full")
+
+    def test_an_unreadable_slot_state_falls_back_to_the_fixed_cap(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = self.pi_tests_jobs(3)
+        self.assertEqual(self.broker(None).tick(), jobs[:2])
+        self.assertEqual(row(self.home, jobs[2])["detail"], "hold tests: slots full")
+
+    def test_the_slot_state_is_read_once_per_tick(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        self.pi_tests_jobs(3)
+        reads = []
+
+        def state(home):
+            reads.append(home)
+            return S.SlotState("pytest", 16, 0, 0)
+
+        make_broker(self.home, self.fake(live_s=30), slot_state=state).tick()
+        self.assertEqual(len(reads), 1)
 
 
 class RelaunchPacingTests(ProcessCleanup):

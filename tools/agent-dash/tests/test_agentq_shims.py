@@ -62,6 +62,13 @@ class FakeGauges:
         return H.Headroom(self.free, self.cpu, self.swap, None)
 
 
+def dead_pid():
+    """A pid that is certainly not running: a reaped child's."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -86,7 +93,10 @@ class Base(unittest.TestCase):
         env["AGENTQ_REFUSED_SLEEP_PAUSE_S"] = "0"
         env["AGENTQ_SHIM_PYTHON"] = sys.executable
         env["AGENTQ_MEMCAP"] = str(self.memcap_script())
-        for key in ("AGENTQ_SLOT_HELD", "AGENTQ_MEMCAPPED", "AGENTQ_RUN", "AGENTQ_JOB"):
+        # A pytest run that is itself under the shims (or the plugin) exports these; the child must
+        # start clean, or the shim skips the gate and the end-to-end tests see no slot.
+        for key in ("AGENTQ_SLOT_HELD", "AGENTQ_PYTEST_SLOT_HELD", "AGENTQ_MEMCAPPED", "AGENTQ_RUN",
+                    "AGENTQ_JOB"):
             env.pop(key, None)
         (self.home / "broker.json").write_text(json.dumps({"shims": {"ssh_gated_hosts": ["prod-box"]}}),
                                                encoding="utf-8")
@@ -423,11 +433,247 @@ class SlotsCommandTests(Base):
         holder.release()
         text = out.getvalue().splitlines()
         self.assertEqual(code, 0)
-        self.assertIn("pytest: 1 of 16 held", text)
-        self.assertIn("ssh: 0 of 8 held", text)
+        self.assertIn("pytest: 1 of 16 held, 0 waiting", text)
+        self.assertIn("ssh: 0 of 8 held, 0 waiting", text)
         self.assertIn("ws2-exec-z", "\n".join(text))
         self.assertTrue(text[-1].startswith("ANSWER: "))
         self.assertIn("pytest 1/16", text[-1])
+
+
+class WaiterTests(Base):
+    """A run waiting for a slot registers a waiter file, and every exit path removes it."""
+
+    def hold(self, limit=1):
+        return slots.acquire("pytest", limit=limit, home=self.home, max_wait_s=0)
+
+    def waiter_file(self):
+        return slots.waiters_dir(self.home, "pytest") / str(os.getpid())
+
+    def wait_for(self, predicate, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return predicate()
+
+    def test_a_waiting_run_registers_a_waiter_file_and_drops_it_on_acquire(self):
+        holder = self.hold()
+        got = []
+        thread = threading.Thread(target=lambda: got.append(
+            slots.acquire("pytest", limit=1, home=self.home, label="waiter", max_wait_s=10)))
+        thread.start()
+        try:
+            self.assertTrue(self.wait_for(self.waiter_file().exists), "no waiter file while waiting")
+            self.assertEqual(slots.live_state(self.home, "pytest", 1).waiting, 1)
+            holder.release()
+            thread.join(10)
+        finally:
+            holder.release()
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(got and got[0].slotted)
+        self.assertFalse(self.waiter_file().exists())
+        got[0].release()
+
+    def test_a_waiter_file_is_dropped_on_timeout(self):
+        holder = self.hold()
+        clock = FakeClock()
+        result = slots.acquire("pytest", limit=1, home=self.home, label="slow", max_wait_s=1.0,
+                               clock=clock, sleep=clock.sleep, jitter=lambda: 0.5,
+                               warn=lambda message: None)
+        holder.release()
+        self.assertFalse(result.slotted)
+        self.assertFalse(self.waiter_file().exists())
+        self.assertEqual([row["outcome"] for row in slots.read_events(self.home) if row["label"] == "slow"],
+                         ["timeout"])
+
+    def test_a_dead_waiters_file_is_reaped_and_recorded(self):
+        directory = slots.waiters_dir(self.home, "pytest")
+        directory.mkdir(parents=True)
+        dead = dead_pid()
+        (directory / str(dead)).write_text(json.dumps({"pid": dead, "label": "gone", "since": 1000.0}),
+                                           encoding="utf-8")
+        self.assertEqual(slots.reap_waiters(self.home, "pytest", clock=lambda: 1010.0), 0)
+        self.assertFalse((directory / str(dead)).exists())
+        rows = slots.read_events(self.home)
+        self.assertEqual([(row["outcome"], row["label"], row["wait_ms"]) for row in rows],
+                         [("reaped", "gone", 10000)])
+
+    def test_a_live_waiters_file_is_left_alone(self):
+        directory = slots.waiters_dir(self.home, "pytest")
+        directory.mkdir(parents=True)
+        (directory / str(os.getpid())).write_text(json.dumps({"pid": os.getpid(), "label": "me", "since": 1.0}),
+                                                  encoding="utf-8")
+        self.assertEqual(slots.reap_waiters(self.home, "pytest"), 1)
+        self.assertTrue((directory / str(os.getpid())).exists())
+        self.assertEqual(slots.read_events(self.home), [])
+
+    def test_live_state_counts_holders_and_waiters(self):
+        holder = self.hold(limit=2)
+        directory = slots.waiters_dir(self.home, "pytest")
+        directory.mkdir(parents=True)
+        (directory / str(os.getpid())).write_text(json.dumps({"pid": os.getpid(), "label": "w", "since": 1.0}),
+                                                  encoding="utf-8")
+        state = slots.live_state(self.home, "pytest", 2)
+        holder.release()
+        self.assertEqual((state.kind, state.limit, state.held, state.waiting, state.busy),
+                         ("pytest", 2, 1, 1, 2))
+
+    def test_live_state_of_an_unused_home_is_empty(self):
+        state = slots.live_state(self.home, "pytest", 16)
+        self.assertEqual((state.held, state.waiting, state.busy), (0, 0, 0))
+
+
+class SlotHistoryTests(Base):
+    """Every acquire, release, timeout and reap appends one row; ``slots --history`` aggregates them."""
+
+    def event(self, ts, **kw):
+        row = {"kind": "pytest", "label": "ws1", "pid": 1, "wait_ms": 0, "hold_ms": None,
+               "outcome": "acquired", "argv": "tests/test_a.py"}
+        row.update(kw)
+        slots.record_event(self.home, clock=lambda: ts, **row)
+
+    def test_acquire_and_release_write_one_row_each(self):
+        holder = slots.acquire("pytest", limit=2, home=self.home, label="ws1", max_wait_s=0,
+                               command="pytest -q -k slow tests/test_a.py tests/test_b.py --maxfail=1")
+        holder.release()
+        rows = slots.read_events(self.home)
+        self.assertEqual([row["outcome"] for row in rows], ["acquired", "released"])
+        self.assertEqual(rows[0]["label"], "ws1")
+        self.assertEqual(rows[0]["argv"], "tests/test_a.py tests/test_b.py")
+        self.assertIsNone(rows[0]["hold_ms"])
+        self.assertIsInstance(rows[1]["hold_ms"], int)
+        self.assertEqual(rows[1]["argv"], rows[0]["argv"])
+        self.assertEqual(rows[1]["pid"], os.getpid())
+
+    def test_an_ssh_slot_records_its_kind(self):
+        holder = slots.acquire("ssh", limit=2, home=self.home, label="ws1", max_wait_s=0,
+                               command="ssh prod-box uptime")
+        holder.release()
+        self.assertEqual([row["kind"] for row in slots.read_events(self.home)], ["ssh", "ssh"])
+
+    def test_test_paths_keeps_only_test_files(self):
+        self.assertEqual(slots.test_paths("pytest -q -k slow tests/test_a.py tests/test_b.py::test_x --maxfail=1"),
+                         "tests/test_a.py tests/test_b.py::test_x")
+        self.assertEqual(slots.test_paths("pytest -q"), "")
+        self.assertEqual(slots.test_paths("pytest " + " ".join(f"tests/test_{i}.py" for i in range(6))),
+                         "tests/test_0.py tests/test_1.py tests/test_2.py")
+
+    def test_history_aggregates_per_label(self):
+        self.event(1000.0, label="a", wait_ms=0)
+        self.event(1001.0, label="a", outcome="released", hold_ms=60000)
+        self.event(1002.0, label="a", wait_ms=2000)
+        self.event(1003.0, label="a", outcome="released", hold_ms=120000)
+        self.event(1004.0, label="b", wait_ms=500)
+        self.event(1005.0, label="b", outcome="released", hold_ms=30000)
+        report = slots.history(self.home, since_s=100.0, now=1100.0)
+        by_label = {entry["label"]: entry for entry in report["labels"]}
+        self.assertEqual(by_label["a"]["runs"], 2)
+        self.assertEqual(by_label["a"]["hold_ms"], 180000)
+        self.assertEqual(by_label["a"]["wait_ms"], 2000)
+        self.assertEqual(by_label["a"]["wait_p50_ms"], 0)
+        self.assertEqual(by_label["a"]["wait_p95_ms"], 2000)
+        self.assertEqual(by_label["b"]["runs"], 1)
+        self.assertEqual(report["totals"]["runs"], 3)
+        self.assertEqual(report["totals"]["hold_ms"], 210000)
+        self.assertEqual(report["since"], 1000.0)
+
+    def test_history_counts_an_identical_rerun_with_no_release_in_between(self):
+        self.event(1000.0, argv="tests/test_a.py")
+        self.event(1001.0, argv="tests/test_a.py")
+        self.event(1002.0, outcome="released", hold_ms=1000, argv="tests/test_a.py")
+        self.event(1003.0, argv="tests/test_a.py")
+        self.event(1004.0, argv="tests/test_b.py")
+        report = slots.history(self.home, since_s=100.0, now=1100.0)
+        self.assertEqual(report["labels"][0]["reruns"], 1)
+
+    def test_history_skips_rows_outside_the_window(self):
+        self.event(100.0, label="old")
+        self.event(1000.0, label="new")
+        report = slots.history(self.home, since_s=100.0, now=1100.0)
+        self.assertEqual([entry["label"] for entry in report["labels"]], ["new"])
+
+    def test_history_of_an_empty_home_is_empty(self):
+        report = slots.history(self.home, since_s=100.0, now=1100.0)
+        self.assertEqual((report["labels"], report["totals"]["runs"]), ([], 0))
+
+    def test_the_events_file_is_rotated_when_it_grows_past_the_cap(self):
+        path = slots.events_path(self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x" * (slots.EVENTS_MAX_BYTES + 1), encoding="utf-8")
+        self.event(1000.0)
+        self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_slots_history_command_prints_totals_and_json(self):
+        now = time.time()
+        self.event(now - 60, label="ws1", wait_ms=4000)
+        self.event(now - 30, label="ws1", outcome="released", hold_ms=60000)
+        out = io.StringIO()
+        code = cli.main(["slots", "--history", "--since", "6h"],
+                        env={"AGENTQ_HOME": str(self.home)}, out=out)
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("ws1", text)
+        self.assertIn("1 slot run(s) over 6h", text)
+        self.assertTrue(text.splitlines()[-1].startswith("ANSWER: "))
+        out = io.StringIO()
+        code = cli.main(["slots", "--history", "--json"], env={"AGENTQ_HOME": str(self.home)}, out=out)
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue().rsplit("ANSWER:", 1)[0])
+        self.assertEqual(payload["totals"]["runs"], 1)
+        self.assertEqual(payload["labels"][0]["label"], "ws1")
+
+    def test_slots_history_rejects_a_bad_since(self):
+        out = io.StringIO()
+        code = cli.main(["slots", "--history", "--since", "soon"],
+                        env={"AGENTQ_HOME": str(self.home)}, out=out)
+        self.assertEqual(code, 1)
+        self.assertIn("not a duration", out.getvalue())
+
+
+class StatusHintTests(Base):
+    """``agentq status`` prints one slot line: utilization, median wait, and a cap hint."""
+
+    def event(self, ts, **kw):
+        row = {"kind": "pytest", "label": "a", "pid": 1, "wait_ms": 0, "hold_ms": None,
+               "outcome": "acquired", "argv": "tests/test_a.py"}
+        row.update(kw)
+        slots.record_event(self.home, clock=lambda: ts, **row)
+
+    def test_no_events_says_no_waits(self):
+        self.assertIn("no waits recorded", slots.status_hint(self.home, now=1000.0))
+
+    def test_low_waits_keep_the_cap(self):
+        self.event(900.0, wait_ms=1000)
+        text = slots.status_hint(self.home, now=1000.0, gauges=FakeGauges(free=90.0, cpu=0.2))
+        self.assertIn("keep slots.tests at 16", text)
+
+    def test_high_waits_with_headroom_recommend_a_higher_cap(self):
+        self.event(900.0, wait_ms=120000)
+        text = slots.status_hint(self.home, now=1000.0, gauges=FakeGauges(free=90.0, cpu=0.2))
+        self.assertIn("raise slots.tests to 20", text)
+
+    def test_high_waits_without_headroom_keep_the_cap(self):
+        self.event(900.0, wait_ms=120000)
+        text = slots.status_hint(self.home, now=1000.0, gauges=FakeGauges(free=10.0, cpu=0.2))
+        self.assertIn("keep slots.tests at 16 (memory free 10% < 35%)", text)
+
+    def test_the_recommendation_never_passes_the_tests_ceiling(self):
+        (self.home / "broker.json").write_text(json.dumps({"slots": {"light": 17}}), encoding="utf-8")
+        self.event(900.0, wait_ms=120000)
+        text = slots.status_hint(self.home, now=1000.0, gauges=FakeGauges(free=90.0, cpu=0.2))
+        self.assertIn("raise slots.tests to 17", text)
+
+    def test_utilization_is_held_time_over_capacity(self):
+        self.event(900.0, outcome="released", hold_ms=28800000)
+        text = slots.status_hint(self.home, now=1000.0)
+        self.assertIn("pytest 50% utilized over 1.0h (cap 16)", text)
+
+    def test_status_prints_the_slot_line(self):
+        self.event(time.time() - 60, wait_ms=1000)
+        out = io.StringIO()
+        cli.main(["status"], env={"AGENTQ_HOME": str(self.home)}, out=out)
+        self.assertIn("slots: pytest", out.getvalue())
 
 
 class ShellFastPathTests(Base):

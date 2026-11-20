@@ -80,6 +80,8 @@ PROBE_RETRIES = 3
 PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
 RUN_WORKER = Path(__file__).resolve().parents[1] / "scripts" / "run_worker.py"
 DEFAULT_SLOTS = {"light": 40, "tests": 6, "ssh": 8}
+#: Harnesses whose workers run under the agentq PATH shims, so their pytest runs take a pytest slot.
+SHIMMED_HARNESSES = ("pi",)
 DEFAULT_TIERS = {"pi-kimi": 2, "pi-deepseek-flash": 48}
 DEFAULT_ADAPTIVE = {
     "enabled": True,
@@ -164,8 +166,12 @@ def load_config(home) -> dict:
         data = {}
     if not isinstance(data, dict):
         data = {}
+    slots = _caps(DEFAULT_SLOTS, data.get("slots"))
+    ceiling = _tests_ceiling(data.get("slots"), slots)
+    slots.pop("tests_ceiling", None)
     return {
-        "slots": _caps(DEFAULT_SLOTS, data.get("slots")),
+        "slots": slots,
+        "tests_ceiling": ceiling,
         "tiers": _caps(DEFAULT_TIERS, data.get("tiers")),
         "adaptive": _adaptive(data.get("adaptive")),
         "laptop": _laptop(data.get("laptop")),
@@ -186,6 +192,19 @@ def _caps(defaults: dict, override) -> dict:
             except (TypeError, ValueError):
                 continue
     return caps
+
+
+def _tests_ceiling(raw_slots, caps: dict) -> int:
+    """``slots.tests_ceiling``: the hard cap on ``tests`` jobs under adaptive admission.
+
+    Defaults to ``slots.light``, so the ceiling follows the light cap unless the file sets it.
+    """
+    value = raw_slots.get("tests_ceiling") if isinstance(raw_slots, dict) else None
+    try:
+        ceiling = int(value)
+    except (TypeError, ValueError):
+        ceiling = int(caps.get("light", DEFAULT_SLOTS["light"]))
+    return max(0, ceiling)
 
 
 def _adaptive(override) -> dict:
@@ -317,6 +336,48 @@ def laptop_hold(res: str, reading: headroom_lib.Headroom, running_tests: int, la
     else:
         return None
     return headroom_lib.pressure(reading, **bars)
+
+
+def shimmed(job: dict) -> bool:
+    """True when the job's harness runs its workers under the agentq PATH shims (pi)."""
+    return (job.get("harness") or "").strip() in SHIMMED_HARNESSES
+
+
+def pytest_slot_state(home):
+    """Live pytest slot state for ``home``, or None when it cannot be read.
+
+    ``slots`` imports this module, so the import is local. A failure is None, which falls back
+    to the fixed cap.
+    """
+    try:
+        from agentq import slots as slots_lib
+
+        return slots_lib.live_state(home, "pytest")
+    except Exception:
+        return None
+
+
+def tests_hold(running_tests: int, cfg: dict, state) -> tuple[str, str] | None:
+    """Why a ``tests`` job of a shimmed harness must wait, or None when it may launch.
+
+    Below ``slots.tests`` the job always launches: the fixed cap is the floor. From there up it
+    launches while the pytest slots have room for it, that is while held plus waiting stays
+    below the pytest cap, because the shims take a slot per pytest run inside the job. The hard
+    stop is ``slots.tests_ceiling`` (default ``slots.light``). An unreadable slot state falls
+    back to the fixed cap. The hold key carries no live number, so a job keeps one hold identity
+    while the counts move.
+    """
+    floor = int(cfg["slots"].get("tests", 0))
+    ceiling = int(cfg["tests_ceiling"])
+    if running_tests >= ceiling:
+        return "tests ceiling full", f"tests ceiling full ({running_tests} of {ceiling})"
+    if running_tests < floor:
+        return None
+    if state is None:
+        return plain_hold("slots full")
+    if state.busy < state.limit:
+        return None
+    return "pytest slots busy", f"pytest slots busy ({state.held} held, {state.waiting} waiting)"
 
 
 def queue_rank(job: dict, now: float) -> int:
@@ -1061,13 +1122,14 @@ class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
     def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
-                 labeler=None, work_synchronous=False, healer: ProxyHealer | None = None):
+                 labeler=None, work_synchronous=False, healer: ProxyHealer | None = None, slot_state=None):
         self.home = Path(home)
         self.healer = healer
         self.launcher = launcher or run_worker_launcher
         self.labeler = labeler or label_for
         self.now = now
         self.proxy = proxy or proxy_status
+        self.slot_state = slot_state or pytest_slot_state
         self.gauges = gauges or headroom_lib.Gauges(home, settings=headroom_lib.settings(load_config(home)),
                                                     clock=now)
         self.launch_pool = launch_pool or concurrent.futures.ThreadPoolExecutor(
@@ -1174,6 +1236,13 @@ class Broker:
                 gauge_reading.append(self.gauges.read())
             return gauge_reading[0]
 
+        slot_reading: list = []
+
+        def pytest_state():
+            if not slot_reading:
+                slot_reading.append(self.slot_state(self.home))
+            return slot_reading[0]
+
         worktree_settings = cfg["auto_worktree"]
         ready_ids = {job["id"] for job in ready}
         self._plans = {job_id: plan for job_id, plan in self._plans.items() if job_id in ready_ids}
@@ -1214,7 +1283,10 @@ class Broker:
                     continue
             if reason is None and plan is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
                 reason, local_gate = plain_hold("workspace busy"), True
-            if reason is None and slots_free.get(job["res"], 0) <= 0:
+            if reason is None and job["res"] == "tests" and on and shimmed(job):
+                reason = tests_hold(res_used.get("tests", 0), cfg, pytest_state())
+                local_gate = reason is not None
+            elif reason is None and slots_free.get(job["res"], 0) <= 0:
                 reason, local_gate = plain_hold("slots full"), True
             tier_cap = cfg["tiers"].get(job["tier"])
             if reason is None and tier_cap is not None and tier_used.get(job["tier"], 0) >= tier_cap:
