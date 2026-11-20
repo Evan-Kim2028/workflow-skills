@@ -548,7 +548,12 @@ one line and exit 0.
   reads the whole tree (`SCAN_ROOTS`, `git ls-files`, `rglob`, `os.walk`, `.glob(`) the whole
   tree sha. A miss is cheap; a false hit is a lie, so anything that cannot be keyed (no
   target, a missing target, an unresolved repo import, a tree test with no git tree sha) runs
-  normally and is not cached.
+  normally and is not cached. A closure over `MAX_CLOSURE_FILES` (300) is not walked to the
+  end: the key falls back to the whole tree sha, which is the same answer for a test that
+  reaches everything and costs one `git ls-files` instead of a parse of the repo. The verdict
+  is cached per target blob, so a repeat does not walk to the cap again. In a monorepo where
+  one test's closure is a few thousand files (measured: 2359 for one orchestration test) that
+  is the normal path, and the key is then the tree sha plus argv, env and interpreter.
 - **Recorded only on exit 0** with at least one passed test, in the main process only. A
   failure, an error, a skip-only run and a `-x` early exit write nothing.
 - **The guard, folded in.** The shim's `pytest_reason` refusals (a bare pytest, a directory
@@ -568,7 +573,8 @@ one line and exit 0.
   per-file import lists, keyed by content sha and shared across worktrees). Entries and
   closures are pruned by age (30 days) and count (20 000) at most once an hour. The first
   walk of a large closure parses every file in it once (a thousand files for a test that
-  imports a whole monorepo); after that the store answers from memory.
+  imports a whole monorepo); after that the store answers from memory. A closure over the cap
+  is stored as a `too_large` marker instead, so the next run goes straight to the tree sha.
 
 Tests: `tests/test_agentq_pytest_cache.py` (key material and each miss trigger, the import
 cache, the event rows, gating, the guard, the never-fails paths, and real

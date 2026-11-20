@@ -275,6 +275,32 @@ class ImportCacheTests(CacheBase):
         self.key()
         self.assertTrue(list((self.home / "pytest-cache" / "imports").glob("*.json")))
 
+    def test_a_closure_over_the_cap_keys_on_the_whole_tree(self):
+        """A test that reaches more than the cap is keyed on the tree, so any edit misses."""
+        for index in range(plugin.MAX_CLOSURE_FILES + 5):
+            (self.repo / f"tests/m{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+        imports = "".join(f"import m{index}\n" for index in range(plugin.MAX_CLOSURE_FILES + 5))
+        (self.repo / "tests/test_a.py").write_text(imports, encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "-c", "commit.gpgsign=false", "commit", "-qm", "wide")
+        before, why = self.key()
+        self.assertEqual(why, "")
+        self.assertIsNotNone(before)
+        (self.repo / "unrelated.txt").write_text("x\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_closure_over_the_cap_is_not_walked_again(self):
+        for index in range(plugin.MAX_CLOSURE_FILES + 5):
+            (self.repo / f"tests/m{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+        imports = "".join(f"import m{index}\n" for index in range(plugin.MAX_CLOSURE_FILES + 5))
+        (self.repo / "tests/test_a.py").write_text(imports, encoding="utf-8")
+        self.key()
+        calls, patcher = self.counting()
+        with patcher:
+            self.key()
+        self.assertEqual(len(calls), 0)
+
     def test_the_closure_is_cached_and_a_repeat_does_not_walk(self):
         walks = []
         real = plugin._walk

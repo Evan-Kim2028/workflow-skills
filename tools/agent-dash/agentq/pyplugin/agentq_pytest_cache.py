@@ -87,8 +87,13 @@ GUARD_COMMAND_CHARS = 300
 MAX_ENTRIES = 20000
 MAX_AGE_S = 30 * 86400.0
 PRUNE_EVERY_S = 3600.0
-MAX_CLOSURE_FILES = 4000
+# A closure over this many files is not walked to the end: the key falls back to the whole
+# tree sha, which is the same answer for a test that reaches everything and costs one
+# `git ls-files` instead of a parse of the repo. The verdict is cached per root blob, so a
+# repeat does not walk to the cap again.
+MAX_CLOSURE_FILES = 300
 MAX_IMPORT_ROWS = 20000
+SAVE_EVERY = 500
 MAX_CONFIG_FILES = 500
 PYTEST_FILE_LIMIT = 25
 PYTEST_HINT = "Run only the test files for the code you changed: pytest <file.py> [...]"
@@ -307,9 +312,10 @@ def _skipped_path(rel):
     """True for a path under a folder the key ignores (``.git``, ``.venv``, ``__pycache__``...).
 
     pytest writes ``.pytest_cache`` and ``__pycache__`` into the tree on every run, so a
-    whole-tree sha that counted them would never repeat.
+    whole-tree sha that counted them would never repeat. Split on ``/`` rather than
+    ``Path.parts``: this runs once per tracked file, and pathlib costs 0.15 ms a call.
     """
-    return any(part in SKIP_DIRS for part in Path(rel).parts)
+    return any(part in SKIP_DIRS for part in rel.split("/"))
 
 
 def _tree_sha(root):
@@ -406,7 +412,7 @@ def _module_file(base, parts):
     for candidate in (target.with_suffix(".py"), target / "__init__.py"):
         try:
             if candidate.is_file():
-                return candidate.resolve()
+                return candidate
         except OSError:
             continue
     return None
@@ -419,6 +425,10 @@ def _module_index(root):
     ``packages/<name>/<name>`` layout and a namespace package all resolve without
     knowing where the import roots are. Two files with the same suffix both match,
     which only ever adds files to the closure. Directory entries only: no file is read.
+
+    The last component is indexed too, so ``import helpers`` next to a test resolves
+    without a stat per import root: a test-local helper is the common case, and the
+    per-root fallback cost a stat and a ``resolve`` per import of every file walked.
     """
     index = {}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -434,7 +444,10 @@ def _module_index(root):
                 parts = parts[:-1]
             if not parts:
                 continue
-            index.setdefault(".".join(parts), []).append(Path(dirpath) / name)
+            path = Path(dirpath) / name
+            index.setdefault(".".join(parts), []).append(path)
+            if len(parts) > 1:
+                index.setdefault(parts[-1], []).append(path)
     return index
 
 
@@ -485,8 +498,13 @@ def _repo_names(roots):
     return names
 
 
-def _resolve(path, level, dotted, index, roots):
-    """The files a ``(level, dotted)`` import names: a list, empty when it is not in the repo."""
+def _resolve(path, level, dotted, index, roots, repo_names):
+    """The files a ``(level, dotted)`` import names: a list, empty when it is not in the repo.
+
+    The index answers first, so a stdlib or third-party import (``json``, ``typing``) costs
+    one dict lookup and no stat: the per-root fallback is only for a name the repo provides
+    and the index missed, which is rare and would otherwise be a stat storm per import.
+    """
     parts = [part for part in dotted.split(".") if part]
     if not parts:
         return []
@@ -497,6 +515,10 @@ def _resolve(path, level, dotted, index, roots):
         found = _module_file(base, parts)
         return [found] if found else []
     found = list(index.get(".".join(parts), []))
+    if not found and len(parts) > 1:
+        found = list(index.get(parts[-1], []))
+    if found or parts[0] not in repo_names:
+        return found
     for root in roots:
         candidate = _module_file(root, parts)
         if candidate is not None and candidate not in found:
@@ -516,6 +538,7 @@ class _ImportStore:
         self.path = Path(path)
         self.rows = {}
         self.dirty = False
+        self.added = 0
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -536,11 +559,15 @@ class _ImportStore:
             return None
         self.rows[rel] = {"blob": blob, "imports": [list(item) for item in targets]}
         self.dirty = True
+        self.added += 1
+        if self.added >= SAVE_EVERY:
+            self.save()
         return targets
 
     def save(self):
         if not self.dirty:
             return
+        self.added = 0
         if len(self.rows) > MAX_IMPORT_ROWS:
             for key in list(self.rows)[:len(self.rows) - MAX_IMPORT_ROWS]:
                 del self.rows[key]
@@ -554,9 +581,14 @@ class _ImportStore:
 
 
 def _walk(seeds, root, context, store, known, budget):
-    """Files reachable from ``seeds``, not descending into ``known`` (already in the closure)."""
+    """Files reachable from ``seeds``, not descending into ``known`` (already in the closure).
+
+    Returns ``(files, blobs, unresolved)``: the blobs are the shas of the bytes already read
+    here, so the caller does not read and hash every file a second time.
+    """
     index, roots, repo_names = context()
     files = set()
+    blobs = {}
     unresolved = set()
     queue = list(seeds)
     while queue:
@@ -573,12 +605,14 @@ def _walk(seeds, root, context, store, known, budget):
         except OSError:
             unresolved.add(f"<unreadable {rel or path}>")
             continue
-        targets = store.imports(rel or str(path), _sha(data), data)
+        blob = _sha(data)
+        blobs[rel or str(path)] = blob
+        targets = store.imports(rel or str(path), blob, data)
         if targets is None:
             unresolved.add(f"<unparsable {rel or path}>")
             continue
         for level, dotted, required in targets:
-            found = _resolve(path, level, dotted, index, roots)
+            found = _resolve(path, level, dotted, index, roots, repo_names)
             if not found:
                 if required and (level or dotted.split(".")[0] in repo_names):
                     unresolved.add(dotted)
@@ -588,51 +622,64 @@ def _walk(seeds, root, context, store, known, budget):
                 if item_rel is not None and item_rel in known:
                     continue
                 queue.append(item)
-    return files, unresolved
+    return files, blobs, unresolved
 
 
 def _read_closure(path, root_blob):
-    """The cached ``{rel: blob}`` closure for this root content, or None."""
+    """The cached ``{rel: blob}`` closure for this root content, or None.
+
+    A closure that was too large to walk is cached as ``{"too_large": True}``, so the next
+    run goes straight to the whole-tree key instead of walking to the cap again.
+    """
     try:
         row = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(row, dict) or row.get("root_blob") != root_blob:
         return None
+    if row.get("too_large"):
+        return {}
     files = row.get("files")
     if not isinstance(files, dict):
         return None
     return {str(key): str(value) for key, value in files.items()}
 
 
-def _write_closure(path, root_blob, blobs):
+def _write_closure(path, root_blob, blobs, too_large=False):
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        row = {"root_blob": root_blob, "too_large": True} if too_large else {
+            "root_blob": root_blob, "files": blobs}
         tmp = Path(path).with_name(f"{Path(path).name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"root_blob": root_blob, "files": blobs}, sort_keys=True),
-                       encoding="utf-8")
+        tmp.write_text(json.dumps(row, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
     except OSError:
         pass
 
 
 def _closure(test_path, root, context, store, closures_dir, budget):
-    """``(blobs, unresolved)``: every repo file the test file imports, transitively.
+    """``(blobs, unresolved, too_large)``: every repo file the test file imports, transitively.
 
     A closure is cached per (root file, its content sha) with every member's blob, and
     validated by re-hashing the members: a member whose blob still matches has the same
     imports, so the cached closure is still the one a walk would produce. A changed member
     is walked again, and the walk stops at members that are still unchanged.
+
+    A closure over ``MAX_CLOSURE_FILES`` is not walked to the end: the caller keys on the
+    whole tree instead, which is the same answer for a test that reaches everything, and
+    costs one ``git ls-files`` rather than a parse of the repo.
     """
     rel = _rel(test_path, root) or str(test_path)
     root_blob = _blob(test_path)
     if root_blob is None:
-        return None, {f"<unreadable {rel}>"}
+        return None, {f"<unreadable {rel}>"}, False
     cache_file = Path(closures_dir) / f"{_sha(f'{rel}\0{root_blob}'.encode('utf-8'))[:32]}.json"
     blobs = {}
     seeds = [Path(test_path)]
     stored = _read_closure(cache_file, root_blob)
     if stored is not None:
+        if not stored:
+            return None, set(), True
         changed = []
         for item_rel, item_blob in stored.items():
             blob = _blob(Path(root) / item_rel)
@@ -641,9 +688,12 @@ def _closure(test_path, root, context, store, closures_dir, budget):
             else:
                 blobs[item_rel] = blob
         if not changed:
-            return blobs, set()
+            return blobs, set(), False
         seeds = changed
-    found, unresolved = _walk(seeds, root, context, store, blobs, budget)
+    found, walked, unresolved = _walk(seeds, root, context, store, blobs, budget)
+    if "<closure too large>" in unresolved:
+        _write_closure(cache_file, root_blob, {}, too_large=True)
+        return None, set(), True
     for path in found:
         item_rel = _rel(path, root)
         if item_rel is None:
@@ -651,14 +701,14 @@ def _closure(test_path, root, context, store, closures_dir, budget):
             continue
         if item_rel in blobs:
             continue
-        blob = _blob(path)
+        blob = walked.get(item_rel) or _blob(path)
         if blob is None:
             unresolved.add(f"<unreadable {item_rel}>")
             continue
         blobs[item_rel] = blob
     if not unresolved:
         _write_closure(cache_file, root_blob, blobs)
-    return blobs, unresolved
+    return blobs, unresolved, False
 
 
 def _conftest_chain(files, root):
@@ -786,9 +836,11 @@ def _key_material(config, environ):
     budget = [MAX_CLOSURE_FILES]
     closure = {}
     unresolved = set()
+    too_large = False
     for path in files:
-        found, missing = _closure(path, root, context, store, closures_dir, budget)
+        found, missing, large = _closure(path, root, context, store, closures_dir, budget)
         unresolved |= missing
+        too_large = too_large or large
         if found:
             closure.update(found)
     store.save()
@@ -799,7 +851,7 @@ def _key_material(config, environ):
     if configs is None:
         return None, "too many config files"
     tree = None
-    if any(_has_tree_marker(path) for path in files):
+    if too_large or any(_has_tree_marker(path) for path in files):
         tree = _tree_sha(root)
         if tree is None:
             return None, "whole-tree test but no tree sha"
@@ -810,7 +862,7 @@ def _key_material(config, environ):
         "argv": argv,
         "env": _env_material(environ),
         "targets": {rel: _blob(path) for rel, path in rels.items()},
-        "closure": closure,
+        "closure": {} if too_large else closure,
         "conftest": conftest,
         "config": configs,
         "tree": tree,
