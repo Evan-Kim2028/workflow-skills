@@ -7,6 +7,7 @@ run_worker.py: it writes a pi-shaped report and starts a real short-lived proces
 
 import concurrent.futures
 import io
+import json
 import os
 import plistlib
 import signal
@@ -190,7 +191,8 @@ def write_config(home, slots=None, tiers=None):
     (home / "broker.json").write_text(json.dumps(data), encoding="utf-8")
 
 
-def set_running(home, job_id, *, pid=None, run_dir=None, attempt=0, pi_session=None, rate_attempts=0):
+def set_running(home, job_id, *, pid=None, run_dir=None, attempt=0, pi_session=None, rate_attempts=0,
+                orig_workspace=None):
     conn = db.connect(home)
     found = B.probe(pid) if pid else None
     db.transition(
@@ -200,6 +202,7 @@ def set_running(home, job_id, *, pid=None, run_dir=None, attempt=0, pi_session=N
         pid_start=found.start if found else None,
         run_dir=str(run_dir) if run_dir else None, attempt=attempt,
         pi_session=pi_session, started_at=time.time(), rate_attempts=rate_attempts,
+        orig_workspace=orig_workspace,
     )
 
 
@@ -826,6 +829,140 @@ class ReviewFixTests(ProcessCleanup):
     def test_16_submit_takes_max_runtime(self):
         job_id = submit(self.env, self.prompt, "--max-runtime", "120", label="mr")
         self.assertEqual(row(self.home, job_id)["max_runtime_s"], 120.0)
+
+
+class PiErrorDeathTests(ProcessCleanup):
+    """A pi run that stopped on an error is a death, not a finish (2026-11-20).
+
+    pi exits 0 after a provider error, so the launcher writes the last assistant
+    text as the report and the broker used to record ``done`` with verdict
+    ``none``, which the dash renders as finished.
+    """
+
+    def stream(self, run_dir, label, events):
+        pi = Path(run_dir) / "pi"
+        pi.mkdir(parents=True, exist_ok=True)
+        path = pi / f"stream-{label}.ndjson"
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        return path
+
+    def report(self, run_dir, label, text):
+        pi = Path(run_dir) / "pi"
+        pi.mkdir(parents=True, exist_ok=True)
+        (pi / f"out-{label}.md").write_text(text, encoding="utf-8")
+
+    def ended(self, job_id, run_dir, label, attempt=0, orig_workspace=None):
+        """Reconcile a dead worker; a requeued job is relaunched and stays running."""
+        set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir, attempt=attempt,
+                    orig_workspace=orig_workspace)
+        make_broker(self.home, self.fake(live_s=30)).tick()
+        return row(self.home, job_id)
+
+    def error_stream(self, run_dir, label, error="API key auth failed for provider morph"):
+        return self.stream(run_dir, label, [
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "error",
+                                                  "errorMessage": error}},
+            {"type": "agent_end", "willRetry": False, "errorMessage": error},
+            {"type": "agent_settled", "aborted": False},
+        ])
+
+    def events(self, job_id):
+        conn = db.connect(self.home)
+        return [dict(row) for row in conn.execute(
+            "SELECT kind, detail FROM events WHERE job_id = ? ORDER BY seq", (job_id,)).fetchall()]
+
+    def test_pi_error_stop_requeues_with_the_worktree_intact(self):
+        job_id = submit(self.env, self.prompt, label="err")
+        run_dir = self.tmp / "run-err"
+        self.report(run_dir, "err", "I could not finish the task.")
+        self.error_stream(run_dir, "err")
+        job = self.ended(job_id, run_dir, "err", orig_workspace=str(self.tmp / "wt"))
+        self.assertEqual((job["state"], job["attempt"]), ("running", 1))
+        requeues = [event for event in self.events(job_id) if event["kind"] == "requeue"]
+        self.assertEqual(len(requeues), 1)
+        self.assertIn("pi stopped", requeues[0]["detail"])
+        self.assertIn("API key auth failed", requeues[0]["detail"])
+        self.assertEqual(job["orig_workspace"], str(self.tmp / "wt"))
+
+    def test_pi_error_stop_without_a_report_is_a_death(self):
+        job_id = submit(self.env, self.prompt, label="err2")
+        run_dir = self.tmp / "run-err2"
+        self.error_stream(run_dir, "err2")
+        job = self.ended(job_id, run_dir, "err2")
+        self.assertEqual((job["state"], job["attempt"]), ("running", 1))
+        self.assertTrue(any("pi stopped" in (event["detail"] or "") for event in self.events(job_id)))
+
+    def test_last_pi_error_stop_fails_with_the_dead_verdict(self):
+        job_id = submit(self.env, self.prompt, label="err3")
+        run_dir = self.tmp / "run-err3"
+        self.report(run_dir, "err3", "I could not finish the task.")
+        self.error_stream(run_dir, "err3")
+        job = self.ended(job_id, run_dir, "err3", attempt=B.MAX_ATTEMPTS - 1)
+        self.assertEqual((job["state"], job["verdict"]), ("failed", "DEAD"))
+        self.assertIn("pi stopped", job["detail"])
+
+    def test_retried_error_then_a_normal_stop_finishes(self):
+        job_id = submit(self.env, self.prompt, label="retry")
+        run_dir = self.tmp / "run-retry"
+        self.report(run_dir, "retry", "PASS\nall green\n")
+        self.stream(run_dir, "retry", [
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "error",
+                                                  "errorMessage": "overloaded"}},
+            {"type": "agent_end", "willRetry": True, "errorMessage": "overloaded"},
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+            {"type": "agent_end", "willRetry": False},
+        ])
+        job = self.ended(job_id, run_dir, "retry")
+        self.assertEqual((job["state"], job["verdict"]), ("done", "PASS"))
+
+    def test_long_report_without_a_verdict_still_finishes(self):
+        job_id = submit(self.env, self.prompt, label="long")
+        run_dir = self.tmp / "run-long"
+        self.report(run_dir, "long", "I read the files and changed nothing.\n" * 20)
+        self.stream(run_dir, "long", [
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+            {"type": "agent_end", "willRetry": False},
+        ])
+        job = self.ended(job_id, run_dir, "long")
+        self.assertEqual((job["state"], job["verdict"]), ("done", "none"))
+
+    def test_tiny_report_without_a_stream_is_a_death(self):
+        job_id = submit(self.env, self.prompt, label="tiny")
+        run_dir = self.tmp / "run-tiny"
+        self.report(run_dir, "tiny", "I could not finish the task.")
+        job = self.ended(job_id, run_dir, "tiny")
+        self.assertEqual((job["state"], job["attempt"]), ("running", 1))
+        self.assertTrue(any("fragment" in (event["detail"] or "") for event in self.events(job_id)))
+
+    def test_tiny_report_with_a_verdict_still_finishes(self):
+        job_id = submit(self.env, self.prompt, label="tiny-pass")
+        run_dir = self.tmp / "run-tiny-pass"
+        self.report(run_dir, "tiny-pass", "PASS")
+        job = self.ended(job_id, run_dir, "tiny-pass")
+        self.assertEqual((job["state"], job["verdict"]), ("done", "PASS"))
+
+    def test_max_runtime_failure_records_the_dead_verdict(self):
+        job_id = submit(self.env, self.prompt, "--max-runtime", "5", label="slow")
+        launcher = self.fake(live_s=30, report=False)
+        clock = Clock(1000.0)
+        broker = make_broker(self.home, launcher, clock=clock)
+        broker.tick()
+        clock.t = 1010.0
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["verdict"]), ("failed", "DEAD"))
+
+    def test_cli_result_exit_status_treats_a_verdictless_finish_as_not_ok(self):
+        job_id = submit(self.env, self.prompt, label="none")
+        run_dir = self.tmp / "run-none"
+        self.report(run_dir, "none", "I could not finish the task.\n" * 20)
+        set_running(self.home, job_id, pid=dead_pid(), run_dir=run_dir)
+        conn = db.connect(self.home)
+        make_broker(self.home, self.fake())._worker_ended(conn, db.get_job(conn, job_id), time.time())
+        self.assertEqual(row(self.home, job_id)["verdict"], "none")
+        code, out = run_cli(self.env, ["result", job_id])
+        self.assertEqual(code, 1, out)
+        self.assertIn("verdict none", out)
 
 
 class AdaptiveAdmissionTests(ProcessCleanup):

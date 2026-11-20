@@ -244,7 +244,7 @@ def cmd_result(args, ctx: Context) -> int:
         ctx.print(f"{broker_lib.worktree_note(job)} (from {job['orig_workspace']})")
     if args.print and job["report_path"]:
         ctx.print(Path(job["report_path"]).read_text(encoding="utf-8"))
-    ok = job["state"] == "done"
+    ok = job["state"] == "done" and (job["verdict"] or "").strip().lower() not in ("", "none")
     return answer(ctx, f"{args.id} {job['state']}, verdict {job['verdict'] or 'none'}", 0 if ok else 1)
 
 

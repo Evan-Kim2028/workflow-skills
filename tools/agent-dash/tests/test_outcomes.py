@@ -53,6 +53,9 @@ CASES = [
     (("died_early", "QUOTA", True, False), "died"),
     (("died_early", "IDLE", True, False), "died"),
     (("died_early", "DEAD", True, False), "died"),
+    # A failed agentq job is a death, never a finish (2026-11-20).
+    (("failed", "DEAD", True, False), "died"),
+    (("failed", None, True, False), "died"),
     # Deaths by verdict.
     (("finished", "FAILURE", True, False), "died"),
     (("done", "FAIL", True, False), "died"),
@@ -78,6 +81,8 @@ REASONS = [
     ({"status": "died_early", "verdict": "IDLE", "ended_at": 1.0}, "died", "idle"),
     ({"status": "died_early", "verdict": "DEAD", "ended_at": 1.0}, "died", "process gone"),
     ({"status": "died_early", "verdict": None, "ended_at": 1.0}, "died", "without a verdict"),
+    ({"status": "failed", "verdict": "DEAD", "ended_at": 1.0}, "died", "process gone"),
+    ({"status": "failed", "verdict": None, "ended_at": 1.0}, "died", "without a verdict"),
     ({"status": "finished", "verdict": "FAILURE", "ended_at": 1.0}, "died", "FAILURE"),
     ({"status": "running", "verdict": None, "ended_at": None, "stalled": 7200.0}, "stalled", "no output for 2.0h"),
     ({"status": "unknown", "verdict": None, "ended_at": 1.0}, "unk", "no verdict"),

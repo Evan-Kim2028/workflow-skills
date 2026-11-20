@@ -374,7 +374,8 @@ class ShimHandoffTests(unittest.TestCase):
         env["AGENTQ_HOME"] = str(self.home)
         env["AGENTQ_SHIM_PYTHON"] = sys.executable
         env["AGENTQ_MEMCAPPED"] = "1"
-        for key in ("AGENTQ_SLOT_HELD", "AGENTQ_PYTEST_SLOT_HELD", "AGENTQ_RUN", "AGENTQ_JOB"):
+        for key in ("AGENTQ_SLOT_HELD", "AGENTQ_PYTEST_SLOT_HELD", "AGENTQ_RUN", "AGENTQ_JOB",
+                    "AGENTQ_SHIM_DEPTH"):
             env.pop(key, None)
         env.update(extra or {})
         return env

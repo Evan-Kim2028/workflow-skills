@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,37 @@ def dead_pid():
     return child.pid
 
 
+def run_bounded(argv, env, timeout=10, cwd=None):
+    """Run argv in its own process group and kill the whole group on timeout.
+
+    A shim scenario that recurses must never outlive the test: the group kill
+    takes every child with it, so a fork bomb cannot fill the process table.
+    """
+    proc = subprocess.Popen(argv, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        out, err = proc.communicate()
+        raise AssertionError(f"shim run did not finish in {timeout}s: {err[-2000:]}")
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def shim_processes(marker):
+    """Pids whose command line names ``marker`` (a temp shim folder)."""
+    proc = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True, text=True, timeout=30)
+    found = []
+    for line in proc.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and marker in command:
+            found.append(int(pid))
+    return found
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -86,6 +118,15 @@ class Base(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    def second_shims(self, name="shims2"):
+        """A second copy of the shims, the way a worker put one on PATH on 2026-11-20."""
+        folder = self.bin / name
+        folder.mkdir()
+        for entry in SHIMS.iterdir():
+            if entry.is_file():
+                shutil.copy(entry, folder / entry.name)
+        return folder
+
     def shim_env(self, extra=None):
         env = dict(os.environ)
         env["PATH"] = os.pathsep.join([str(SHIMS), str(self.bin), "/usr/bin", "/bin"])
@@ -96,7 +137,7 @@ class Base(unittest.TestCase):
         # A pytest run that is itself under the shims (or the plugin) exports these; the child must
         # start clean, or the shim skips the gate and the end-to-end tests see no slot.
         for key in ("AGENTQ_SLOT_HELD", "AGENTQ_PYTEST_SLOT_HELD", "AGENTQ_MEMCAPPED", "AGENTQ_RUN",
-                    "AGENTQ_JOB"):
+                    "AGENTQ_JOB", "AGENTQ_SHIM_DEPTH"):
             env.pop(key, None)
         (self.home / "broker.json").write_text(json.dumps({"shims": {"ssh_gated_hosts": ["prod-box"]}}),
                                                encoding="utf-8")
@@ -317,6 +358,20 @@ class RealBinaryTests(Base):
         real = self.fake_binary("ssh", "exit 0\n")
         env = {"PATH": os.pathsep.join([str(SHIMS), str(self.bin)])}
         self.assertEqual(dispatch.real_binary("ssh", env), str(real))
+
+    def test_resolution_skips_a_second_shim_folder(self):
+        real = self.fake_binary("sleep", "exit 0\n")
+        second = self.second_shims()
+        env = {"PATH": os.pathsep.join([str(SHIMS), str(second), str(self.bin)])}
+        self.assertEqual(dispatch.real_binary("sleep", env), str(real))
+
+    def test_missing_real_binary_names_the_shim_folders(self):
+        second = self.second_shims()
+        env = {"PATH": os.pathsep.join([str(SHIMS), str(second)])}
+        with self.assertRaises(dispatch.ShimError) as caught:
+            dispatch.real_binary("sleep", env)
+        self.assertIn("no real `sleep`", str(caught.exception))
+        self.assertIn(str(second), str(caught.exception))
 
     def test_missing_real_binary_fails_with_a_message(self):
         env = {"PATH": str(SHIMS)}
@@ -778,6 +833,54 @@ class ShellFastPathTests(Base):
         self.fake_binary("ssh", "exit 0\n")
         self.assertEqual(self.run_shim(folder, "ssh", ["prod-box"]).returncode, 0)
         self.assertFalse(marker.exists())
+
+
+class ShimRecursionTests(Base):
+    """A second copy of the shims on PATH must never become the "real" binary.
+
+    On 2026-11-20 a worker put a second shim folder on a PATH that already had
+    the installed shims, and an exhausted sleep budget made each shim run the
+    other as its "real" sleep: 5795 processes in under two minutes.
+    """
+
+    def test_shell_shim_skips_a_second_shim_folder(self):
+        second = self.second_shims()
+        record = self.bin / "slept"
+        self.fake_binary("sleep", f'printf "%s\\n" "$@" > "{record}"\n')
+        env = self.shim_env({"PATH": os.pathsep.join([str(SHIMS), str(second), str(self.bin),
+                                                       "/usr/bin", "/bin"])})
+        result = run_bounded([str(SHIMS / "sleep"), "1"], env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(record.read_text().split(), ["1"])
+
+    def test_exhausted_budget_with_two_shim_folders_leaves_no_child_chain(self):
+        second = self.second_shims()
+        (self.home / "guard").mkdir(parents=True, exist_ok=True)
+        (self.home / "guard" / "sleep-bomb").write_text("1800\n", encoding="utf-8")
+        env = self.shim_env({
+            "PATH": os.pathsep.join([str(SHIMS), str(second), str(self.bin), "/usr/bin", "/bin"]),
+            "AGENTQ_JOB": "bomb",
+            "AGENTQ_REFUSED_SLEEP_PAUSE_S": "0",
+        })
+        result = run_bounded([str(SHIMS / "sleep"), "2"], env, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("sleep budget used", result.stderr)
+        self.assertEqual(shim_processes(str(second)), [])
+        self.assertEqual(shim_processes(str(SHIMS)), [])
+
+    def test_depth_past_two_is_refused(self):
+        env = self.shim_env({"AGENTQ_SHIM_DEPTH": "2"})
+        result = run_bounded([str(SHIMS / "sleep"), "0"], env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("shim depth 3", result.stderr)
+
+    def test_depth_one_still_runs(self):
+        record = self.bin / "slept"
+        self.fake_binary("sleep", f'printf "%s\\n" "$@" > "{record}"\n')
+        env = self.shim_env({"AGENTQ_SHIM_DEPTH": "1"})
+        result = run_bounded([str(SHIMS / "sleep"), "0"], env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(record.read_text().split(), ["0"])
 
 
 class SshHostsFileTests(Base):

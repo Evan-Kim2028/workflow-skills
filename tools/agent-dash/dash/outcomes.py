@@ -105,7 +105,7 @@ def _class_of(run) -> str:
         return "stalled"
     if ended is None:
         return "run" if status == "running" else "unk"
-    if status in ("killed", "died_early"):
+    if status in ("killed", "died_early", "failed"):
         return "died"
     if status == "unknown":
         # The source could not confirm the end: a verdict on an

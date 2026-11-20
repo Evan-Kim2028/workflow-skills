@@ -14,6 +14,7 @@ os.environ.setdefault(
 
 import contextlib
 import io
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,10 @@ class ReapDecisionsTest(unittest.TestCase):
         patcher = mock.patch.object(worktrees, "gh_pr_merged", return_value=False)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The agentq job guard reads the live database by default; keep the suite hermetic.
+        held = mock.patch.object(worktrees, "agentq_active_workspaces", return_value={})
+        held.start()
+        self.addCleanup(held.stop)
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
@@ -535,6 +540,68 @@ class ProcScanCapTest(unittest.TestCase):
         """A normal scan reports itself complete."""
         _pids, partial = worktrees._proc_scan()
         self.assertFalse(partial)
+
+
+class AgentqJobGuardTest(unittest.TestCase):
+    """A worktree that is the workspace of a queued or running agentq job is kept.
+
+    A requeued job (state ``queued``, no process) keeps its worktree, and the
+    retry would recreate it from ``origin/main`` if the reaper removed it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "agentq"
+        self.home.mkdir()
+        self.path = Path(self._tmp.name) / "wt"
+        self.path.mkdir()
+        patcher = mock.patch.dict(os.environ, {"AGENTQ_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # No live process holds the temp path; the scan itself is covered elsewhere.
+        for name, value in (("_proc_scan", ([], False)), ("_cwd_table", {}), ("_command_table", {})):
+            patcher = mock.patch.object(worktrees, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def make_db(self, rows):
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, state TEXT, workspace TEXT)")
+        conn.executemany("INSERT INTO jobs(id, state, workspace) VALUES (?, ?, ?)", rows)
+        conn.commit()
+        conn.close()
+
+    def test_queued_job_workspace_is_busy(self):
+        self.make_db([("abc123", "queued", str(self.path))])
+        busy = worktrees.busy_map([str(self.path)])
+        self.assertIn("abc123", busy[str(self.path)])
+        self.assertIn("queued or running", busy[str(self.path)])
+
+    def test_running_job_workspace_is_busy(self):
+        self.make_db([("def456", "running", str(self.path))])
+        self.assertIn("def456", worktrees.busy_map([str(self.path)])[str(self.path)])
+
+    def test_finished_job_workspace_is_not_busy(self):
+        self.make_db([("aaa111", "done", str(self.path)), ("bbb222", "failed", str(self.path))])
+        self.assertEqual(worktrees.busy_map([str(self.path)]), {})
+
+    def test_missing_database_holds_nothing(self):
+        self.assertEqual(worktrees.agentq_active_workspaces(), {})
+        self.assertEqual(worktrees.busy_map([str(self.path)]), {})
+
+    def test_unreadable_database_holds_nothing(self):
+        (self.home / "agentq.db").write_text("not a database", encoding="utf-8")
+        self.assertEqual(worktrees.agentq_active_workspaces(), {})
+
+    def test_decide_keeps_a_worktree_a_queued_job_holds(self):
+        self.make_db([("abc123", "queued", str(self.path))])
+        busy = worktrees.busy_map([str(self.path)])
+        row = worktrees.decide("/tmp/repo", {"path": str(self.path), "branch": "agentq/abc123"},
+                               "/tmp/repo", "main", 0, set(), time.time(),
+                               busy_reason=busy.get(str(self.path), ""))
+        self.assertEqual(row["decision"], "keep")
+        self.assertIn("abc123", row["reason"])
 
 
 class MergedPrLookupTest(unittest.TestCase):

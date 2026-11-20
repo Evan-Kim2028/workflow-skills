@@ -239,7 +239,7 @@
     var st = r.status, v = r.verdict == null ? null : String(r.verdict).toUpperCase();
     if (r.stalled && (st === "running" || st === "queued") && r.ended_at == null) return "stalled";
     if (r.ended_at == null) return st === "running" ? "run" : "unk";
-    if (st === "killed" || st === "died_early") return "died";
+    if (st === "killed" || st === "died_early" || st === "failed") return "died";
     if (st === "unknown") return "unk";
     if (v === "FAILURE" || v === "FAIL" || v === "UNRESOLVED" || v === "QUOTA" || v === "IDLE" || v === "DEAD") return "died";
     if (v === "CANCELED") return "cancelled";
