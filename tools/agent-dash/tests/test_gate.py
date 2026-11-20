@@ -199,7 +199,14 @@ class GateSelectionTest(unittest.TestCase):
         self.assertNotIn("WARN", err)
         self.assertEqual(
             selected,
-            ["test_install.py", "test_page_rules.py", "test_privacy_pin.py", "test_run_worker.py", "test_worker_watch.py"],
+            [
+                "test_install.py",
+                "test_memcap.py",
+                "test_page_rules.py",
+                "test_privacy_pin.py",
+                "test_run_worker.py",
+                "test_worker_watch.py",
+            ],
         )
 
     def test_fixture_change_does_not_widen_to_other_fixture_suites(self):

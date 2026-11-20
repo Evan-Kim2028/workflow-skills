@@ -76,3 +76,5 @@ by `install.sh`. Some come from third parties; see the owner's list before movin
 ## Local memcap rules
 
 `scripts/memcap.sh` sources `~/.config/agent-dash/memcap-rules.sh` when it exists (override the path with `AGENT_DASH_MEMCAP_RULES`). The file sees the wrapped command in `$*` and may `exit` to refuse a run. Keep machine-specific paths there, not in this repo.
+
+The child leads its own process group, created with `perl`/`python3` `setpgrp` rather than bash job control: `set -m` needs `setpgid`, which some agentq pi workers refuse (`child setpgid ... Operation not permitted`), and a refused group made the cap kill the caller's pipeline (exit 143, no output). When the group cannot be created, the poll loop sums RSS over the child's descendant tree and kills that tree. `MEMCAP_NO_SETPGRP=1` forces that fallback; the tests use it.

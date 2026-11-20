@@ -408,7 +408,8 @@
       "test_worker_watch"
     ],
     "scripts/memcap.sh": [
-      "test_install"
+      "test_install",
+      "test_memcap"
     ],
     "tests/test_control_plane_e2e.py": [
       "test_control_plane_e2e"
