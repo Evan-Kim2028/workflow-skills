@@ -2,9 +2,9 @@
 
 A worktree is listed for removal only when every guard holds at once:
 clean status, branch merged into the main ref with proof it contributed,
-no live process sitting in it or naming it, older than the minimum age,
-and absent from the skip list. Dry-run by default; nothing is removed
-without ``--apply``.
+no live process sitting in it or naming it, no queued or running agentq job
+holding it as its workspace, older than the minimum age, and absent from the
+skip list. Dry-run by default; nothing is removed without ``--apply``.
 
 ``--purge-age`` is the owner's override for lanes nobody came back to: past
 that idle cutoff a worktree is removed whether or not its branch merged and
@@ -44,6 +44,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -572,8 +573,40 @@ def reclaim_note(apparent: int, on_disk: int | None) -> str:
     )
 
 
+def agentq_active_workspaces(home=None) -> dict[str, str]:
+    """Worktree paths held by a queued or running agentq job, each mapped to its job id.
+
+    A requeued job (state ``queued``, no process) keeps its worktree, and the
+    retry would recreate it from ``origin/main`` if the reaper removed it. The
+    agentq database is opened read-only and one query answers every path; a
+    missing database, table or unreadable file means no job holds anything, so
+    the reaper keeps its old behaviour.
+    """
+    base = Path(os.path.expanduser(home or os.environ.get("AGENTQ_HOME") or "~/.local/state/agentq"))
+    path = base / "agentq.db"
+    if not path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = conn.execute(
+            "select id, workspace from jobs where state in ('queued', 'running') and workspace is not null"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    held: dict[str, str] = {}
+    for job_id, workspace in rows:
+        if workspace:
+            held[os.path.realpath(str(workspace))] = str(job_id)
+    return held
+
+
 def busy_map(paths: list[str]) -> dict[str, str]:
-    """Worktree paths holding a live process, each mapped to its reason."""
+    """Worktree paths holding a live process or a queued/running agentq job, each mapped to its reason."""
     targets = {os.path.realpath(path): path for path in paths}
     mine = os.getpid()
     pids, partial = _proc_scan()
@@ -610,6 +643,16 @@ def busy_map(paths: list[str]) -> dict[str, str]:
                     busy[shown] = "worktree path is on a process command line"
         if len(busy) == len(targets):
             break
+    try:
+        held = agentq_active_workspaces()
+    except Exception:
+        held = {}
+    for target, shown in targets.items():
+        if shown in busy:
+            continue
+        job_id = held.get(target)
+        if job_id:
+            busy[shown] = f"agentq job {job_id} is queued or running"
     return busy
 
 

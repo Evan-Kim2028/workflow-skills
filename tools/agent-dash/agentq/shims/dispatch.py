@@ -1,9 +1,10 @@
 """Dispatch for the PATH shims in this folder: ``ssh``, ``pytest``, ``python``, ``python3``, ``uv``, ``sleep``, ``pkill``, ``killall``, ``grep``, ``rg`` and ``find``.
 
 Each shell wrapper runs ``dispatch.py <its own name> <args>`` only when the sh fast
-path cannot decide. The real binary is the first match on PATH with this folder
-removed, so a shim never calls itself. Anything that is not refused is replaced by
-the real binary with the same argv.
+path cannot decide. The real binary is the first match on PATH outside every shim
+folder (recognised by content: a folder holding ``shim-lib.sh`` and ``dispatch.py``),
+so a shim never calls itself or another copy of the shims. Anything that is not
+refused is replaced by the real binary with the same argv.
 
 Guards (every refusal prints ``BLOCKED: agentq guard: <reason>`` on stderr, exits 2,
 and appends one row to ``guard_blocks.tsv`` under ``AGENTQ_HOME``: epoch, run label,
@@ -114,15 +115,31 @@ class ShimError(RuntimeError):
     """The real binary a shim wraps cannot be found."""
 
 
+def is_shim_dir(entry) -> bool:
+    """True when ``entry`` is an agentq shim folder: it holds ``shim-lib.sh`` and ``dispatch.py``.
+
+    Recognised by content, not by name, so a copy of the shims under any folder
+    name is skipped. A shim that runs a shim is a fork bomb (2026-11-20: two shim
+    folders on PATH and an exhausted sleep budget spawned 5795 sleep shims).
+    """
+    return os.path.isfile(os.path.join(entry, "shim-lib.sh")) and os.path.isfile(
+        os.path.join(entry, "dispatch.py")
+    )
+
+
 def real_binary(name: str, environ) -> str:
-    """The first executable ``name`` on PATH outside the shim folder.
+    """The first executable ``name`` on PATH outside every shim folder.
 
     Raises ``ShimError`` when there is none, so the shim fails with a message
-    instead of recursing into itself.
+    instead of recursing into itself or into another copy of the shims.
     """
     shim = os.path.realpath(SHIMS_DIR)
+    skipped = []
     for entry in (environ.get("PATH") or "").split(os.pathsep):
-        if not entry or os.path.realpath(entry) == shim:
+        if not entry:
+            continue
+        if os.path.realpath(entry) == shim or is_shim_dir(entry):
+            skipped.append(entry)
             continue
         candidate = os.path.join(entry, name)
         if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
@@ -130,7 +147,8 @@ def real_binary(name: str, environ) -> str:
         if os.path.realpath(candidate) == os.path.join(shim, name):
             continue
         return candidate
-    raise ShimError(f"agentq shim: no real `{name}` on PATH outside {shim}; put it on PATH or set AGENTQ_SHIMS=0")
+    where = f"the shim folders ({', '.join(skipped)})" if skipped else shim
+    raise ShimError(f"agentq shim: no real `{name}` on PATH outside {where}; put it on PATH or set AGENTQ_SHIMS=0")
 
 
 def ssh_host(args) -> str | None:

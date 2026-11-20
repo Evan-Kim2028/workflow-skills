@@ -1,16 +1,43 @@
 # agentq shim library, sourced by the shell wrappers. POSIX sh; builtins only, so no fork on the fast path.
 
+# Depth guard: a shim that runs another shim is a fork bomb (2026-11-20: two shim folders on
+# PATH, an exhausted sleep budget, and 5795 sleep shims). Each shim process adds one level and
+# exports the count, so a child shim sees its parent's level. Past two, refuse.
+case ${AGENTQ_SHIM_DEPTH:-0} in
+    ''|*[!0-9]*) AGENTQ_SHIM_DEPTH=0 ;;
+esac
+AGENTQ_SHIM_DEPTH=$((AGENTQ_SHIM_DEPTH + 1))
+export AGENTQ_SHIM_DEPTH
+if [ "$AGENTQ_SHIM_DEPTH" -gt 2 ]; then
+    echo "agentq shim: shim depth $AGENTQ_SHIM_DEPTH; refusing to run another shim (a shim that runs a shim is a fork bomb)" >&2
+    exit 2
+fi
+
+shim_is_shim_dir() {
+    # True when $1 is an agentq shim folder: it holds shim-lib.sh and dispatch.py.
+    # Recognised by content, not by name, so a copy under any folder name is skipped.
+    [ -f "$1/shim-lib.sh" ] && [ -f "$1/dispatch.py" ]
+}
+
 shim_real() {
     set -f
     _oldifs=$IFS
     IFS=:
     REAL=
+    _shim_skipped=
     for _d in $PATH; do
         case $_d in
             /*) ;;
             *) continue ;;
         esac
-        if [ "$_d" != "$SHIM_HERE" ] && [ -f "$_d/$1" ] && [ -x "$_d/$1" ]; then
+        if [ "$_d" = "$SHIM_HERE" ]; then
+            continue
+        fi
+        if shim_is_shim_dir "$_d"; then
+            _shim_skipped="$_shim_skipped $_d"
+            continue
+        fi
+        if [ -f "$_d/$1" ] && [ -x "$_d/$1" ]; then
             REAL=$_d/$1
             break
         fi
@@ -18,7 +45,11 @@ shim_real() {
     IFS=$_oldifs
     set +f
     if [ -z "$REAL" ]; then
-        echo "agentq shim: no real \`$1\` on PATH outside $SHIM_HERE; put it on PATH or set AGENTQ_SHIMS=0" >&2
+        if [ -n "$_shim_skipped" ]; then
+            echo "agentq shim: no real \`$1\` on PATH outside the shim folders ($_shim_skipped); put it on PATH or set AGENTQ_SHIMS=0" >&2
+        else
+            echo "agentq shim: no real \`$1\` on PATH outside $SHIM_HERE; put it on PATH or set AGENTQ_SHIMS=0" >&2
+        fi
         return 1
     fi
     case $REAL in
@@ -27,6 +58,10 @@ shim_real() {
             return 1
             ;;
     esac
+    if shim_is_shim_dir "${REAL%/*}"; then
+        echo "agentq shim: real \`$1\` resolves into a shim folder ($REAL); refusing to recurse" >&2
+        return 1
+    fi
     if [ "$REAL" -ef "$SHIM_HERE/$1" ]; then
         echo "agentq shim: real \`$1\` resolves to the shim itself ($REAL); refusing to recurse" >&2
         return 1
@@ -125,8 +160,10 @@ shim_sleep_budget() {
     if [ "$_new" -gt "$_budget" ]; then
         _pause=${AGENTQ_REFUSED_SLEEP_PAUSE_S:-10}
         case $_pause in *[!0-9]*) _pause=10 ;; esac
-        if [ "$_pause" -gt 0 ] && shim_real sleep; then
-            "$REAL" "$(( _secs < _pause ? _secs : _pause ))" 2>/dev/null
+        if [ "$_pause" -gt 0 ] && [ -x /bin/sleep ]; then
+            # Never run $REAL here: it may be another shim, and a shim that runs a shim is
+            # the fork bomb this pause used to feed. An absolute /bin/sleep cannot recurse.
+            /bin/sleep "$(( _secs < _pause ? _secs : _pause ))" 2>/dev/null
         fi
         shim_refuse "sleep budget used ($_new s of $_budget s)" \
             "workers never babysit. Launch long work detached, write a status file, and report its PID and paths." \

@@ -774,6 +774,77 @@ def _pi_dir(run_dir) -> Path:
     return Path(run_dir) / "pi"
 
 
+PI_STREAM_TAIL_BYTES = 4 * 1024 * 1024
+TINY_REPORT_BYTES = 200
+
+
+def _tail_lines(path, limit: int = PI_STREAM_TAIL_BYTES):
+    """The last ``limit`` bytes of a file as text lines, dropping a partial first line."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+                fh.readline()
+            return fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def pi_stream_path(run_dir, label: str) -> Path:
+    """The pi event stream of a run: ``<run_dir>/pi/stream-<label>.ndjson``."""
+    return _pi_dir(run_dir) / f"stream-{label}.ndjson"
+
+
+def pi_stopped_on_error(run_dir, label: str) -> str | None:
+    """The error text when pi's last stream event says the run stopped on an error, else None.
+
+    pi exits 0 after a provider error (``agent_settled {aborted:false}``), so the
+    launcher writes the last assistant text as the report and the broker used to
+    read that fragment as a finish. The last assistant ``message_end`` carries the
+    discriminator: ``stopReason: "error"`` is a death, ``"stop"`` is a normal end.
+    An ``agent_end`` with an error and no retry counts too.
+    """
+    stop = None
+    agent_error = None
+    for line in _tail_lines(pi_stream_path(run_dir, label)):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "message_end":
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            reason = message.get("stopReason")
+            if isinstance(reason, str):
+                stop = (reason, str(message.get("errorMessage") or ""))
+                agent_error = None
+        elif kind == "agent_end":
+            error = event.get("errorMessage")
+            if isinstance(error, str) and error.strip() and event.get("willRetry") is False:
+                agent_error = error.strip()
+    if stop is not None and stop[0] == "error":
+        return stop[1] or "pi stopped on an error"
+    return agent_error
+
+
+def tiny_verdictless(text: str) -> bool:
+    """A report too small to be a report: under 200 bytes, one line, no verdict.
+
+    A harness that writes no event stream leaves only this fragment when it dies
+    mid-run, and the broker used to read it as a finish with verdict ``none``.
+    """
+    body = text.strip()
+    return len(body.encode("utf-8")) < TINY_REPORT_BYTES and "\n" not in body and verdict_of(body) == "none"
+
+
 def report_text(run_dir, label: str) -> str | None:
     """The worker's final text: ``pi/out-<label>.md``, else a non-launcher ``out-<label>.md``."""
     for path in (_pi_dir(run_dir) / f"out-{label}.md", Path(run_dir) / f"out-{label}.md"):
@@ -1663,8 +1734,19 @@ class Broker:
         if run_dir and quota_marked(run_dir, label):
             return self._rate_requeue(conn, job, now, "quota or credit limit")
         text = report_text(run_dir, label) if run_dir else None
+        streamed = bool(run_dir) and pi_stream_path(run_dir, label).is_file()
+        stopped = pi_stopped_on_error(run_dir, label) if streamed else None
         if text is not None:
-            return self._finish(conn, job, text, now)
+            if stopped is not None and verdict_of(text) == "none":
+                return self._death(conn, job, now, f"pi stopped: {stopped[:200]}")
+            if not streamed and tiny_verdictless(text):
+                if run_dir and rate_limited(run_dir, label):
+                    return self._rate_requeue(conn, job, now, "rate limit")
+                return self._death(conn, job, now, "died without a verdict: the report is a fragment")
+            note = f"pi stopped: {stopped[:200]}" if stopped else ""
+            return self._finish(conn, job, text, now, note=note)
+        if stopped is not None:
+            return self._death(conn, job, now, f"pi stopped: {stopped[:200]}")
         if run_dir and rate_limited(run_dir, label):
             return self._rate_requeue(conn, job, now, "rate limit")
         self._death(conn, job, now, "died without a report")
@@ -1708,9 +1790,10 @@ class Broker:
             filler_lib.index_job(conn, job_id, now)
 
     def _fail(self, conn, job: dict, now: float, reason: str, attempt: int | None = None) -> None:
+        """Fail the job with verdict ``DEAD``: a failed job is a death, never a finish."""
         self._move(
             conn, job["id"], ("running",), now, "failed", reason,
-            state="failed", finished_at=now, detail=reason,
+            state="failed", verdict="DEAD", finished_at=now, detail=reason,
             attempt=job["attempt"] if attempt is None else attempt,
         )  # fmt: skip
 
