@@ -1,12 +1,19 @@
 #!/bin/sh
-# session_archive_install.sh - hourly native agent-session archive (macOS).
+# session_archive_install.sh - hourly native agent-session and agentq log archive (macOS).
 #
-# Writes a launchd agent that runs `agent_dash.py logs sessions --apply
-# --scheduled` once an hour. The job packs finished native session history
-# (Claude Code, Codex, Grok build, Cursor, Command Code, pi, muse) into
-# lossless tar.zst copies, ingests the transcript lines into the loopback
-# VictoriaLogs store, and reclaims originals after a longer idle window.
-# See docs/session-archive.md.
+# Writes a launchd agent that runs `agent_dash.py logs scheduled --apply` once an
+# hour. That one command runs two passes in one process, so the plist's
+# taskpolicy, memcap and LowPriorityIO cover both:
+#
+#   1. `logs sessions --apply --scheduled` packs finished native session history
+#      (Claude Code, Codex, Grok build, Cursor, Command Code, pi, muse) into
+#      lossless tar.zst copies, ingests the transcript lines into the loopback
+#      VictoriaLogs store, and reclaims originals after a longer idle window.
+#      See docs/session-archive.md.
+#   2. `logs archive --agentq --apply --scheduled` archives the finished agentq
+#      job folders under ~/.local/state/agentq/jobs: a stripped zstd copy under
+#      the log-archive tree, the rows in the same store, then the per-tool keep.
+#      See docs/log-archive.md.
 #
 #   sh scripts/session_archive_install.sh             install or update (idempotent)
 #   sh scripts/session_archive_install.sh --uninstall stop and remove the agent
@@ -21,7 +28,8 @@
 # the job never finished. The job therefore runs the deployed release
 # (~/.local/share/agent-dash/releases/CURRENT) and writes to
 # ~/.local/share/agent-sessions, and this installer refuses (exit 2) any code
-# dir, memcap.sh or dest whose realpath is inside a TCC-protected folder.
+# dir, memcap.sh, dest or agentq home whose realpath is inside a TCC-protected
+# folder.
 #
 # Test overrides (never needed in normal use):
 #   SESSION_ARCHIVE_PLIST_DIR  launch agents dir (default ~/Library/LaunchAgents)
@@ -29,6 +37,7 @@
 #   SESSION_ARCHIVE_CODE_DIR   code dir          (default ~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash)
 #   SESSION_ARCHIVE_DEST       archive dest      (default: config, else ~/.local/share/agent-sessions)
 #   SESSION_ARCHIVE_CONFIG     config file       (default <state>/config.local.json)
+#   SESSION_ARCHIVE_AGENTQ_HOME agentq home      (default $AGENTQ_HOME, else ~/.local/state/agentq)
 #   SESSION_ARCHIVE_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
 
 set -eu
@@ -49,7 +58,7 @@ uninstall=0
 for arg in "$@"; do
     case "$arg" in
         --uninstall) uninstall=1 ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "session_archive_install: unknown argument '$arg'" >&2; exit 2 ;;
     esac
 done
@@ -114,6 +123,7 @@ PY
 
 DEST="${SESSION_ARCHIVE_DEST:-$(configured_dest)}"
 DEST="$(expand_tilde "${DEST:-$HOME/.local/share/agent-sessions}")"
+AGENTQ_HOME_DIR="$(expand_tilde "${SESSION_ARCHIVE_AGENTQ_HOME:-${AGENTQ_HOME:-$HOME/.local/state/agentq}}")"
 
 TCC_HOME="$(resolve_path "$HOME")"
 
@@ -139,6 +149,7 @@ refuse_tcc() {  # refuse_tcc <what> <path>
 refuse_tcc "code dir" "$CODE_DIR"
 refuse_tcc "memcap.sh" "$MEMCAP"
 refuse_tcc "archive dest" "$DEST"
+refuse_tcc "agentq home" "$AGENTQ_HOME_DIR"
 
 if [ ! -f "$AGENT_DASH" ]; then
     warn "session_archive_install: warning: $AGENT_DASH does not exist yet."
@@ -163,9 +174,8 @@ cat > "$PLIST.tmp" <<EOF
         <string>/usr/bin/python3</string>
         <string>$AGENT_DASH</string>
         <string>logs</string>
-        <string>sessions</string>
+        <string>scheduled</string>
         <string>--apply</string>
-        <string>--scheduled</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

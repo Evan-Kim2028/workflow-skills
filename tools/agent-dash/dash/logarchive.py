@@ -29,20 +29,35 @@ resumes the rest, so it never rereads a done file or re-ingests its rows.
 Dry run (the default) runs step 1 and the skip rules only: it writes no
 zstd copy, no manifest and no lock, and never touches the store.
 
-Entry points: ``main(argv)`` (the CLI) and ``run(opts)`` (for a later
+Two sources feed the same pipeline. The hub roots (``log_archive.roots``) hold
+workstream run folders. ``--agentq`` adds the agentq job folders under
+``$AGENTQ_HOME/jobs`` (``~/.local/state/agentq/jobs``): a job whose state is
+terminal and that finished at least ``--min-idle-hours`` ago contributes its
+``runs/<run>/pi/stream-*.ndjson`` and ``runs/<run>/pi/sessions/*.jsonl`` files,
+including the ``.gz`` copies ``agentq.janitor`` leaves behind. Rows from a job
+carry ``ws="agentq/<workspace basename>"``, ``label=<job label>`` and the extra
+fields ``job_id``, ``job_kind``, ``tier``, ``verdict``, ``session``, ``attempt``.
+A gzip file cannot be stripped in place, so its keep is ``remove``: the zstd
+copy is the compressed copy.
+
+Entry points: ``main(argv)`` (the CLI), ``run(opts)`` (for a later
 ``ws archive`` hook: ``run({"ws": "WS7", "apply": True})`` limits the pass to
-one workstream and returns the same exit codes).
+one workstream and returns the same exit codes), and ``archive_entries`` (the
+shared body ``agentq gc`` calls so it archives before it reclaims).
 """
 
 from __future__ import annotations
 
 import fcntl
 import fnmatch
+import gzip
 import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -128,6 +143,12 @@ class Entry:
     mtime: float
     outdir: str
     tool: str = "other"   # key into KEEP_BY_TOOL
+    #: The file is gzip-compressed on disk (``agentq.janitor`` gzips old streams).
+    compressed: bool = False
+    #: ``hub`` (a workstream run folder) or ``agentq`` (a job folder).
+    source: str = "hub"
+    #: Extra store fields for every row of this file (agentq job identity).
+    extra: dict = field(default_factory=dict)
 
 
 def projects_root() -> Path:
@@ -194,8 +215,15 @@ def tool_of(name: str, kind: str, outdir: str) -> str:
 
 
 def keep_for(entry: "Entry", override: str | None = None) -> str:
-    """What reclaim leaves at the path: the ``--keep`` override, else the tool's default."""
-    return override or KEEP_BY_TOOL.get(entry.tool, "stripped")
+    """What reclaim leaves at the path: the ``--keep`` override, else the tool's default.
+
+    A gzip file is never ``stripped``: the rewrite would decompress it at the
+    path and grow it. Its zstd copy is the compressed copy, so it is removed.
+    """
+    keep = override or KEEP_BY_TOOL.get(entry.tool, "stripped")
+    if entry.compressed and keep == "stripped":
+        return "remove"
+    return keep
 
 
 def reclaim_bytes(entry: Entry, m, keep: str) -> int:
@@ -284,14 +312,227 @@ def discover(roots, *, ws: str | None = None, exclude=()) -> tuple[list[Entry], 
     return entries, skipped
 
 
+# ------------------------------------------------------- agentq job folders
+
+#: ``$AGENTQ_HOME``, else ``~/.local/state/agentq`` (the same default as ``agentq.db``).
+AGENTQ_HOME_DEFAULT = "~/.local/state/agentq"
+#: Mirror prefix for a job file: ``agentq/jobs/<id>/runs/<run>/pi/stream-<label>.ndjson``.
+AGENTQ_REL_PREFIX = "agentq/jobs"
+#: Job states that mean the job will not write again (``agentq.db.TERMINAL_STATES``).
+AGENTQ_TERMINAL = ("done", "failed", "cancelled")
+#: The job row fields every row of that job's log carries. ``kind`` is already the
+#: file kind in the store, so the job's own kind is ``job_kind``.
+AGENTQ_EXTRA_FIELDS = ("job_id", "job_kind", "tier", "verdict", "session", "attempt")
+
+
+def agentq_home(env=None) -> Path:
+    """The agentq home: ``$AGENTQ_HOME``, else ``~/.local/state/agentq``."""
+    env = os.environ if env is None else env
+    return Path(os.path.expanduser(env.get("AGENTQ_HOME") or AGENTQ_HOME_DEFAULT))
+
+
+def agentq_jobs(home) -> list[dict]:
+    """The job rows the agentq pass needs, read from ``<home>/agentq.db`` without writing.
+
+    Read-only: the broker owns the database and may be writing it. A missing
+    database is an empty list (nothing to archive), not an error.
+    """
+    db_path = Path(str(home)) / "agentq.db"
+    if not db_path.is_file():
+        return []
+    columns = "id, state, label, workspace, kind, tier, verdict, session, attempt, finished_at"
+    query = "SELECT %s FROM jobs WHERE state IN (?, ?, ?)" % columns
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=30)
+    except sqlite3.Error:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+        conn.execute("PRAGMA query_only=ON")
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, AGENTQ_TERMINAL).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def _agentq_kind(name: str, parent: str) -> str | None:
+    """The file kind for a job-folder file, or None. A ``.gz`` suffix is the janitor's copy."""
+    base = name[: -len(".gz")] if name.endswith(".gz") else name
+    if parent == "sessions" and base.endswith(".jsonl"):
+        return "session"
+    if base.startswith("stream-") and base.endswith((".jsonl", ".ndjson")):
+        return "stream"
+    return None
+
+
+def agentq_extra(job: dict) -> dict:
+    """The job fields every row of that job's log carries (``make_row`` drops empty ones)."""
+    values = {
+        "job_id": job.get("id"),
+        "job_kind": job.get("kind"),
+        "tier": job.get("tier"),
+        "verdict": job.get("verdict"),
+        "session": job.get("session"),
+        "attempt": job.get("attempt"),
+    }
+    return {key: (None if value is None else str(value)) for key, value in values.items()}
+
+
+def agentq_entry(path, job: dict, home, st=None) -> "Entry | None":
+    """The ``Entry`` for one job-folder file, or None when it is not a stream or session file.
+
+    ``st`` is the ``lstat`` the caller already took (``_agentq_files`` does), so a
+    full scan costs one stat per file instead of three.
+    """
+    p = Path(str(path))
+    kind = _agentq_kind(p.name, p.parent.name)
+    if kind is None:
+        return None
+    if st is None:
+        try:
+            st = os.lstat(str(p))
+        except OSError:
+            return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_size == 0:
+        return None
+    jobs_dir = Path(str(home)) / "jobs"
+    try:
+        rel = os.path.relpath(str(p), str(jobs_dir))
+    except ValueError:
+        return None
+    workspace = str(job.get("workspace") or "").rstrip("/")
+    outdir = str(p.parent.parent) if kind == "session" else str(p.parent)
+    return Entry(
+        path=str(p),
+        root=str(jobs_dir),
+        rel=AGENTQ_REL_PREFIX + "/" + rel,
+        ws="agentq/" + (os.path.basename(workspace) or "unknown"),
+        label=str(job.get("label") or ""),
+        kind=kind,
+        size=st.st_size,
+        mtime_ns=st.st_mtime_ns,
+        mtime=st.st_mtime,
+        outdir=outdir,
+        tool=tool_of(p.name, kind, outdir),
+        compressed=p.name.endswith(".gz"),
+        source="agentq",
+        extra=agentq_extra(job),
+    )
+
+
+def _agentq_files(run_dir: Path) -> list[tuple[Path, os.stat_result]]:
+    """Every stream and session file under one run folder, with its ``lstat``, symlinks skipped.
+
+    ``os.scandir`` rather than ``os.walk``: the dirent type answers "is a
+    directory" without a syscall, so a full scan of 15,000 job folders costs one
+    ``lstat`` per candidate file instead of three stats and an ``islink`` each.
+    """
+    found: list[tuple[Path, os.stat_result]] = []
+    stack = [str(run_dir)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                items = list(it)
+        except OSError:
+            continue
+        parent = os.path.basename(current)
+        for item in items:
+            try:
+                if item.is_dir(follow_symlinks=False):
+                    stack.append(item.path)
+                    continue
+                if not item.is_file(follow_symlinks=False):
+                    continue
+                if _agentq_kind(item.name, parent) is None:
+                    continue
+                st = item.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            found.append((Path(item.path), st))
+    return found
+
+
+def discover_agentq(home, jobs, *, min_idle_hours: float = MIN_IDLE_HOURS, now: float | None = None,
+                    exclude=()) -> tuple[list[Entry], dict]:
+    """Stream and session files of finished agentq jobs, plus a count of what was skipped.
+
+    A job is considered only when its state is terminal and it finished at least
+    ``min_idle_hours`` ago. The job id must be plain lowercase hex and its
+    ``runs`` folder must resolve inside ``<home>/jobs`` (``agentq.gc.job_runs_root``),
+    so a bad row or a planted symlink cannot point the pass outside the tree.
+    A live ``running/`` pid is left to ``plan_entries``, which refuses it.
+    """
+    from agentq import gc as gc_lib  # lazy: agentq.gc imports this module for its archive-first pass
+
+    now = time.time() if now is None else float(now)
+    cutoff = now - float(min_idle_hours) * 3600.0
+    home = Path(str(home))
+    jobs_dir = home / "jobs"
+    try:
+        jobs_resolved = jobs_dir.resolve(strict=True)
+    except OSError:
+        jobs_resolved = None
+    entries: list[Entry] = []
+    skipped: dict = {}
+
+    def bump(key: str) -> None:
+        skipped[key] = skipped.get(key, 0) + 1
+
+    for job in jobs:
+        if job.get("state") not in AGENTQ_TERMINAL:
+            bump("not terminal")
+            continue
+        finished = job.get("finished_at")
+        if finished is None or float(finished) > cutoff:
+            bump("finished recently")
+            continue
+        job_root, reason = gc_lib.job_runs_root(home, job.get("id"), jobs_resolved=jobs_resolved)
+        if job_root is None:
+            if reason != "no runs folder":
+                bump(reason)
+            continue
+        for run_dir in sorted(job_root.iterdir()):
+            if not run_dir.is_dir() or run_dir.is_symlink():
+                continue
+            for path, st in _agentq_files(run_dir):
+                rel = os.path.relpath(str(path), str(jobs_dir))
+                if exclude and any(fnmatch.fnmatchcase(rel, g) for g in exclude):
+                    bump("excluded")
+                    continue
+                entry = agentq_entry(path, job, home, st=st)
+                if entry is not None:
+                    entries.append(entry)
+    entries.sort(key=lambda e: e.path)
+    return entries, skipped
+
+
 # ------------------------------------------------------------- liveness
 
 def open_paths(paths) -> set[str]:
-    """Paths some process holds open. Fails closed: lsof missing is an error."""
+    """Paths some process holds open. Fails closed: lsof missing is an error.
+
+    ``lsof`` scans every process whatever the argument count, so one call costs
+    the same for 100 paths as for 2,000 (about 7 s on a busy laptop). Chunks are
+    therefore as large as the argument limit allows: a 26,800-file agentq scan is
+    14 calls, not 268.
+    """
     paths = [os.path.realpath(p) for p in paths]
     found: set[str] = set()
-    for i in range(0, len(paths), 100):
-        chunk = paths[i : i + 100]
+    chunk: list[str] = []
+    chunk_bytes = 0
+    for path in paths + [None]:
+        if path is not None:
+            chunk.append(path)
+            chunk_bytes += len(path) + 1
+            if len(chunk) < 2000 and chunk_bytes < 200_000:
+                continue
+        if not chunk:
+            continue
         try:
             proc = subprocess.run(
                 ["lsof", "-Fn", "--"] + chunk,
@@ -308,6 +549,8 @@ def open_paths(paths) -> set[str]:
         for line in proc.stdout.splitlines():
             if line.startswith("n"):
                 found.add(line[1:])
+        chunk = []
+        chunk_bytes = 0
     return found
 
 
@@ -559,8 +802,12 @@ class Measure:
     stripped_sha256: str = ""
 
 
-def measure(path: str, zst_out: str | None, tok: str = DEFAULT_TOKEN_TYPE) -> Measure:
-    """One streaming pass: stripped zstd copy to ``zst_out`` (or counted only)."""
+def measure(path: str, zst_out: str | None, tok: str = DEFAULT_TOKEN_TYPE, compressed: bool = False) -> Measure:
+    """One streaming pass: stripped zstd copy to ``zst_out`` (or counted only).
+
+    ``compressed`` reads the file through gzip (``agentq.janitor`` gzips old
+    streams); the copy and the counts are of the decompressed bytes.
+    """
     flt = logfilter.StreamFilter()
     raw_scan, out_scan = Scan(tok), Scan(tok)
     digest = hashlib.sha256()
@@ -572,7 +819,7 @@ def measure(path: str, zst_out: str | None, tok: str = DEFAULT_TOKEN_TYPE) -> Me
     drain = _Drain(zproc.stdout, zst_out)
     drain.start()
     try:
-        with open(path, "rb") as fh:
+        with (gzip.open if compressed else open)(path, "rb") as fh:
             while True:
                 chunk = fh.read(READ_CHUNK)
                 if not chunk:
@@ -728,6 +975,7 @@ def row_lines(entry: Entry, zst_path: str):
             type_=type_,
             kind=entry.kind,
             path=entry.rel,
+            extra=entry.extra or None,
         )
         acct["rows"] += 1
         acct["truncated"] += 1 if truncated else 0
@@ -949,7 +1197,7 @@ def process(
             results["done"] += 1
             continue
         if not apply:
-            m = measure(e.path, None, token_type(e.kind))
+            m = measure(e.path, None, token_type(e.kind), compressed=e.compressed)
             _count(totals, e, m, keep=keep_for(e, keep))
             results["planned"] += 1
             print("  would archive %s  raw %s  stripped %s  lines %d  replaced %d" % (e.rel, _fmt(m.raw_bytes), _fmt(m.stripped_bytes), m.stripped_lines, m.replaced), file=out)
@@ -960,7 +1208,7 @@ def process(
                 rec = prior
             else:
                 tmp_zst = str(zst) + ".tmp"
-                m = measure(e.path, tmp_zst, token_type(e.kind))
+                m = measure(e.path, tmp_zst, token_type(e.kind), compressed=e.compressed)
                 _verify_measure(m)
                 if decompressed_sha256(tmp_zst) != m.stripped_sha256:
                     raise ArchiveError("zstd copy does not decompress to the stripped bytes")
@@ -1095,6 +1343,117 @@ def print_totals(totals: Totals, plans: list[Plan], out) -> None:
         )
 
 
+def print_census(entries, out) -> None:
+    """Files and bytes discovered, by kind, before any measurement (cheap: stat only)."""
+    by_kind: dict = {}
+    for e in entries:
+        row = by_kind.setdefault(e.kind, {"files": 0, "bytes": 0, "gzip": 0})
+        row["files"] += 1
+        row["bytes"] += e.size
+        row["gzip"] += 1 if e.compressed else 0
+    print("discovered %d files, %s on disk" % (len(entries), _fmt(sum(e.size for e in entries))), file=out)
+    for kind in sorted(by_kind):
+        row = by_kind[kind]
+        print(
+            "  kind %-8s files %6d  %s  (%d gzip)" % (kind, row["files"], _fmt(row["bytes"]), row["gzip"]),
+            file=out,
+        )
+
+
+def archive_status(entries, *, state: Path | None = None) -> dict:
+    """``{rel: status}`` from the manifest: ``reclaimed``, ``archived``, ``error`` or ``none``.
+
+    ``archived`` means a verified zstd copy exists and its rows are in the store;
+    ``reclaimed`` means the path already holds the archive's own copy. Anything
+    else (no record, a record for a different size or mtime, an error) is
+    ``none``: the file has no verified archive and must not be deleted.
+    """
+    manifest = Manifest(archive_root(state))
+    found: dict = {}
+    for e in entries:
+        rec = manifest.latest.get(e.rel)
+        if not rec:
+            found[e.rel] = "none"
+        elif rec.get("status") in ("archived", "reclaimed") and _same_file(rec, e):
+            found[e.rel] = rec["status"]
+        elif rec.get("status") == "error":
+            found[e.rel] = "error"
+        else:
+            found[e.rel] = "none"
+    return found
+
+
+def archive_entries(
+    entries,
+    *,
+    apply: bool,
+    keep: str | None = None,
+    url: str | None = None,
+    out=None,
+    state: Path | None = None,
+    min_idle_hours: float = 0.0,
+    now: float | None = None,
+    ws_scoped: bool = True,
+    limit: int | None = None,
+    client=None,
+) -> tuple[int, Totals, dict, list[Plan]]:
+    """Plan, then measure/verify/ingest/reclaim a known set of entries.
+
+    The shared body of ``logs archive`` and ``agentq gc``: takes the archive
+    lock, checks the store, and returns ``(exit_code, totals, results, plans)``. A file
+    is only ever reclaimed by ``process`` after its zstd copy verified and its
+    rows are in the store, so a caller cannot delete an un-archived log through
+    this path. ``client`` is injectable for tests.
+    """
+    out = out or sys.stdout
+    root = archive_root(state)
+    now = time.time() if now is None else float(now)
+    lock_fh = None
+    if apply:
+        # Only a real run takes the lock; a dry run writes nothing at all.
+        root.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(root / "archive.lock", "a+")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fh.close()
+            print("another logs archive run holds %s" % (root / "archive.lock"), file=sys.stderr)
+            return 3, Totals(), {"errors": 0, "lock": "held"}, []
+    try:
+        if apply and client is None:
+            client = vlogs.VLogsClient(url or vlogs.DEFAULT_URL)
+            if not client.healthy():
+                print(
+                    "VictoriaLogs is not reachable at %s; start it: sh scripts/vlogs_install.sh"
+                    % (url or vlogs.DEFAULT_URL),
+                    file=sys.stderr,
+                )
+                return 5, Totals(), {"errors": 0, "store": "unreachable"}, []
+        # Drop what the manifest already reclaimed, before the liveness probe: a
+        # caught-up pass then costs one lsof per new file, not one per file ever
+        # archived (26,779 agentq files is 268 lsof calls, about two minutes).
+        done = 0
+        if entries:
+            latest = Manifest(root).latest
+            kept = []
+            for e in entries:
+                rec = latest.get(e.rel)
+                if rec and rec.get("status") == "reclaimed" and _same_file(rec, e):
+                    done += 1
+                    continue
+                kept.append(e)
+            entries = kept
+        plans = plan_entries(entries, min_idle_hours=min_idle_hours, now=now, ws_scoped=ws_scoped)
+        totals, results = process(
+            plans, apply=apply, keep=keep, client=client, root=root, limit=limit, out=out
+        )
+        results["done"] = results.get("done", 0) + done
+        return (1 if results["errors"] else 0), totals, results, plans
+    finally:
+        if lock_fh is not None:
+            lock_fh.close()
+
+
 def main(argv=None, out=None) -> int:
     """``agent_dash.py logs archive`` entry. Returns the exit code."""
     out = out or sys.stdout
@@ -1111,63 +1470,84 @@ def run(opts: dict, out=None, *, state: Path | None = None) -> int:
 
     The entry point for a ``ws archive`` hook: pass ``ws=<id>`` to archive
     one workstream's logs, ``apply=True`` to write. Dry run is the default.
-    Returns the exit code (0 ok, 1 failures or zero planned on real input,
-    2 bad options, 3 another run holds the lock, 5 store unreachable).
+    ``agentq=True`` adds the agentq job folders as a second source (and needs no
+    ``log_archive.roots``). Returns the exit code (0 ok, 1 failures or zero
+    planned on real input, 2 bad options, 3 another run holds the lock, 5 store
+    unreachable).
     """
     out = out or sys.stdout
     opts = dict(_DEFAULTS, **opts)
-    roots = opts["roots"] or default_roots()
-    if not roots:
+    roots = opts["roots"] or ([] if opts["agentq"] else default_roots())
+    if not roots and not opts["agentq"]:
         print("no hub roots: pass --root <hub> or set log_archive.roots in <state>/config.local.json", file=sys.stderr)
         return 2
-    root = archive_root(state)
-    lock_fh = None
-    if opts["apply"]:
-        # Only a real run takes the lock; a dry run writes nothing at all.
-        root.mkdir(parents=True, exist_ok=True)
-        lock_fh = open(root / "archive.lock", "a+")
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            lock_fh.close()
-            print("another logs archive run holds %s" % (root / "archive.lock"), file=sys.stderr)
-            return 3
-    try:
-        client = None
-        if opts["apply"]:
-            client = vlogs.VLogsClient(opts["url"])
-            if not client.healthy():
-                print("VictoriaLogs is not reachable at %s; start it: sh scripts/vlogs_install.sh" % opts["url"], file=sys.stderr)
-                return 5
-        entries, skipped_meta = discover(roots, ws=opts["ws"], exclude=opts["exclude"])
-        print("mode: %s   keep: %s   min-idle: %g h   roots: %d" % ("apply" if opts["apply"] else "dry-run", opts["keep"] or "per tool", opts["min_idle"], len(roots)), file=out)
-        plans = plan_entries(entries, min_idle_hours=opts["min_idle"], now=time.time(), ws_scoped=opts["ws"] is not None)
-        for key, count in sorted(skipped_meta.items()):
-            print("ignored %s: %d files" % (key, count), file=out)
-        totals, results = process(
-            plans,
-            apply=opts["apply"],
-            keep=opts["keep"],
-            client=client,
-            root=root,
-            limit=opts["limit"],
-            out=out,
+    now = time.time()
+    entries: list[Entry] = []
+    skipped_meta: dict = {}
+    if roots:
+        hub_entries, hub_skipped = discover(roots, ws=opts["ws"], exclude=opts["exclude"])
+        entries.extend(hub_entries)
+        for key, count in hub_skipped.items():
+            skipped_meta[key] = skipped_meta.get(key, 0) + count
+    if opts["agentq"]:
+        home = agentq_home()
+        aq_entries, aq_skipped = discover_agentq(
+            home, agentq_jobs(home), min_idle_hours=opts["min_idle"], now=now, exclude=opts["exclude"]
         )
-        print_totals(totals, plans, out)
-        print("results: %s" % json.dumps(results, sort_keys=True), file=out)
-        if not opts["apply"]:
-            print("dry run: nothing written. Re-run with --apply to archive.", file=out)
-            if entries and results["planned"] == 0:
-                print("dry run planned zero actions on real input", file=sys.stderr)
-                return 1
-            return 0
-        return 1 if results["errors"] else 0
-    finally:
-        if lock_fh is not None:
-            lock_fh.close()
+        entries.extend(aq_entries)
+        for key, count in aq_skipped.items():
+            skipped_meta[key] = skipped_meta.get(key, 0) + count
+    print(
+        "mode: %s   keep: %s   min-idle: %g h   roots: %d   agentq: %s"
+        % (
+            "apply" if opts["apply"] else "dry-run",
+            opts["keep"] or "per tool",
+            opts["min_idle"],
+            len(roots),
+            "yes" if opts["agentq"] else "no",
+        ),
+        file=out,
+    )
+    for key, count in sorted(skipped_meta.items()):
+        print("ignored %s: %d files" % (key, count), file=out)
+    print_census(entries, out)
+    rc, totals, results, plans = archive_entries(
+        entries,
+        apply=opts["apply"],
+        keep=opts["keep"],
+        url=opts["url"],
+        out=out,
+        state=state,
+        min_idle_hours=opts["min_idle"],
+        now=now,
+        ws_scoped=opts["ws"] is not None,
+        limit=opts["limit"],
+    )
+    if rc in (3, 5):
+        return rc
+    print_totals(totals, plans, out)
+    print("results: %s" % json.dumps(results, sort_keys=True), file=out)
+    if not opts["apply"]:
+        print("dry run: nothing written. Re-run with --apply to archive.", file=out)
+        if entries and results["planned"] == 0 and not opts["scheduled"]:
+            print("dry run planned zero actions on real input", file=sys.stderr)
+            return 1
+        return 0
+    return rc
 
 
-_DEFAULTS = {"roots": [], "ws": None, "min_idle": MIN_IDLE_HOURS, "apply": False, "keep": DEFAULT_KEEP, "url": vlogs.DEFAULT_URL, "limit": None, "exclude": ()}
+_DEFAULTS = {
+    "roots": [],
+    "ws": None,
+    "min_idle": MIN_IDLE_HOURS,
+    "apply": False,
+    "keep": DEFAULT_KEEP,
+    "url": vlogs.DEFAULT_URL,
+    "limit": None,
+    "exclude": (),
+    "agentq": False,
+    "scheduled": False,
+}
 
 
 def parse_args(args: list[str]):
@@ -1177,6 +1557,10 @@ def parse_args(args: list[str]):
         a = args[i]
         if a in ("--apply",):
             opts["apply"] = True
+        elif a in ("--agentq",):
+            opts["agentq"] = True
+        elif a in ("--scheduled",):
+            opts["scheduled"] = True
         elif a in ("--root", "--ws", "--min-idle-hours", "--keep", "--vlogs-url", "--limit", "--exclude"):
             if i + 1 >= len(args):
                 return "%s needs a value" % a

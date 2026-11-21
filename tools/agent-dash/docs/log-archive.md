@@ -13,7 +13,7 @@ exception is in `CONTRACT.md` ("Log archive exception").
 |---|---|---|
 | Base64 filter | `dash/logfilter.py` | Replaces runs of 2000+ base64 characters with `<img sha256=<16 hex> bytes=<n>>`. No quotes, so JSON stays valid. Line count and all other bytes are kept. Streaming: a run of 2000+ is hashed as it arrives, never held, so a 30 MB line costs about 64 KB of memory. Flushes per chunk. |
 | Launchers | `scripts/launch_pi.py`, `scripts/launch_codex.py`, `scripts/launch_cmd.py` | Child stdout goes through `start_filtered`/`run_filtered`. If the filter raises, the pump falls back to raw passthrough for the rest of the stream, the child keeps running, and its exit code is returned. Session-id capture, verdict and quota checks read the stripped stream, and they still match: base64 never carries those strings. |
-| Archive | `dash/logarchive.py`, `agent_dash.py logs archive` | Finds finished streams (idle 3 h, no open handle, no live launcher), measures them in one streaming pass, writes `log-archive/<mirror path>.zst`, ingests rows, verifies, reclaims. Manifest and lock make reruns idempotent. |
+| Archive | `dash/logarchive.py`, `agent_dash.py logs archive` | Finds finished streams (idle 3 h, no open handle, no live launcher), measures them in one streaming pass, writes `log-archive/<mirror path>.zst`, ingests rows, verifies, reclaims. Manifest and lock make reruns idempotent. `--agentq` adds the finished agentq job folders as a second source (below). |
 | Store client | `dash/vlogs.py` | Loopback only. Redacts secret shapes before ingest. Rows over 1.8 MiB are truncated and flagged (the zstd copy keeps them whole). |
 | Service | `scripts/vlogs_install.sh` | VictoriaLogs v1.53.0, checksum-verified, launchd agent `com.agent-dash.vlogs`, 127.0.0.1:19428, flags as specified. `--uninstall`, `--purge`. |
 | Option test | `scripts/log_keep_eval.py` | Evidence for what stays at the original path (below and "Per-kind decision"). |
@@ -236,6 +236,44 @@ base64 only, see the per-kind table).
 - **Launcher death (fixed).** The launchers (`launch_pi.py`, `launch_cmd.py`, `launch_codex.py`) now pass `detached=True`: the child's stdout pipe goes to a filter process in its own session (`dash/logfilter.py`), not to the launcher. If the launcher is killed, the filter keeps reading until the child closes stdout, so the child finishes as it did when it wrote to a file. Measured with a killed launcher (`SIGKILL` at 1.5 s, child writes 61 lines over 6 s): the old file redirect finished (61 lines); the in-process pump died at 15 lines with `BrokenPipeError`; the detached filter finished (61 lines). What a killed launcher still loses is its own bookkeeping (the TSV row, the usage lines, the verdict), exactly as before. The reaper marks those runs dead. If the filter cannot start, the launcher uses the in-process pump (the old failure mode) and says so in its err log.
 - **Uninstall while running.** `vlogs_install.sh --uninstall --purge` removes data. Under launchd it boots out the agent first. With `VLOGS_NO_LOAD=1` it cannot stop a running process. Do not purge a store that is running.
 
+## agentq job folders (`--agentq`)
+
+`~/.local/state/agentq/jobs` holds one folder per job, and it is the largest
+unarchived log source on the machine: 18,459 folders, 12 GB, of which about
+1,400 raw `stream-*.ndjson` files are over 1 MB (5.3 GB) and the
+`runs/<n>/pi/sessions/*.jsonl` copies duplicate the stream's messages (see
+"Token regression reference"). `agentq gc` used to delete those streams after
+seven days without archiving them, so almost none of it reached the store: 6
+rows for `native/pi` in 24 h against 1,771 jobs.
+
+`--agentq` scans that tree with the same pipeline, the same manifest and the same
+lock. It needs no `log_archive.roots` (pass `--root` as well to do both in one
+pass). A job is a candidate when its row is terminal (`done`, `failed`,
+`cancelled`), it finished at least `--min-idle-hours` ago (default 3), and no
+`running/` pid file in its run folder is alive. Files are the job's own
+`runs/<n>/pi/stream-*.ndjson|jsonl` and `runs/<n>/pi/sessions/*.jsonl`, plus the
+janitor's `.gz` copies of either; a `.gz` file is read through `gzip` and its
+keep is forced to `remove`, because the stripped copy at the path would be a
+second decompressed duplicate.
+
+Rows carry the usual fields plus the job's identity:
+
+| field | value |
+|---|---|
+| `ws` | `agentq/<workspace basename>` |
+| `label` | the job label |
+| `kind` | `stream` or `session` |
+| `job_id` | the job id |
+| `job_kind` | `read`, `write`, `review`, `exec` |
+| `tier` | the model tier the job ran on |
+| `verdict` | `PASS`, `PARTIAL`, `BLOCKED`, or empty |
+| `session` | the submitting session id |
+| `attempt` | the attempt number |
+
+`agentq gc --apply` is the same pass over the files it planned, so a stream is
+never unlinked before its zstd copy verified and its rows are in the store. See
+[agentq.md](agentq.md#disk-janitor) for the gc side.
+
 ## Roots
 
 With no `--root`, the archive scans the roots in `log_archive.roots` of the
@@ -266,6 +304,13 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --exclude 'catalog
 
 # one workstream (what a ws archive hook would call)
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --ws ws25-ja-quality --apply
+
+# the agentq job folders (dry run; --apply archives, then reclaims)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --agentq
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs archive --agentq --apply
+
+# what the hourly launchd job runs: sessions, then agentq, in one process
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs scheduled --apply
 
 # read an archived log back
 zstd -dc ~/.local/share/agent-dash/log-archive/<mirror path>.zst | head
