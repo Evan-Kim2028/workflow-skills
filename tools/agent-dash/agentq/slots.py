@@ -22,6 +22,9 @@ is reaped by the next reader and recorded as ``reaped``.
 Every acquire, release, timeout and reaped waiter appends one row to
 ``slots/events.jsonl``: epoch, kind, label, pid, wait and hold milliseconds, the
 outcome and the test file paths of the command (never an environment value).
+The pytest result cache (``agentq/pyplugin/agentq_pytest_cache.py``) appends its own
+rows to the same file with ``cache=hit|miss`` and no slot, so ``history`` counts them
+as ``cache_hits`` / ``cache_misses``.
 ``history`` aggregates those rows per label and ``status_hint`` turns the last
 hour into one line for ``agentq status``. The file is jsonl rather than a table
 in ``agentq.db`` because this module is loaded by file path in arbitrary
@@ -469,9 +472,10 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
     """Per-label slot totals over the last ``since_s`` seconds.
 
     Each label gets ``runs`` (acquires), ``timeouts``, ``reaped``, total ``hold_ms`` and
-    ``wait_ms``, their p50 and p95, and ``reruns``: an acquire whose test paths are identical to
+    ``wait_ms``, their p50 and p95, ``reruns``: an acquire whose test paths are identical to
     a run of the same label that is still holding, so the same command ran twice with no release
-    in between. ``totals`` sums the labels.
+    in between, and ``cache_hits`` / ``cache_misses``: the pytest result cache's decisions
+    (``agentq/pyplugin/agentq_pytest_cache.py``), which take no slot. ``totals`` sums the labels.
     """
     since = (time.time() if now is None else now) - max(0.0, float(since_s))
     labels: dict[str, dict] = {}
@@ -482,7 +486,11 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
         label = row.get("label") or "-"
         entry = labels.setdefault(label, {"label": label, "runs": 0, "timeouts": 0, "reaped": 0,
                                           "hold_ms": 0.0, "wait_ms": 0.0,
+                                          "cache_hits": 0, "cache_misses": 0,
                                           "holds": [], "waits": []})
+        cache = row.get("cache")
+        if cache in ("hit", "miss"):
+            entry["cache_hits" if cache == "hit" else "cache_misses"] += 1
         outcome = row.get("outcome")
         argv = row.get("argv") or ""
         if outcome == "acquired":
@@ -526,6 +534,8 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
               "timeouts": sum(entry["timeouts"] for entry in entries),
               "reaped": sum(entry["reaped"] for entry in entries),
               "reruns": sum(entry["reruns"] for entry in entries),
+              "cache_hits": sum(entry["cache_hits"] for entry in entries),
+              "cache_misses": sum(entry["cache_misses"] for entry in entries),
               "hold_ms": sum(entry["hold_ms"] for entry in entries),
               "wait_ms": sum(entry["wait_ms"] for entry in entries),
               "hold_p50_ms": percentile(all_holds, 50),
@@ -541,11 +551,13 @@ def format_history(report: dict) -> str:
     if not report["labels"]:
         lines.append("no slot events in the window")
         return "\n".join(lines)
-    lines.append(f"{'label':<28} {'runs':>4} {'hold':>8} {'wait':>8} {'p50':>7} {'p95':>7} {'reruns':>6}")
+    lines.append(f"{'label':<28} {'runs':>4} {'hold':>8} {'wait':>8} {'p50':>7} {'p95':>7} "
+                 f"{'reruns':>6} {'hit':>4} {'miss':>4}")
     for entry in [*report["labels"], dict(report["totals"], label="total")]:
         lines.append(f"{entry['label'][:28]:<28} {entry['runs']:>4} {format_ms(entry['hold_ms']):>8} "
                      f"{format_ms(entry['wait_ms']):>8} {format_ms(entry['wait_p50_ms']):>7} "
-                     f"{format_ms(entry['wait_p95_ms']):>7} {entry['reruns']:>6}")
+                     f"{format_ms(entry['wait_p95_ms']):>7} {entry['reruns']:>6} "
+                     f"{entry['cache_hits']:>4} {entry['cache_misses']:>4}")
     return "\n".join(lines)
 
 
