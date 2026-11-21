@@ -48,6 +48,10 @@ if [ -f "$PLIST" ]; then
         old_data=$(sed -n 's|.*<string>-storageDataPath=\([^<]*\)</string>.*|\1|p' "$PLIST" | head -n 1)
         if [ -n "$old_data" ]; then DATA="$old_data"; fi
     fi
+    if [ -z "${VLOGS_MIN_FREE+set}" ]; then
+        old_free=$(sed -n 's|.*<string>-storage\.minFreeDiskSpaceBytes=\([^<]*\)</string>.*|\1|p' "$PLIST" | head -n 1)
+        if [ -n "$old_free" ]; then MIN_FREE="$old_free"; fi
+    fi
 fi
 LOG="$HOME_DIR/server.log"
 VERSION_FILE="$HOME_DIR/VERSION"

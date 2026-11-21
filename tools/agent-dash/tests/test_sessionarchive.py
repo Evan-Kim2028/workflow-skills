@@ -1299,7 +1299,14 @@ class ReviewRegressionTest(Base):
         self.assertGreaterEqual(stats["stripped_bytes"], len(image))
         # The tar keeps the original bytes: the lossless copy is unchanged.
         raw = subprocess.run(
-            ["zstd", "-d", "-q", "-c", str(self.home / "a.tar.zst")],
+            [
+                "zstd",
+                "-d",
+                sa.ZSTD_LONG,
+                "-q",
+                "-c",
+                str(self.home / "a.tar.zst"),
+            ],
             check=True,
             stdout=subprocess.PIPE,
         ).stdout

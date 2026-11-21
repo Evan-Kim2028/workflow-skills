@@ -42,6 +42,11 @@ python3 agent_dash.py logs rebuild-store \
   grew after it was packed is archived again with a higher `rev`, and the
   store keeps both, because `rev` is part of its dedupe key), every
   log-archive `.zst`, and the agentq job entries.
+- Reads the whole manifest, including the records `logs sessions manifest
+  compact` rolled into `manifest-segments/*.jsonl.zst`. Compaction moves
+  records, it does not drop them, so the rebuild still sees units whose
+  tail record has aged out; reading only `manifest.jsonl` would silently
+  skip them.
 - Decompresses a member whose file is packed (`.jsonl.zst`, `.log.gz`): the
   tar holds the file's bytes losslessly, so reading the frame as text would
   write a couple of garbage rows instead of the real ones.
