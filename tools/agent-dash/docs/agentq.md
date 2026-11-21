@@ -289,7 +289,11 @@ instead of letting it swing between idle and burst.
   AGENTS.md text that no longer matches the code), `risk` (security issues and expensive
   patterns such as unbounded scans of large tables). A target and kind pair is due when
   it has never run or the target changed since that kind last ran. Due pairs rotate
-  across targets, and the kind that ran longest ago goes first. Reports go to
+  across targets, and the kind that ran longest ago goes first. `docs` is the exception:
+  it is due at most once per 7 days per target, and only when the target changed since
+  the last docs audit, because docstring drift is the least actionable class (55 % of
+  high and medium docs findings still pointed at byte-identical code a week later). When
+  `tests` and `docs` are both due, `tests` goes first. Reports go to
   `<report_dir>/filler/<repo>/<kind>/<module-slug>.md`.
 - PR reviews. Each merged PR into `main` in the last `pr_window_h` hours, for a repo with
   a `github` slug, gets one `pr` review job, checking what the merge introduced and
@@ -308,6 +312,16 @@ instead of letting it swing between idle and burst.
   retained window. Each finding is one
   bullet, ``- **high** `file:line` — title``, and a finding whose file:line and title are
   already in the index is skipped.
+- Reading the findings. `agentq filler findings [--repo R] [--severity high] [--path FILE]
+  [--limit N] [--json]` lists the newest findings of that severity, deduplicated by
+  file:line and title, each with its report path and whether the cited line is still
+  identical at `origin/main` (`same`), differs (`changed`), or is gone (`gone`). The
+  dashboard's "Filler findings" card shows the newest eight high ones. The line check
+  reads the report's `- commit:` (or a PR review's merge commit) and compares that line
+  with the same line at `origin/main`; answers are cached per commit in
+  `$AGENTQ_HOME/filler-findings-cache.json`, because a commit's content never changes.
+  `same` is the only status that means the finding is still open; `changed` is an upper
+  bound on fixed (an unrelated commit can move a line).
 - Briefs are output-lean. Every audit and PR-review brief asks for at most 10 findings,
   most severe first, each on one line (severity, `file:line`, title, and one sentence of
   why), a report under 60 lines, no code block longer than 5 lines, and no restating of the
@@ -431,7 +445,15 @@ high, xhigh or max). Unset means pi's own default, which real work keeps unless 
     old rule that a `saturated` proxy holds backlog jobs.
 - A held job records why it waits in `jobs.detail` (for example
   `hold tests: memory free 31% < 35%`). `logs/broker.log` gets one line each time
-  that reason changes.
+  that reason changes. A job the launch loop never reaches because
+  `MAX_CONCURRENT_LAUNCHES` (8) launches are already in flight gets
+  `hold launch-cap: 8 launches in flight`, so a job skipped by the cap shows in the log
+  and the dashboard instead of looking like a job with no hold at all.
+- Queue wait is the first `started` event minus `submitted_at`, not `jobs.started_at`
+  minus it: a requeue after a death or a stall overwrites `started_at`, so a job that
+  ran for an hour and was requeued would otherwise count its second start as queue
+  wait. `agentq status` prints p50, p90, p99 and max over the last 48 hours, and the
+  dashboard's "Jobs queued" tile shows the same figures.
 - Auto worktrees: a `write` job whose workspace is the main checkout of a git
   repo (with an `origin` remote) gets its own worktree when it launches, not when
   it is submitted. The worktree is `<root>/<repo>/agentq-<job id>` on a new branch

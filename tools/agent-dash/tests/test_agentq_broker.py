@@ -172,6 +172,13 @@ class InlinePool:
         return future
 
 
+class PendingPool:
+    """Never finishes a launch, so the broker's in-flight count stays at the launch cap across ticks."""
+
+    def submit(self, fn, *args):
+        return concurrent.futures.Future()
+
+
 def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None, slot_state=None,
                 disk_free=None):
     """A broker over ``home`` with every outside reading stubbed.
@@ -1285,6 +1292,30 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         status["doc"] = proxy_doc(total=0)
         self.assertEqual(broker.tick(), [job])
         self.assertIsNone(row(self.home, job)["detail"])
+
+    def test_jobs_past_the_launch_cap_get_a_hold_line_instead_of_vanishing(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, label=f"c{i}") for i in range(B.MAX_CONCURRENT_LAUNCHES + 2)]
+        broker = self.broker(clock=Clock(1000.0))
+        self.assertEqual(broker.tick(), jobs[:B.MAX_CONCURRENT_LAUNCHES])
+        skipped = jobs[B.MAX_CONCURRENT_LAUNCHES:]
+        for job in skipped:
+            self.assertEqual(row(self.home, job)["state"], "queued")
+            self.assertEqual(row(self.home, job)["detail"],
+                             f"hold launch-cap: {B.MAX_CONCURRENT_LAUNCHES} launches in flight")
+        log_path = self.home / "logs" / "broker.log"
+        self.assertEqual(log_path.read_text().count("hold launch-cap"), len(skipped))
+
+    def test_the_launch_cap_hold_is_logged_once_per_job_not_every_tick(self):
+        write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})
+        jobs = [submit(self.env, self.prompt, label=f"c{i}") for i in range(B.MAX_CONCURRENT_LAUNCHES + 1)]
+        broker = make_broker(self.home, self.fake(live_s=30), clock=Clock(1000.0), launch_pool=PendingPool())
+        broker.tick()
+        broker.tick()
+        log_path = self.home / "logs" / "broker.log"
+        self.assertEqual(log_path.read_text().count("hold launch-cap"), 1)
+        self.assertEqual(row(self.home, jobs[-1])["detail"],
+                         f"hold launch-cap: {B.MAX_CONCURRENT_LAUNCHES} launches in flight")
 
     def test_hold_logs_once_while_the_cpu_reading_moves(self):
         write_config(self.home, slots={"light": 40, "tests": 10, "ssh": 8})

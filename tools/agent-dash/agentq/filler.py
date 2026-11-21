@@ -72,6 +72,10 @@ DEFAULT_MAX_RUNTIME_S = 900.0
 DEFAULT_MAX_TARGET_LINES = 4000
 DEFAULT_MIN_TARGET_LINES = 300
 DEFAULT_PR_WINDOW_H = 48.0
+#: A docs audit runs at most this often per target, and only when the target changed since the last docs audit.
+#: Docstring drift is the least actionable finding class (55 % of high+medium docs findings still pointed at
+#: byte-identical code a week later), so it is the one kind that is not re-run on every commit.
+DOCS_MIN_INTERVAL_S = 7 * 86400.0
 PR_REFRESH_S = 1800.0
 MAX_PR_WINDOW_H = 720.0
 REFRESH_BACKOFF_MIN_S = 60.0
@@ -187,6 +191,11 @@ def label_fits(label: str) -> bool:
     return db.LAUNCH_LABEL_RE.fullmatch(label or "") is not None
 
 
+def repo_short(repo: str) -> str:
+    """The repo's short name in a filler label: lowercase letters, digits and dashes, at most REPO_SHORT_MAX."""
+    return _short(repo, REPO_SHORT_MAX)
+
+
 def label_slug(target: Target, kind: str = "bugs") -> str:
     """The slug passed to ``label make`` for an audit: ``backlog-filler-<kind>-<repo-short>-<readable>-<hash>``.
 
@@ -194,7 +203,7 @@ def label_slug(target: Target, kind: str = "bugs") -> str:
     the module's readable part takes the rest of the room; the hash of the full path (the same one the report path uses)
     keeps two modules apart even when their readable parts are cut to the same text.
     """
-    head = f"{LABEL_SLUG}-{kind}-{_short(target.repo, REPO_SHORT_MAX)}-"
+    head = f"{LABEL_SLUG}-{kind}-{repo_short(target.repo)}-"
     digest = _digest(target.module)
     room = db.LAUNCH_LABEL_MAX - len(LABEL_PREFIX) - len(head) - len(digest) - 1
     readable = _short(target.module, room) if room > 0 else ""
@@ -526,9 +535,15 @@ def _audit_row(conn, target_key: str, kind: str) -> dict | None:
     return dict(row) if row else None
 
 
-def due_kinds(conn, target: Target, kinds, head: str) -> list[str]:
+def due_kinds(conn, target: Target, kinds, head: str, now: float | None = None) -> list[str]:
     """The kinds due for one target at ``head``: never run, or the target changed since that kind last ran. Kinds
-    that ran longest ago come first (never-run kinds in configured order), and a kind with an open job is left out."""
+    that ran longest ago come first (never-run kinds in configured order), and a kind with an open job is left out.
+
+    ``docs`` is due at most once per ``DOCS_MIN_INTERVAL_S`` and only when the target changed since the last docs
+    audit, so a busy module is not re-documented on every commit. When ``tests`` and ``docs`` are both due, tests
+    come first: they are the cheapest high-yield kind, and a docs pass is the one that can wait a week.
+    """
+    now = time.time() if now is None else now
     due = []
     for position, kind in enumerate(kinds):
         row = _audit_row(conn, target.key, kind)
@@ -537,8 +552,14 @@ def due_kinds(conn, target: Target, kinds, head: str) -> list[str]:
             continue
         if _open(conn, row["last_job"]) or row["last_commit"] == head:
             continue
+        if kind == "docs" and now - (row["last_submitted"] or 0.0) < DOCS_MIN_INTERVAL_S:
+            continue
         due.append((row["last_submitted"] or 0.0, position, kind))
-    return [kind for _, _, kind in sorted(due)]
+    ordered = [kind for _, _, kind in sorted(due)]
+    if "tests" in ordered and "docs" in ordered:
+        ordered.remove("docs")
+        ordered.insert(ordered.index("tests") + 1, "docs")
+    return ordered
 
 
 def _pr_reviewed(conn, repo: str, number: int) -> bool:
@@ -552,7 +573,7 @@ def pr_work(candidate: dict) -> Work:
     return Work(
         kind="pr", repo=repo, workspace=candidate["workspace"], module="", commit=candidate.get("merge_commit", ""),
         report_path=str(Path(candidate["report_dir"]) / "filler" / repo / "pr" / f"{number}.md"),
-        slug=f"{LABEL_SLUG}-pr-{_short(repo, REPO_SHORT_MAX)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
+        slug=f"{LABEL_SLUG}-pr-{repo_short(repo)}-{number}", key=f"pr:{repo}#{number}", pr_number=number,
         pr_title=candidate.get("title", ""), pr_url=candidate.get("url", ""), pr_slug=candidate.get("slug", ""),
         report_dir=candidate["report_dir"],
     )
@@ -567,7 +588,7 @@ def audit_work(target: Target, kind: str, head: str) -> Work:
 
 
 def due_works(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_head, prs=(),
-              count: int = 1) -> list[Work]:
+              count: int = 1, now: float | None = None) -> list[Work]:
     """The filler jobs to submit now, at most ``count``, from one priority-ordered due list.
 
     Unreviewed merged PRs come first, newest first. Then target and kind pairs: targets rotate from the saved
@@ -606,7 +627,7 @@ def due_works(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_h
             head = heads[target.key]
             if head is None:
                 continue
-            due = [kind for kind in due_kinds(conn, target, kinds, head) if (target.key, kind) not in chosen]
+            due = [kind for kind in due_kinds(conn, target, kinds, head, now) if (target.key, kind) not in chosen]
             if due:
                 chosen.add((target.key, due[0]))
                 works.append(audit_work(target, due[0], head))
@@ -614,9 +635,10 @@ def due_works(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_h
     return works
 
 
-def next_work(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_head, prs=()) -> Work | None:
+def next_work(conn, targets: list[Target], kinds=DEFAULT_KINDS, head_of=module_head, prs=(),
+              now: float | None = None) -> Work | None:
     """The single next job to submit (see ``due_works``), or None when nothing is due."""
-    found = due_works(conn, targets, kinds=kinds, head_of=head_of, prs=prs, count=1)
+    found = due_works(conn, targets, kinds=kinds, head_of=head_of, prs=prs, count=1, now=now)
     return found[0] if found else None
 
 
@@ -1019,7 +1041,7 @@ def main(argv=None, out=None, run_pr=pr_source.merged_prs, now=None, head_of=Non
         for target in settings.targets:
             head = head_lookup(target)
             if head is not None:
-                pairs.extend((target.key, kind) for kind in due_kinds(conn, target, settings.kinds, head))
+                pairs.extend((target.key, kind) for kind in due_kinds(conn, target, settings.kinds, head, now))
         prs_due, pr_errors = [], []
         window_start = now - settings.pr_window_h * 3600
         for repo in settings.pr_repos:
