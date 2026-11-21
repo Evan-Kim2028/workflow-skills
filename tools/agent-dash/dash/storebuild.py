@@ -59,7 +59,7 @@ ARCHIVE_LABEL = "com.agent-dash.session-archive"
 #: installer writes, including the free-disk floor: a full disk makes the
 #: store read-only and loud instead of failing inserts silently.
 BASE_FLAGS = (
-    "-retentionPeriod=100y",
+    "-retentionPeriod=90d",
     "-memory.allowedBytes=1GiB",
     "-insert.maxLineSizeBytes=8MiB",
     "-storage.minFreeDiskSpaceBytes=20GiB",

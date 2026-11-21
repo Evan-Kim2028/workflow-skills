@@ -250,7 +250,7 @@ class VlogsInstallerTest(unittest.TestCase):
     def test_fresh_install_keeps_history_and_floors_free_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
             text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MIN_FREE"))
-            self.assertIn("<string>-retentionPeriod=100y</string>", text)
+            self.assertIn("<string>-retentionPeriod=90d</string>", text)
             self.assertIn("<string>-storage.minFreeDiskSpaceBytes=20GiB</string>", text)
             # No disk-usage cap: it would evict old partitions.
             self.assertNotIn("maxDiskSpaceUsageBytes", text)
@@ -285,7 +285,7 @@ class VlogsInstallerTest(unittest.TestCase):
             )
             text = self._install(tmp, seed_plist=old, unset=("VLOGS_DATA",))
             self.assertNotIn("maxDiskSpaceUsageBytes", text)
-            self.assertIn("<string>-retentionPeriod=100y</string>", text)
+            self.assertIn("<string>-retentionPeriod=90d</string>", text)
             self.assertIn("<string>-storage.minFreeDiskSpaceBytes=20GiB</string>", text)
 
 

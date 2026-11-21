@@ -18,9 +18,12 @@
 #   VLOGS_PLIST_DIR  launch agents dir      (default ~/Library/LaunchAgents)
 #   VLOGS_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
 #
-# Retention is 100y and there is no disk-usage cap: logs are historical data
-# kept with maximum retention, so the store never drops an old partition. A
-# full disk makes it read-only (loudly) rather than evicting history.
+# The store is a search index over the lossless archives (session archive and
+# log archive), which keep every log forever. The index keeps the last 90 days
+# (owner decision, 2026-11-21); older months are re-loaded on demand with
+# `agent_dash.py logs rebuild-store`. There is no disk-usage cap: a full disk
+# makes the store read-only (loudly) rather than evicting partitions early.
+#   VLOGS_RETENTION  index retention        (default 90d)
 
 set -eu
 
@@ -37,6 +40,7 @@ DATA="${VLOGS_DATA-$HOME_DIR/data}"
 # A free-disk floor, not a retention cap: below it the store refuses writes
 # and says so, instead of silently dropping old partitions.
 MIN_FREE="${VLOGS_MIN_FREE-20GiB}"
+RETENTION="${VLOGS_RETENTION-90d}"
 
 # An update must not silently move the store: when VLOGS_DATA is unset, keep
 # the value the currently installed plist already runs with. A fresh install
@@ -145,7 +149,7 @@ cat > "$PLIST.tmp" <<EOF
         <string>$BIN</string>
         <string>-httpListenAddr=127.0.0.1:$PORT</string>
         <string>-storageDataPath=$DATA</string>
-        <string>-retentionPeriod=100y</string>
+        <string>-retentionPeriod=$RETENTION</string>
         <string>-storage.minFreeDiskSpaceBytes=$MIN_FREE</string>
         <string>-memory.allowedBytes=1GiB</string>
         <string>-insert.maxLineSizeBytes=8MiB</string>
