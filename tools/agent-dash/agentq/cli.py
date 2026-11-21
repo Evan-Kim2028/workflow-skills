@@ -1,7 +1,7 @@
 """agentq command line.
 
-Commands: submit, wait, escalate, ls, result, cancel, daemon, status, slots, gc
-and backlog (add, ls, rm, pause, resume). Every
+Commands: submit, wait, escalate, ls, result, cancel, daemon, status, slots, gc,
+verdicts (backfill) and backlog (add, ls, rm, pause, resume). Every
 command prints its output and ends with one ``ANSWER:`` line. Exit codes:
 0 ok, 1 negative fact (unknown job, nothing to escalate, a failed job), 3
 timeout or the store unreachable.
@@ -10,6 +10,7 @@ timeout or the store unreachable.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import shutil
@@ -28,6 +29,7 @@ from agentq import gc as gc_lib
 from agentq import janitor as janitor_lib
 from agentq import slots as slots_lib
 from agentq import thinking_report as thinking_lib
+from agentq import verdict as verdict_lib
 
 HARNESS_VARS = (
     ("CLAUDE_CODE_SESSION_ID", "claude"),
@@ -230,8 +232,16 @@ def cmd_ls(args, ctx: Context) -> int:
     else:
         for job in jobs:
             worktree = f" {broker_lib.worktree_note(job)}" if job["orig_workspace"] else ""
-            ctx.print(f"{job['id']} {job['state']:<9} {job['lane']:<7} {job['tier']:<20} {job['label']} {job['verdict'] or '-'}{worktree}")
+            note = _no_verdict_note(job)
+            ctx.print(f"{job['id']} {job['state']:<9} {job['lane']:<7} {job['tier']:<20} {job['label']} {job['verdict'] or '-'}{note}{worktree}")
     return answer(ctx, f"{len(jobs)} job(s)", 0)
+
+
+def _no_verdict_note(job: dict) -> str:
+    """`` [detail]`` for a finished job with no verdict, so a silent ``none`` says why; empty otherwise."""
+    if job["state"] not in db.TERMINAL_STATES or verdict_lib.has_verdict(job["verdict"]):
+        return ""
+    return f" [{job['detail']}]" if job["detail"] else ""
 
 
 def cmd_result(args, ctx: Context) -> int:
@@ -241,11 +251,13 @@ def cmd_result(args, ctx: Context) -> int:
     if job["state"] not in db.TERMINAL_STATES:
         return answer(ctx, f"{args.id} is {job['state']}; no result yet", 1)
     ctx.print(f"{job['id']} {job['verdict'] or 'none'} {job['report_path'] or '-'}")
+    if job["detail"]:
+        ctx.print(f"detail: {job['detail']}")
     if job["orig_workspace"]:
         ctx.print(f"{broker_lib.worktree_note(job)} (from {job['orig_workspace']})")
     if args.print and job["report_path"]:
         ctx.print(Path(job["report_path"]).read_text(encoding="utf-8"))
-    ok = job["state"] == "done" and (job["verdict"] or "").strip().lower() not in ("", "none")
+    ok = job["state"] == "done" and verdict_lib.has_verdict(job["verdict"])
     return answer(ctx, f"{args.id} {job['state']}, verdict {job['verdict'] or 'none'}", 0 if ok else 1)
 
 
@@ -292,6 +304,67 @@ def cmd_gc(args, ctx: Context) -> int:
         + (f", {len(skipped)} job(s)/run folder(s) skipped" if skipped else ""),
         1 if errors else 0,
     )
+
+
+def cmd_verdicts_backfill(args, ctx: Context) -> int:
+    """Re-parse report.md of finished jobs whose verdict is none/NULL. Dry run unless --apply."""
+    conn = db.connect(ctx.home)
+    jobs = db.select_jobs(
+        conn,
+        "state IN (?, ?) AND (verdict IS NULL OR verdict = 'none')",
+        ("done", "failed"),
+    )
+    if args.limit:
+        jobs = jobs[: args.limit]
+    changes, unreadable, still_none = [], 0, 0
+    for job in jobs:
+        text = _report_text(job, ctx.home)
+        if text is None:
+            unreadable += 1
+            continue
+        found = verdict_lib.verdict_of(text)
+        if found is None:
+            still_none += 1
+            continue
+        changes.append((job, found))
+    for job, found in changes:
+        ctx.print(f"{job['id']} {job['kind']:<6} {job['verdict'] or 'none'} -> {found}")
+    counts = collections.Counter(found for _, found in changes)
+    for found, n in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        ctx.print(f"  {found}: {n}")
+    summary = (
+        f"{len(changes)} of {len(jobs)} job(s) would gain a verdict"
+        f" ({still_none} report(s) still have no verdict line, {unreadable} unreadable)"
+    )
+    if not args.apply:
+        ctx.print("dry run: nothing written (add --apply to write these verdicts)")
+        return answer(ctx, summary, 0)
+    written = 0
+    for job, found in changes:
+        detail = _backfilled_detail(job["detail"], found)
+        if db.transition(conn, job["id"], db.TERMINAL_STATES, ctx.now(), "verdict-backfill", detail,
+                         verdict=found, detail=detail):
+            written += 1
+    return answer(ctx, f"wrote {written} verdict(s); {summary}", 0)
+
+
+def _report_text(job: dict, home) -> str | None:
+    """The job's report text: its recorded ``report_path``, else ``jobs/<id>/report.md``; None when neither reads."""
+    for path in (job["report_path"], str(db.job_dir(home, job["id"]) / "report.md")):
+        if not path:
+            continue
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return None
+
+
+def _backfilled_detail(detail: str | None, verdict: str) -> str:
+    """The job detail with its ``verdict ...`` clause replaced and the no-verdict note dropped."""
+    parts = [part.strip() for part in (detail or "").split(";") if part.strip()]
+    kept = [part for part in parts if part != broker_lib.NO_VERDICT_DETAIL and not part.startswith("verdict ")]
+    return "; ".join([f"verdict {verdict}", *kept])
 
 
 def cmd_daemon(args, ctx: Context) -> int:
@@ -563,6 +636,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="keep runs that finished within this window: 30m, 12h, 7d (default 7d)")
     p.add_argument("--apply", action="store_true", help="remove the files; without it, only report")
     p.set_defaults(func=cmd_gc)
+
+    p = sub.add_parser("verdicts", help="re-parse report.md of finished jobs whose verdict is none (dry run unless --apply)")
+    vsub = p.add_subparsers(dest="verdicts_cmd", required=True)
+    b = vsub.add_parser("backfill", help="fill in the verdict each finished report names")
+    b.add_argument("--apply", action="store_true", help="write the verdicts; without it, only report")
+    b.add_argument("--limit", type=int, default=0, metavar="N", help="stop after N jobs (default: all)")
+    b.set_defaults(func=cmd_verdicts_backfill)
 
     p = sub.add_parser("backlog", help="recurring low-priority jobs that fill idle Morph capacity")
     bsub = p.add_subparsers(dest="backlog_cmd", required=True)

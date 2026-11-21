@@ -809,13 +809,16 @@ class ReviewFixTests(ProcessCleanup):
         self.assertEqual(job["state"], "failed")
         self.assertIn("stalled", job["detail"])
 
-    def test_13_verdict_is_the_last_verdict_line(self):
+    def test_13_verdict_is_the_first_verdict_line(self):
         cases = {
             "PASS (no BLOCKED items)": "PASS",
-            "Summary\nPARTIAL\n\nverdict: BLOCKED": "BLOCKED",
+            "Summary\nPARTIAL\n\nverdict: BLOCKED": "PARTIAL",
             "verdict - pass\nall fine": "PASS",
             "no verdict here PASS": "none",
-            "BLOCKED by upstream\n\nPASS": "PASS",
+            "BLOCKED by upstream\n\nPASS": "BLOCKED",
+            "PASS\n\n- BLOCKED: the pyright slot was full": "PASS",
+            "**Verdict: REQUEST_CHANGES.** The direction is sound": "REQUEST_CHANGES",
+            "**VERDICT: APPROVE_WITH_CHANGES**": "APPROVE_WITH_CHANGES",
         }
         for text, expected in cases.items():
             self.assertEqual(B.verdict_of(text), expected, text)
@@ -932,6 +935,22 @@ class PiErrorDeathTests(ProcessCleanup):
         ])
         job = self.ended(job_id, run_dir, "long")
         self.assertEqual((job["state"], job["verdict"]), ("done", "none"))
+        self.assertIn("no verdict line in report", job["detail"])
+
+    def test_a_review_report_keeps_its_review_word(self):
+        job_id = submit(self.env, self.prompt, "--kind", "review", label="rev")
+        run_dir = self.tmp / "run-rev"
+        self.report(run_dir, "rev", "**Verdict: REQUEST_CHANGES.** The direction is sound.\n")
+        self.stream(run_dir, "rev", [
+            {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+            {"type": "agent_end", "willRetry": False},
+        ])
+        job = self.ended(job_id, run_dir, "rev")
+        self.assertEqual((job["state"], job["verdict"]), ("done", "REQUEST_CHANGES"))
+        self.assertNotIn("no verdict line in report", job["detail"] or "")
+        code, out = run_cli(self.env, ["result", job_id])
+        self.assertEqual(code, 0, out)
+        self.assertIn("REQUEST_CHANGES", out)
 
     def test_tiny_report_without_a_stream_is_a_death(self):
         job_id = submit(self.env, self.prompt, label="tiny")
@@ -967,9 +986,64 @@ class PiErrorDeathTests(ProcessCleanup):
         conn = db.connect(self.home)
         make_broker(self.home, self.fake())._worker_ended(conn, db.get_job(conn, job_id), time.time())
         self.assertEqual(row(self.home, job_id)["verdict"], "none")
+        self.assertIn("no verdict line in report", row(self.home, job_id)["detail"])
         code, out = run_cli(self.env, ["result", job_id])
         self.assertEqual(code, 1, out)
         self.assertIn("verdict none", out)
+        self.assertIn("detail: verdict none; no verdict line in report", out)
+        code, out = run_cli(self.env, ["ls"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("[verdict none; no verdict line in report]", out)
+
+
+class VerdictBackfillTests(ProcessCleanup):
+    def finished_without_verdict(self, label, report, kind="read"):
+        """A done job whose row says ``none`` and whose report.md holds ``report``."""
+        job_id = submit(self.env, self.prompt, "--kind", kind, label=label)
+        path = self.tmp / f"report-{label}.md"
+        path.write_text(report, encoding="utf-8")
+        conn = db.connect(self.home)
+        db.transition(
+            conn, job_id, B.ALL_STATES, time.time(), "finish", "verdict none; no verdict line in report",
+            state="done", verdict="none", report_path=str(path), finished_at=time.time(),
+        )  # fmt: skip
+        return job_id
+
+    def test_dry_run_reports_the_new_verdicts_and_writes_nothing(self):
+        review = self.finished_without_verdict(
+            "rev", "**Verdict: REQUEST_CHANGES.** The direction is sound.\n", kind="review"
+        )
+        silent = self.finished_without_verdict("silent", "I read the files and changed nothing.\n")
+        code, out = run_cli(self.env, ["verdicts", "backfill"])
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"{review} review none -> REQUEST_CHANGES", out)
+        self.assertIn("REQUEST_CHANGES: 1", out)
+        self.assertIn("1 of 2 job(s) would gain a verdict", out)
+        self.assertIn("1 report(s) still have no verdict line", out)
+        self.assertIn("dry run", out)
+        self.assertEqual(row(self.home, review)["verdict"], "none")
+        self.assertEqual(row(self.home, silent)["verdict"], "none")
+
+    def test_apply_writes_the_verdict_and_its_detail(self):
+        job_id = self.finished_without_verdict("appr", "**VERDICT: APPROVE_WITH_CHANGES**\n\nOne defect.\n")
+        code, out = run_cli(self.env, ["verdicts", "backfill", "--apply"])
+        self.assertEqual(code, 0, out)
+        job = row(self.home, job_id)
+        self.assertEqual(job["verdict"], "APPROVE_WITH_CHANGES")
+        self.assertEqual(job["detail"], "verdict APPROVE_WITH_CHANGES")
+        kinds = [e["kind"] for e in db.connect(self.home).execute(
+            "SELECT kind FROM events WHERE job_id = ?", (job_id,)).fetchall()]  # fmt: skip
+        self.assertIn("verdict-backfill", kinds)
+        code, out = run_cli(self.env, ["result", job_id])
+        self.assertEqual(code, 0, out)
+        self.assertIn("APPROVE_WITH_CHANGES", out)
+
+    def test_limit_stops_after_n_jobs(self):
+        self.finished_without_verdict("one", "PASS\nall green\n")
+        self.finished_without_verdict("two", "PASS\nall green\n")
+        code, out = run_cli(self.env, ["verdicts", "backfill", "--limit", "1"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 of 1 job(s) would gain a verdict", out)
 
 
 class AdaptiveAdmissionTests(ProcessCleanup):

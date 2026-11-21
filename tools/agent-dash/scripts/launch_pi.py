@@ -106,6 +106,7 @@ if str(ROOT) not in sys.path:
 
 from agentq import repetition_guard as repeat_guard  # noqa: E402
 from agentq import slots as agentq_slots  # noqa: E402
+from agentq import verdict as verdict_lib  # noqa: E402
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
@@ -255,13 +256,13 @@ def assistant_events(raw: bytes) -> list[dict]:
 
 
 def verdict_of(text: str) -> str:
-    """Worker verdict from the first line of the final text."""
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    first = lines[0].upper() if lines else ""
-    for word in ("BLOCKED", "PARTIAL", "PASS"):
-        if word in first:
-            return word
-    return "PARTIAL"
+    """Worker verdict from the first verdict line of the final text, else ``PARTIAL``.
+
+    The words and matching rules are ``agentq.verdict``'s, shared with the
+    broker: ``PASS``, ``PARTIAL``, ``BLOCKED``, and the review words
+    ``APPROVE``, ``APPROVE_WITH_CHANGES``, ``REQUEST_CHANGES``, ``REJECT``.
+    """
+    return verdict_lib.verdict_of(text) or "PARTIAL"
 
 
 def session_id_of(raw: bytes) -> str | None:

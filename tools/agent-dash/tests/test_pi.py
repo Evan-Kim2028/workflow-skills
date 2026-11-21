@@ -225,6 +225,11 @@ class LauncherHelperTest(unittest.TestCase):
         self.assertEqual(launch.verdict_of("BLOCKED: no key"), "BLOCKED")
         self.assertEqual(launch.verdict_of("nothing here"), "PARTIAL")
 
+    def test_verdict_keeps_a_review_word(self):
+        self.assertEqual(launch.verdict_of("**Verdict: REQUEST_CHANGES.** The direction is sound."), "REQUEST_CHANGES")
+        self.assertEqual(launch.verdict_of("**VERDICT: APPROVE_WITH_CHANGES**\n\nOne defect."), "APPROVE_WITH_CHANGES")
+        self.assertEqual(launch.verdict_of("APPROVE\nlooks right"), "APPROVE")
+
     def test_parent_session_of_prefers_pad_then_env(self):
         sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         pad = os.path.join(os.sep, "tmp", "claude-1000", "-x", sid, "scratchpad", "pi")

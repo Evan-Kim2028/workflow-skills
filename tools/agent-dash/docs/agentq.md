@@ -31,6 +31,7 @@ agentq backlog add NAME PROMPT_FILE --every 6h [--kind read|write|review]
               [--res light|tests|ssh] [--workspace PATH] [--tier T] [--max-runtime 2h]
 agentq backlog ls | rm NAME | pause NAME | resume NAME
 agentq gc [--runs-older-than 7d] [--apply]       # reclaim finished run streams
+agentq verdicts backfill [--apply] [--limit N]   # re-parse report.md of verdictless jobs
 agentq daemon                                    # the broker loop; launchd runs this
 ```
 
@@ -45,12 +46,48 @@ agentq daemon                                    # the broker loop; launchd runs
 - `--max-runtime` sets the job's wall-clock cap (default 21600 s, six hours).
 - `escalate` moves jobs to the `urgent` lane. A running job speeds up on its next
   request through the proxy. Each escalation is logged in `events` with the session.
-- `result ID` prints the report path and verdict; `--print` also cats the report.
+- `result ID` prints the report path and verdict, and the job detail when it has
+  one; `--print` also cats the report. `ls` shows the detail in brackets after a
+  finished job's verdict when the job has no verdict.
+- `verdicts backfill` re-parses `report.md` for every finished job whose verdict
+  is `none` or NULL and reports the verdict each report names, by new verdict.
+  It is a dry run unless `--apply` is given, and `--limit N` stops after N jobs.
+  A job that gains a verdict also gets its `detail` rewritten to `verdict <word>`.
+  See [Verdicts](#verdicts).
 - `cancel` drops a queued job, or sends SIGTERM to a running job's process group
   (stored pgid, checked against the stored process start time first).
 
 Typical use from a harness: `agentq submit prompt.md --kind review`, then
 `agentq wait <id>`. For "escalate this subagent work", run `agentq escalate`.
+
+## Verdicts
+
+A report opens with its verdict line, and `agentq/verdict.py` is the one parser
+for it: the broker, `scripts/launch_pi.py` and the dashboard all call it. The
+line may carry markdown emphasis, a `Verdict:` label and trailing prose, so
+`PASS`, `**PASS** (no BLOCKED items)`, `Verdict: PARTIAL` and
+`**Verdict: REQUEST_CHANGES.** The direction is sound ...` all read their word.
+Matching is case-insensitive and the first verdict-looking line wins: the
+contract puts the verdict first, and a later bullet that opens with `BLOCKED`
+quotes a sub-check, not the run.
+
+| job kind | verdict words |
+| --- | --- |
+| `read`, `write` | `PASS`, `PARTIAL`, `BLOCKED` |
+| `review` | `APPROVE`, `APPROVE_WITH_CHANGES` (`APPROVE_WITH_NITS` reads the same), `REQUEST_CHANGES`, `REJECT` |
+
+The word is stored verbatim in `jobs.verdict`. A report with no verdict line
+stores `none` and the job detail says `no verdict line in report`, so
+`agentq ls` and `agentq result` show it instead of a silent `none`. A failed
+job stores `DEAD`, which is a death, not a verdict. The vocabulary is also in
+the worker rules (`templates/worker-common.md`), with a separate line for
+review jobs.
+
+The dashboard's finished tile keeps its three buckets and folds the review
+words in: `APPROVE`, `APPROVE_WITH_CHANGES` and `APPROVE_WITH_NITS` count as
+`PASS`, `REQUEST_CHANGES` and `REJECT` as `PARTIAL`. `BLOCKED`, `DEAD` and
+`none` stay out of the totals, as before. `agentq result` exits 0 for any real
+verdict, review words included: a `REQUEST_CHANGES` review finished its job.
 
 ## Streams and disk
 
