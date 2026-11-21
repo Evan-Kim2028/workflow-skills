@@ -573,13 +573,34 @@ def _root_spellings(root, cwd):
     return sorted(spellings, key=len, reverse=True)
 
 
+AGENTQ_PLUGIN_OPT_RE = re.compile(r"-p\s*agentq_pytest_\w+")
+
+
+def _pytest_env_value(key, value):
+    """``PYTEST_ADDOPTS`` / ``PYTEST_PLUGINS`` without the parts that cannot change a result.
+
+    The agentq plugins themselves and a ``--basetemp`` value are dropped, so a worker that sets
+    ``PYTEST_ADDOPTS="--basetemp=..."`` keys the same as one that passes nothing.
+    """
+    if key == "PYTEST_ADDOPTS":
+        value = BASETEMP_RE.sub(" ", AGENTQ_PLUGIN_OPT_RE.sub(" ", value))
+        return " ".join(value.split())
+    if key == "PYTEST_PLUGINS":
+        return ",".join(part for part in (piece.strip() for piece in value.split(","))
+                        if part and not part.startswith("agentq_pytest_"))
+    return value
+
+
 def _env_material(environ, roots=()):
     """The whole environment, minus the volatile variables that cannot change a test."""
     picked = {}
     for key in sorted(environ):
         if key in ENV_SKIP or key.startswith(ENV_SKIP_PREFIXES):
             continue
-        picked[key] = _portable(environ[key], roots)
+        value = _pytest_env_value(key, environ[key])
+        if key in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS") and not value:
+            continue
+        picked[key] = _portable(value, roots)
     return picked
 
 
