@@ -449,11 +449,40 @@ def _run(command, env) -> int:
     return code if code >= 0 else 128 - code
 
 
+SLOT_PLUGIN = "agentq_pytest_slot"
+
+
+def plugin_takes_slot(environ) -> bool:
+    """True when the pytest the shim starts will load the slot plugin, which takes the slot itself.
+
+    The plugin takes its slot in ``pytest_configure``, after the result cache's
+    ``pytest_cmdline_main`` lookup, so a cache hit (or a wait on an identical run in flight)
+    never queues for a slot. The shim taking the slot first made every hit wait behind the cap.
+    The plugin loads when ``PYTEST_PLUGINS`` or ``PYTEST_ADDOPTS`` names it and a
+    ``PYTHONPATH`` folder holds it.
+    """
+    named = SLOT_PLUGIN in (environ.get("PYTEST_PLUGINS") or "").replace(" ", "").split(",") or \
+        f"-p {SLOT_PLUGIN}" in (environ.get("PYTEST_ADDOPTS") or "")
+    if not named:
+        return False
+    return any(part and os.path.isfile(os.path.join(part, SLOT_PLUGIN + ".py"))
+               for part in (environ.get("PYTHONPATH") or "").split(os.pathsep))
+
+
 def run_gated(kind: str, command, environ, home) -> int:
-    """Run ``command`` while holding a ``kind`` slot; pytest also runs under the memory cap."""
+    """Run ``command`` while holding a ``kind`` slot; pytest also runs under the memory cap.
+
+    A pytest whose slot plugin will load runs under the memory cap without a shim slot: the
+    plugin takes it after the result-cache lookup (see :func:`plugin_takes_slot`).
+    """
     held = _held_kinds(environ)
     if kind in held:
         return _run(command, _child_env(environ, held, None, capped=False))
+    if kind == "pytest" and plugin_takes_slot(environ):
+        capped = False
+        if not environ.get(MEMCAPPED_ENV):
+            command, capped = memcap_command(command, environ)
+        return _run(command, _child_env(environ, held, None, capped))
     limits = slots.load_limits(home)
     admit = None
     capped = False

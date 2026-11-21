@@ -194,9 +194,42 @@ class KeyTests(CacheBase):
         (self.repo / "sub").mkdir()
         self.assertNotEqual(self.key(cwd=self.repo / "sub")[0], before)
 
-    def test_a_second_repo_at_another_path_keys_differently(self):
+    def test_a_second_checkout_with_the_same_content_keys_the_same(self):
         other = make_repo(self.tmp / "other")
+        self.assertEqual(self.key(cwd=other)[0], self.key()[0])
+
+    def test_a_second_checkout_with_different_content_keys_differently(self):
+        other = make_repo(self.tmp / "other")
+        (other / "tests/helpers.py").write_text("def value():\n    return 2\n", encoding="utf-8")
         self.assertNotEqual(self.key(cwd=other)[0], self.key()[0])
+
+    def test_a_checkout_path_inside_an_env_value_does_not_split_the_key(self):
+        os.environ["VIRTUAL_ENV"] = str(self.repo / ".venv")
+        mine = self.key()[0]
+        other = make_repo(self.tmp / "other")
+        os.environ["VIRTUAL_ENV"] = str(other / ".venv")
+        self.assertEqual(self.key(cwd=other)[0], mine)
+
+    def test_a_basetemp_value_is_not_part_of_the_key(self):
+        before = self.key(("-q", "--basetemp=/tmp/pt/job-a", "tests/test_a.py"))[0]
+        os.environ["PYTEST_ADDOPTS"] = "--basetemp /tmp/pt/job-b"
+        after = self.key(("-q", "--basetemp=/tmp/pt/job-b", "tests/test_a.py"))[0]
+        os.environ.pop("PYTEST_ADDOPTS")
+        self.assertEqual(self.key(("-q", "--basetemp=/tmp/pt/job-c", "tests/test_a.py"))[0], before)
+        self.assertNotEqual(after, before)
+
+    def test_per_worker_scratch_and_session_variables_are_not_part_of_the_key(self):
+        before = self.key()[0]
+        for name in ("AGENT_SCRATCH", "PI_SESSION_FILE", "PI_SESSION_ID"):
+            os.environ[name] = "/per/worker/" + name
+        self.assertEqual(self.key()[0], before)
+        for name in ("AGENT_SCRATCH", "PI_SESSION_FILE", "PI_SESSION_ID"):
+            os.environ.pop(name)
+
+    def test_different_installed_packages_miss(self):
+        before = self.key()[0]
+        with mock.patch.object(plugin, "_installed", return_value="other-venv"):
+            self.assertNotEqual(self.key()[0], before)
 
     def test_a_missing_target_is_not_cached(self):
         key, why = self.key(("-q", "tests/test_missing.py"))
@@ -628,7 +661,7 @@ class RecordTests(CacheBase):
 class NeverFailsTests(CacheBase):
     def test_a_broken_key_logs_one_line_and_runs_pytest(self):
         err = io.StringIO()
-        with mock.patch.object(plugin, "_key_material", side_effect=RuntimeError("boom")):
+        with mock.patch.object(plugin, "_key_parts", side_effect=RuntimeError("boom")):
             with redirect_stderr(err):
                 code = plugin.pytest_cmdline_main(fake_config(("-q", "tests/test_a.py"), self.repo))
         self.assertIsNone(code)
@@ -676,6 +709,67 @@ class NeverFailsTests(CacheBase):
         plugin._prune(self.home)
 
 
+class TwinTests(CacheBase):
+    """An identical run in flight is waited on, not duplicated."""
+
+    def key_and_entry(self):
+        key = self.key()[0]
+        return key, plugin._entry_path(os.environ, key)
+
+    def test_no_claim_means_no_wait(self):
+        key, entry = self.key_and_entry()
+        self.assertIsNone(plugin._wait_for_twin(os.environ, key, entry))
+
+    def test_a_live_twin_that_records_a_pass_is_a_hit(self):
+        key, entry = self.key_and_entry()
+        lock = plugin._inflight_path(os.environ, key)
+        lock.parent.mkdir(parents=True)
+        lock.write_text(str(os.getppid()), encoding="utf-8")
+        ticks = iter(range(100))
+
+        def sleep(_):
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text("{}", encoding="utf-8")
+
+        waited = plugin._wait_for_twin(os.environ, key, entry, clock=lambda: next(ticks), sleep=sleep)
+        self.assertIsNotNone(waited)
+
+    def test_a_twin_that_exits_without_a_pass_ends_the_wait_without_a_hit(self):
+        key, entry = self.key_and_entry()
+        lock = plugin._inflight_path(os.environ, key)
+        lock.parent.mkdir(parents=True)
+        lock.write_text(str(os.getppid()), encoding="utf-8")
+        ticks = iter(range(100))
+        waited = plugin._wait_for_twin(os.environ, key, entry, clock=lambda: next(ticks),
+                                       sleep=lambda _: lock.unlink())
+        self.assertIsNone(waited)
+
+    def test_a_dead_owner_claim_is_taken_over(self):
+        key, _ = self.key_and_entry()
+        lock = plugin._inflight_path(os.environ, key)
+        lock.parent.mkdir(parents=True)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock.write_text(str(dead.pid), encoding="utf-8")
+        self.assertEqual(plugin._claim(os.environ, key), lock)
+        self.assertEqual(lock.read_text(encoding="utf-8"), str(os.getpid()))
+
+
+class ChangedTests(CacheBase):
+    """Each miss names the keyed inputs that moved since the same label ran the same argv."""
+
+    def changed(self):
+        parts, _ = plugin._key_parts(fake_config(("-q", "tests/test_a.py"), self.repo), os.environ)
+        return plugin._changed(os.environ, parts)
+
+    def test_first_then_same_then_the_moved_inputs(self):
+        self.assertEqual(self.changed(), ["first"])
+        self.assertEqual(self.changed(), ["same"])
+        (self.repo / "tests/helpers.py").write_text("def value():\n    return 1  \n", encoding="utf-8")
+        os.environ["FOO"] = "1"
+        self.assertEqual(self.changed(), ["tree", "env:FOO"])
+
+
 class EndToEndTests(CacheBase):
     """Real ``sys.executable -m pytest`` runs in the temp repo, the way a worker runs a venv.
 
@@ -683,7 +777,7 @@ class EndToEndTests(CacheBase):
     one method per story rather than one per assertion.
     """
 
-    def run_pytest(self, *args, env=None):
+    def run_pytest(self, *args, env=None, cwd=None):
         base = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.tmp),
@@ -694,7 +788,7 @@ class EndToEndTests(CacheBase):
         }
         base.update(env or {})
         return subprocess.run([sys.executable, "-m", "pytest", "-p", "agentq_pytest_cache", *args],
-                              cwd=str(self.repo), env=base, capture_output=True, text=True, timeout=300)
+                              cwd=str(cwd or self.repo), env=base, capture_output=True, text=True, timeout=300)
 
     def test_a_repeat_is_skipped_and_an_edit_runs_it_again(self):
         first = self.run_pytest("-q", "tests/test_a.py")
@@ -713,6 +807,17 @@ class EndToEndTests(CacheBase):
         self.assertNotIn("unchanged", third.stderr)
         rows = slots.read_events(self.home)
         self.assertEqual([row["cache"] for row in rows], ["miss", "hit", "miss"])
+        self.assertEqual([rows[0].get("changed"), rows[2].get("changed")], [["first"], ["tree"]])
+        self.assertEqual(list((self.home / "pytest-cache" / "inflight").glob("*")), [])
+
+    def test_a_pass_in_one_checkout_skips_the_same_run_in_another(self):
+        other = make_repo(self.tmp / "other")
+        first = self.run_pytest("-q", "tests/test_a.py", env={"VIRTUAL_ENV": str(self.repo / ".venv")})
+        self.assertIn("1 passed", first.stdout)
+        second = self.run_pytest("-q", "tests/test_a.py", cwd=other, env={"AGENTQ_RUN": "ws9-exec-other",
+                                                                          "VIRTUAL_ENV": str(other / ".venv")})
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("unchanged since a recorded pass", second.stderr)
 
     def test_a_data_file_edit_runs_the_test_again(self):
         """F1 end to end: the test reads a JSON file, and editing it must not be a hit."""
