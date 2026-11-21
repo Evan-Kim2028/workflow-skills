@@ -36,10 +36,13 @@ TERMINAL_STATES = ("done", "failed", "cancelled")
 AGING_S = 15 * 60
 #: The cap for a kind with no entry in ``DEFAULT_MAX_RUNTIME_S``.
 MAX_RUNTIME_S = 6 * 3600
-#: Per-kind wall-clock caps. A write job gets two hours, a read job 90 min, a review one hour: a job that
-#: outlives these is spinning, not working (2026-11-21: 20 jobs died at the old six-hour cap in 24 h).
-#: ``broker.json`` ``max_runtime`` overrides them per kind; ``--max-runtime`` on submit still wins.
-DEFAULT_MAX_RUNTIME_S = {"write": 7200, "read": 5400, "review": 3600}
+#: Per-kind wall-clock caps, set from a 48 h replay of finished jobs (2026-11-21). A write job keeps the
+#: six hours it had: 189 of 480 good write jobs ran past two hours, p99 353 min, and the long ones are
+#: workers waiting on a real training or gate run, so a two-hour cap would kill 39% of good work. Read and
+#: review jobs do finish quickly (p99 104 min and 105 min over 48 h, 53 min and 83 min over 7 days), so
+#: they get two hours. ``broker.json`` ``max_runtime`` overrides them per kind; ``--max-runtime`` on
+#: submit still wins.
+DEFAULT_MAX_RUNTIME_S = {"write": 6 * 3600, "read": 2 * 3600, "review": 2 * 3600}
 DEFAULT_HOME = "~/.local/state/agentq"
 BUSY_TIMEOUT_MS = 30000
 CONNECT_TIMEOUT_S = 30

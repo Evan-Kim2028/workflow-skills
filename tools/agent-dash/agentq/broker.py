@@ -82,10 +82,18 @@ STALL_S = 45 * 60
 #: Spin detection: a live job whose pi stream keeps growing while nothing outside it changes is spending
 #: tokens in a loop. The window is the same 45 min as the stall check, and the sample interval keeps the
 #: check to one cheap fingerprint a minute per job instead of a walk every tick.
-DEFAULT_SPIN = {"enabled": True, "window_s": float(STALL_S), "sample_s": 60.0, "min_stream_mb": 1.0}
+#:
+#: ``min_stream_mb`` is a burn rate, not a size: 1 MB over 45 min is 22 KB a minute, which every active
+#: worker clears, so the first setting tripped 33 of 502 good long jobs in a 48 h replay. 8 MB over the
+#: window is 180 KB a minute, which only a worker generating tokens without pause reaches.
+DEFAULT_SPIN = {"enabled": True, "window_s": float(STALL_S), "sample_s": 60.0, "min_stream_mb": 8.0}
 #: Files under the run folder that are the stream itself, not progress: the pi event stream and its session log.
 STREAM_GLOBS = ("stream-*.ndjson",)
 STREAM_DIRS = ("sessions",)
+#: Depth and entry cap for the scratch fingerprint. A scratch folder can hold a virtualenv with tens of
+#: thousands of files, and the broker samples every running job once a minute.
+SCRATCH_DEPTH = 2
+SCRATCH_MAX_ENTRIES = 500
 PROBE_RETRIES = 3
 PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
 RUN_WORKER = Path(__file__).resolve().parents[1] / "scripts" / "run_worker.py"
@@ -1021,14 +1029,53 @@ def git_progress(workspace) -> str | None:
     return (head.stdout.strip() if head.returncode == 0 else "") + "\n" + status.stdout
 
 
+def scratch_progress(label: str) -> tuple:
+    """A fingerprint of the run's ``$AGENT_SCRATCH`` folder, two levels deep.
+
+    A worker that starts a long test or training run and then polls its log is making progress: the
+    background job keeps writing under scratch, and the worker's stream grows only because it reads
+    that output. Counting those writes is what tells that worker apart from one that grows its stream
+    and changes nothing. The walk is bounded because a scratch folder can hold a virtualenv with tens
+    of thousands of files, and the broker samples every running job once a minute.
+    """
+    try:
+        from dash import scratchdir
+
+        root = str(scratchdir.scratch_path(label))
+    except (ImportError, OSError, ValueError):
+        return ()
+    found = []
+    stack = [(root, 0)]
+    while stack and len(found) < SCRATCH_MAX_ENTRIES:
+        path, depth = stack.pop()
+        try:
+            with os.scandir(path) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if len(found) >= SCRATCH_MAX_ENTRIES:
+                break
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            found.append((os.path.relpath(entry.path, root), stat.st_size, stat.st_mtime_ns))
+            if depth + 1 < SCRATCH_DEPTH and entry.is_dir(follow_symlinks=False):
+                stack.append((entry.path, depth + 1))
+    return tuple(sorted(found))
+
+
 def progress_key(job: dict) -> str | None:
     """Everything outside the stream that a working job changes, as one cheap fingerprint.
 
-    The run folder's report and out files, plus for a write job the git state of the worktree it
-    writes in (``workspace``, which the auto-worktree step already moved to the job's own tree).
+    The run folder's report and out files, the run's scratch folder (a background test or training
+    run writes there while the worker polls it), plus for a write job the git state of the worktree
+    it writes in (``workspace``, which the auto-worktree step already moved to the job's own tree).
     None when the git state cannot be read: an unknown fingerprint never trips the spin rule.
     """
     parts = [repr(run_progress(job["run_dir"], job["label"]))]
+    parts.append(repr(scratch_progress(job["label"])))
     if job["kind"] == "write":
         git = git_progress(job["workspace"])
         if git is None:
@@ -1041,10 +1088,11 @@ class SpinWatch:
     """Trip a live job whose stream keeps growing while nothing outside it changes.
 
     One sample per job per ``sample_s``: the stream's size and a fingerprint of the run folder's
-    report/out files plus, for a write job, its worktree's git state. The window restarts on any
-    change of that fingerprint, so a job that commits, edits a tracked file or writes its report is
-    never tripped. A job that spends the whole window growing its stream and nothing else is
-    spending tokens in a loop, and the broker stops it like a stall: requeued once, then failed.
+    report/out files, the run's scratch folder, plus for a write job its worktree's git state. The
+    window restarts on any change of that fingerprint, so a job that commits, edits a tracked file,
+    writes its report or whose background test run writes a log is never tripped. A job that spends
+    the whole window growing its stream and nothing else is spending tokens in a loop, and the broker
+    stops it like a stall: requeued once, then failed.
     """
 
     def __init__(self, settings: dict | None = None) -> None:

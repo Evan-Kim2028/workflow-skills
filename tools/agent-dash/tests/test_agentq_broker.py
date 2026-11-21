@@ -233,6 +233,10 @@ class ProcessCleanup(unittest.TestCase):
         self.env = env_for(self.home)
         self.prompt = write_prompt(self.tmp)
         self.launchers = []
+        # The spin rule fingerprints the run's scratch folder, so keep it inside the temp dir.
+        scratch = mock.patch.dict(os.environ, {"AGENT_DASH_SCRATCH_ROOT": str(self.tmp / "scratch")})
+        scratch.start()
+        self.addCleanup(scratch.stop)
 
     def tearDown(self):
         for launcher in self.launchers:
@@ -857,8 +861,8 @@ class ReviewFixTests(ProcessCleanup):
         self.assertEqual(row(self.home, job_id)["max_runtime_s"], 120.0)
 
     def test_17_submit_defaults_max_runtime_by_kind(self):
-        """A write job gets two hours, a read job 90 min, a review one hour (2026-11-21)."""
-        for kind, expected in (("read", 5400.0), ("write", 7200.0), ("review", 3600.0)):
+        """A write job keeps six hours, a read and a review job get two (2026-11-21 replay)."""
+        for kind, expected in (("read", 7200.0), ("write", 21600.0), ("review", 7200.0)):
             job_id = submit(self.env, self.prompt, "--kind", kind, label=f"mr-{kind}")
             self.assertEqual(row(self.home, job_id)["max_runtime_s"], expected, kind)
 
@@ -869,7 +873,7 @@ class ReviewFixTests(ProcessCleanup):
         write = submit(self.env, self.prompt, "--kind", "write", label="mr-w")
         read = submit(self.env, self.prompt, "--kind", "read", label="mr-r")
         self.assertEqual(row(self.home, write)["max_runtime_s"], 900.0)
-        self.assertEqual(row(self.home, read)["max_runtime_s"], 5400.0)
+        self.assertEqual(row(self.home, read)["max_runtime_s"], 7200.0)
 
     def test_19_the_max_runtime_flag_still_wins_over_the_kind_default(self):
         self.home.mkdir(parents=True, exist_ok=True)
@@ -888,7 +892,7 @@ class ReviewFixTests(ProcessCleanup):
                 "session": "s", "harness": "pi", "prompt_path": str(self.prompt),
                 "max_runtime_s": None,
             }, 1000.0)  # fmt: skip
-        self.assertEqual(row(self.home, "seed1")["max_runtime_s"], 5400.0)
+        self.assertEqual(row(self.home, "seed1")["max_runtime_s"], 7200.0)
 
 
 class SpinWatchTests(ProcessCleanup):
@@ -917,7 +921,7 @@ class SpinWatchTests(ProcessCleanup):
         return {"id": "j1", "kind": kind, "label": label, "run_dir": str(run_dir),
                 "workspace": str(workspace or self.tmp)}  # fmt: skip
 
-    def grow(self, run_dir, label="spin", size=2 * 1024 * 1024, at=None):
+    def grow(self, run_dir, label="spin", size=9 * 1024 * 1024, at=None):
         path = Path(run_dir) / "pi" / f"stream-{label}.ndjson"
         with open(path, "ab") as fh:
             fh.write(b"x" * size)
@@ -934,7 +938,7 @@ class SpinWatchTests(ProcessCleanup):
         self.assertIsNone(watch.observe(job, 1060.0))
         self.assertIsNone(watch.observe(job, 3699.0))
         trip = watch.observe(job, 3700.0)
-        self.assertEqual(trip, "spinning: stream grew 2.0 MB in 45 min with no file or git progress")
+        self.assertEqual(trip, "spinning: stream grew 9.0 MB in 45 min with no file or git progress")
 
     def test_a_report_change_restarts_the_window(self):
         watch = self.watch()
@@ -962,6 +966,35 @@ class SpinWatchTests(ProcessCleanup):
         watch.observe(job, 1000.0)
         self.grow(run_dir, size=100 * 1024)
         self.assertIsNone(watch.observe(job, 3700.0))
+
+    def test_a_scratch_write_restarts_the_window(self):
+        """A background test run writing its log under $AGENT_SCRATCH is progress, not a spin."""
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir)
+        watch.observe(job, 1000.0)
+        self.grow(run_dir)
+        watch.observe(job, 1060.0)
+        log = self.tmp / "scratch" / "hub" / "spin" / "attest.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("running\n", encoding="utf-8")
+        self.assertIsNone(watch.observe(job, 3700.0))
+        self.grow(run_dir)
+        self.assertIsNone(watch.observe(job, 6399.0))
+        self.assertIsNotNone(watch.observe(job, 6400.0))
+
+    def test_the_scratch_walk_is_bounded(self):
+        """A scratch folder holding a virtualenv is fingerprinted without walking all of it."""
+        root = self.tmp / "scratch" / "hub" / "spin"
+        deep = root / "venv" / "lib" / "python3.12" / "site-packages"
+        deep.mkdir(parents=True)
+        for index in range(50):
+            (deep / f"mod{index}.py").write_text("x\n", encoding="utf-8")
+        (root / "attest.log").write_text("running\n", encoding="utf-8")
+        found = B.scratch_progress("spin")
+        self.assertIn("attest.log", [name for name, _, _ in found])
+        self.assertLessEqual(len(found), B.SCRATCH_MAX_ENTRIES)
+        self.assertFalse([name for name, _, _ in found if "site-packages" in name])
 
     def test_the_sample_is_taken_at_most_once_a_minute(self):
         watch = self.watch()
@@ -1029,7 +1062,7 @@ class SpinWatchTests(ProcessCleanup):
         self.assertEqual((job["state"], job["watchdog_trips"], job["attempt"]), ("running", 1, 1))
         events = db.connect(self.home).execute(
             "SELECT detail FROM events WHERE job_id = ? AND kind = 'requeue'", (job_id,)).fetchall()
-        self.assertIn("spinning: stream grew 2.0 MB in 45 min", events[-1]["detail"])
+        self.assertIn("spinning: stream grew 9.0 MB in 45 min", events[-1]["detail"])
         self.assertEqual(launcher.procs[0].wait(timeout=10), -signal.SIGTERM)
         second = Path(job["run_dir"])
         self.assertNotEqual(second, run_dir)
