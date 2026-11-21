@@ -125,7 +125,7 @@ rm -rf ~/.local/share/agent-sessions/vlogs.old-<date>
 
 ## Retention
 
-The store runs with `-retentionPeriod=100y` and **no** disk-usage cap. The
+The store runs with `-retentionPeriod=90d` (a 3-month search index over the lossless archives, owner decision 2026-11-21; `VLOGS_RETENTION` overrides it) and **no** disk-usage cap. The
 installer writes no `-retention.maxDiskSpaceUsageBytes` or
 `maxDiskUsagePercent` line, so the store never evicts a partition. It runs
 with `-storage.minFreeDiskSpaceBytes=20GiB` instead: below that floor it

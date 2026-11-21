@@ -89,8 +89,10 @@ Nothing this job writes is ever deleted for age or space:
 
 - **Archives are kept forever.** `<dest>/archive/**/*.tar.zst` is never
   pruned by the pass, by `--scheduled`, or by the installer.
-- **Store rows are kept forever.** The VictoriaLogs store runs with
-  `-retentionPeriod=100y` and no disk-usage cap: the installer writes no
+- **The store is a 90-day search index.** The archives above keep every row
+  forever; the VictoriaLogs store keeps the last 90 days
+  (`-retentionPeriod=90d`, owner decision 2026-11-21) and older months are
+  re-loaded on demand with `logs rebuild-store`. It has no disk-usage cap: the installer writes no
   `-retention.maxDiskSpaceUsageBytes` (or `maxDiskUsagePercent`) line, so
   the store never evicts a partition to stay under a disk budget. Instead
   it runs with `-storage.minFreeDiskSpaceBytes=20GiB`: below that floor it
