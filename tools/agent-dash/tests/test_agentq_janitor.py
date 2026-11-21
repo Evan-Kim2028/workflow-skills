@@ -697,3 +697,8 @@ class PassWorktreeTests(Base):
     def test_a_job_without_an_auto_worktree_is_ignored(self):
         self.job(finished_at=self.now - 3600.0)
         self.assertEqual(self.reap(), {"removed": [], "kept": []})
+
+    @unittest.skipUnless(janitor.wtreap.shutil.which("lsof", path="/usr/sbin:/usr/bin:/sbin"), "no lsof")
+    def test_the_process_scan_finds_lsof_outside_a_launchd_path(self):
+        with mock.patch.dict(os.environ, {"PATH": "/bin"}):
+            self.assertIsNotNone(janitor.wtreap.process_cwds())
