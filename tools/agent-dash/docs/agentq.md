@@ -30,7 +30,7 @@ agentq status
 agentq backlog add NAME PROMPT_FILE --every 6h [--kind read|write|review]
               [--res light|tests|ssh] [--workspace PATH] [--tier T] [--max-runtime 2h]
 agentq backlog ls | rm NAME | pause NAME | resume NAME
-agentq gc [--runs-older-than 7d] [--apply]       # reclaim finished run streams
+agentq gc [--runs-older-than 7d] [--keep remove|stub|stripped] [--apply]  # archive, then reclaim
 agentq verdicts backfill [--apply] [--limit N]   # re-parse report.md of verdictless jobs
 agentq daemon                                    # the broker loop; launchd runs this
 ```
@@ -112,14 +112,25 @@ dominated that file (57,117 of 61,802 lines in the largest measured stream), so
   `pi.parse_stream` / `pi.final_text` return what they returned before. Set
   `AGENTQ_STREAM_COALESCE=0` to keep every delta line.
 
-`agentq gc` removes the stream files of jobs that finished more than N days ago
-(`30m`, `12h`, `7d`, `2w`, or a bare number of days); `report.md` and the run's
-`out-*.md` stay. It is a dry run unless `--apply`, and it never touches a job
-that is not `done`/`failed`/`cancelled`, a run folder with a live pid in
-`running/`, or a stream modified after the cutoff. A candidate must also be a
-plain-hex job id whose `runs` folder resolves inside `$AGENTQ_HOME/jobs`, and
-every unlink is re-confined to that folder, so a crafted id or a symlinked
-folder cannot reach outside the jobs tree.
+`agentq gc` archives, then reclaims, the stream files of jobs that finished more
+than N days ago (`30m`, `12h`, `7d`, `2w`, or a bare number of days); `report.md`
+and the run's `out-*.md` stay. It is a dry run unless `--apply`, and it never
+touches a job that is not `done`/`failed`/`cancelled`, a run folder with a live
+pid in `running/`, or a stream modified after the cutoff. A candidate must also
+be a plain-hex job id whose `runs` folder resolves inside `$AGENTQ_HOME/jobs`, and
+every path is re-confined to that folder, so a crafted id or a symlinked folder
+cannot reach outside the jobs tree.
+
+**Nothing is deleted before it is archived.** `--apply` does not unlink anything
+itself: it hands the plan to `agent_dash.py logs archive`, which measures each
+file, writes the stripped zstd copy under `<state>/log-archive/agentq/jobs/...`,
+ingests the rows into the loopback VictoriaLogs store, verifies the row count and
+the token sums, and only then applies `--keep` (default `remove`: the verified
+zstd copy is the archive). A file whose archive fails stays where it is and is
+reported; an unreachable store stops the run with exit 5 and deletes nothing. The
+rows carry `ws="agentq/<workspace basename>"`, `label=<job label>` and the job's
+`job_id`, `job_kind`, `tier`, `verdict`, `session` and `attempt`. See
+[log-archive.md](log-archive.md).
 
 The proxy's own log is size-rotated (see [agentq-proxy.md](agentq-proxy.md)).
 
@@ -160,12 +171,14 @@ the tick never waits on deleting a `.venv`. At most
 **Job-dir retention.** A terminal job older than `janitor.jobs_keep_days`
 (default `7`) keeps `prompt.md`, `report.md` and the run's `out-*.md`, and the
 verdict stays in the job row. Its pi streams, pi session logs and err logs are
-gzipped in place, or deleted when a single file is over 32 MB (compressing a
-multi-gigabyte stream is not worth a broker tick). A file modified after the
-cutoff is skipped, and so is a job whose run folder is still live. One pass
-touches at most 10 jobs and 20 files per job, so a tick never walks the whole
-history. `agentq gc` is still the manual, wider sweep: any age, dry run unless
-`--apply`.
+gzipped in place. A single file over 32 MB is **not** deleted: compressing a
+multi-gigabyte stream is not worth a broker tick, and a log leaves its path only
+after the log archive has a verified copy, so it is left for the hourly
+`logs archive --agentq` pass and counted as `needs_archive`. A file modified
+after the cutoff is skipped, and so is a job whose run folder is still live. One
+pass touches at most 10 jobs and 20 files per job, so a tick never walks the
+whole history. `agentq gc` is still the manual, wider sweep: any age, dry run
+unless `--apply`.
 
 **Disk-pressure admission.** When free space on the volume holding the scratch
 root is below `slots.disk_floor_gb` (default `25`), new `write` jobs and jobs on

@@ -1,4 +1,12 @@
-"""``agentq gc``: plan, dry run, apply. Offline; every test uses a temp AGENTQ_HOME."""
+"""``agentq gc``: plan, dry run, archive-then-reclaim. Offline; every test uses a temp AGENTQ_HOME.
+
+``--apply`` no longer unlinks anything itself: it hands the plan to
+``dash.logarchive``, which writes a verified zstd copy, ingests the rows into the
+search store, verifies them, and only then applies the keep. The store is a fake
+client (``tests/fake_vlogs.py``), so the pipeline runs for real without
+VictoriaLogs. The two guarantees under test: a file is never reclaimed without a
+verified archive, and an unreachable store deletes nothing.
+"""
 
 import io
 import os
@@ -8,11 +16,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agentq import cli, db
 from agentq import gc as G
+from fake_vlogs import FakeClient, stream_bytes
 
 NOW = 1_800_000_000.0
 #: A job id shaped like the ones `agentq submit` generates.
@@ -25,11 +35,14 @@ def finished_job(job_id: str, *, state: str = "done", finished_at: float = NOW -
 
 
 def make_stream(home: Path, job_id: str, name: str = "stream-label.ndjson", *, size: int = 100,
-                mtime: float = NOW - 2 * WEEK, run: str = "run1") -> Path:
+                mtime: float = NOW - 2 * WEEK, run: str = "run1", data: bytes | None = None) -> Path:
     folder = Path(home) / "jobs" / job_id / "runs" / run / "pi"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name
-    path.write_text("x" * size)
+    if data is None:
+        path.write_text("x" * size)
+    else:
+        path.write_bytes(data)
     os.utime(path, (mtime, mtime))
     return path
 
@@ -171,8 +184,8 @@ class ContainmentTest(unittest.TestCase):
         items, skipped = G.plan(self.home, [finished_job("../../victim")], older_than_s=WEEK, now=NOW)
         self.assertEqual(items, [])
         self.assertEqual(skipped[0]["reason"], "job id is not plain hex")
-        removed, freed, errors = G.apply(items)
-        self.assertEqual((removed, freed, errors), (0, 0, []))
+        entries, refused = G.entries_for(self.home, items)
+        self.assertEqual((entries, refused), ([], []))
         self.assertTrue(victim.exists())
 
     def test_a_id_with_uppercase_or_short_parts_is_rejected(self) -> None:
@@ -188,8 +201,8 @@ class ContainmentTest(unittest.TestCase):
         items, skipped = G.plan(self.home, [finished_job(JOB)], older_than_s=WEEK, now=NOW)
         self.assertEqual(items, [])
         self.assertEqual(skipped[0]["reason"], "runs folder is a symlink")
-        removed, _, errors = G.apply(items)
-        self.assertEqual((removed, errors), (0, []))
+        entries, refused = G.entries_for(self.home, items)
+        self.assertEqual((entries, refused), ([], []))
         self.assertTrue(victim.exists())
 
     def test_a_symlinked_job_folder_is_rejected_by_resolution(self) -> None:
@@ -200,12 +213,14 @@ class ContainmentTest(unittest.TestCase):
         items, skipped = G.plan(self.home, [finished_job(JOB)], older_than_s=WEEK, now=NOW)
         self.assertEqual(items, [])
         self.assertEqual(skipped[0]["reason"], "runs folder resolves outside the jobs tree")
-        removed, _, _ = G.apply(items)
-        self.assertEqual(removed, 0)
+        entries, refused = G.entries_for(self.home, items)
+        self.assertEqual((entries, refused), ([], []))
         self.assertTrue(victim.exists())
 
 
-class ApplyTest(unittest.TestCase):
+class EntriesTest(unittest.TestCase):
+    """``entries_for`` is the gate between a plan and the archive: it re-confines every path."""
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -222,17 +237,17 @@ class ApplyTest(unittest.TestCase):
             "finished_at": NOW - 2 * WEEK,
         }
 
-    def test_apply_removes_planned_files_and_counts_bytes(self) -> None:
-        items = [self.item("stream-a.ndjson", 10), self.item("stream-b.ndjson", 20)]
-        removed, freed, errors = G.apply(items)
-        self.assertEqual((removed, freed, errors), (2, 30, []))
-        self.assertEqual(list(self.root.iterdir()), [])
+    def test_a_planned_stream_becomes_an_entry(self) -> None:
+        item = self.item("stream-a.ndjson")
+        entries, refused = G.entries_for(self.root, [item])
+        self.assertEqual(refused, [])
+        self.assertEqual([e.path for e in entries], [item["path"]])
+        self.assertEqual(entries[0].kind, "stream")
 
     def test_a_vanished_file_is_not_an_error(self) -> None:
         item = self.item("stream-a.ndjson")
         Path(item["path"]).unlink()
-        removed, freed, errors = G.apply([item])
-        self.assertEqual((removed, freed, errors), (0, 0, []))
+        self.assertEqual(G.entries_for(self.root, [item]), ([], []))
 
     def test_an_item_outside_its_planned_root_is_refused(self) -> None:
         victim = Path(self._tmp.name) / "victim"
@@ -242,30 +257,27 @@ class ApplyTest(unittest.TestCase):
         root = Path(self._tmp.name) / "job" / "runs"
         root.mkdir(parents=True)
         item = {"job_id": JOB, "root": str(root), "path": str(stream), "size": 1, "finished_at": NOW}
-        removed, freed, errors = G.apply([item])
-        self.assertEqual((removed, freed), (0, 0))
-        self.assertEqual(errors[0]["error"], "outside the job runs tree")
+        entries, refused = G.entries_for(self.root, [item])
+        self.assertEqual(entries, [])
+        self.assertEqual(refused[0]["error"], "outside the job runs tree")
         self.assertTrue(stream.exists())
 
     def test_an_item_without_a_root_is_refused(self) -> None:
         path = self.root / "stream-a.ndjson"
         path.write_text("x")
-        removed, _, errors = G.apply([{"job_id": JOB, "path": str(path), "size": 1, "finished_at": NOW}])
-        self.assertEqual(removed, 0)
-        self.assertEqual(errors[0]["error"], "outside the job runs tree")
+        entries, refused = G.entries_for(
+            self.root, [{"job_id": JOB, "path": str(path), "size": 1, "finished_at": NOW}]
+        )
+        self.assertEqual(entries, [])
+        self.assertEqual(refused[0]["error"], "outside the job runs tree")
         self.assertTrue(path.exists())
 
-    def test_an_unlink_error_is_reported_not_raised(self) -> None:
-        items = [self.item("stream-a.ndjson"), self.item("stream-b.ndjson")]
-
-        def unlink(path):
-            if path.endswith("stream-a.ndjson"):
-                raise PermissionError("nope")
-            os.unlink(path)
-
-        removed, freed, errors = G.apply(items, unlink=unlink)
-        self.assertEqual((removed, freed), (1, 10))
-        self.assertEqual(errors[0]["error"], "PermissionError")
+    def test_a_file_that_is_not_a_stream_is_refused(self) -> None:
+        item = self.item("report.md")
+        entries, refused = G.entries_for(self.root, [item])
+        self.assertEqual(entries, [])
+        self.assertEqual(len(refused), 1)
+        self.assertTrue(Path(item["path"]).exists())
 
 
 class SummaryTest(unittest.TestCase):
@@ -295,15 +307,39 @@ class SummaryTest(unittest.TestCase):
         self.assertIn("3 more jobs", lines[-1])
 
 
+class DeadClient:
+    """A store that is not listening: ``healthy()`` is False, so nothing is measured."""
+
+    def __init__(self, url=None):
+        self.url = url
+
+    def healthy(self):
+        return False
+
+
+class SilentClient(FakeClient):
+    """A store that accepts rows and then reports none: the verify step must refuse."""
+
+    def query(self, logsql):
+        return [{"n": "0", "i": "NaN", "o": "NaN", "c": "NaN"}]
+
+
 class GcCommandTest(unittest.TestCase):
-    """End to end through ``cli.main``: dry run leaves the files, --apply removes them."""
+    """End to end through ``cli.main``: dry run leaves the files, --apply archives then reclaims."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name) / "home"
         self.home.mkdir()
-        self.env = {"AGENTQ_HOME": str(self.home), "PATH": os.environ["PATH"]}
+        self.state = Path(self._tmp.name) / "state"
+        self.state.mkdir()
+        self.env = {
+            "AGENTQ_HOME": str(self.home),
+            "AGENT_DASH_STATE_DIR": str(self.state),
+            "PATH": os.environ["PATH"],
+        }
+        self.client = FakeClient()
 
     def insert_job(self, job_id: str, state: str, finished_at) -> None:
         conn = db.connect(self.home)
@@ -317,9 +353,17 @@ class GcCommandTest(unittest.TestCase):
         conn.close()
 
     def run_cli(self, argv):
+        # The archive resolves its tree from the process env, not from ``env``:
+        # point it at the temp state dir so a test never writes the live one.
         out = io.StringIO()
-        code = cli.main(argv, env=self.env, out=out, now=lambda: NOW)
+        with mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": str(self.state)}):
+            code = cli.main(argv, env=self.env, out=out, now=lambda: NOW)
         return code, out.getvalue()
+
+    def run_cli_with_store(self, argv):
+        """Run with the fake store standing in for VictoriaLogs."""
+        with mock.patch("dash.logarchive.vlogs.VLogsClient", lambda url: self.client):
+            return self.run_cli(argv)
 
     def test_dry_run_reports_and_removes_nothing(self) -> None:
         self.insert_job("a1b2c3d4e5f0", "done", NOW - 2 * WEEK)
@@ -329,30 +373,61 @@ class GcCommandTest(unittest.TestCase):
         code, text = self.run_cli(["gc", "--runs-older-than", "7d"])
         self.assertEqual(code, 0, text)
         self.assertIn("1 stream files", text)
-        self.assertIn("would remove 1 stream file(s)", text)
+        self.assertIn("would archive then reclaim 1 stream file(s)", text)
         self.assertIn("dry run: nothing removed", text)
         self.assertTrue(old.exists() and new.exists())
+        self.assertFalse((self.state / "log-archive").exists())
 
-    def test_apply_removes_only_the_old_stream(self) -> None:
+    def test_apply_archives_then_reclaims_only_the_old_stream(self) -> None:
         self.insert_job("a1b2c3d4e5f0", "done", NOW - 2 * WEEK)
         self.insert_job("a1b2c3d4e5f1", "done", NOW - 3600)
         old = make_stream(self.home, "a1b2c3d4e5f0", size=230)
         new = make_stream(self.home, "a1b2c3d4e5f1", mtime=NOW - 3600)
         report = old.parent.parent / "report.md"
         report.write_text("PASS\n")
-        code, text = self.run_cli(["gc", "--runs-older-than", "7d", "--apply"])
+        code, text = self.run_cli_with_store(["gc", "--runs-older-than", "7d", "--apply"])
         self.assertEqual(code, 0, text)
-        self.assertIn("removed 1 stream file(s)", text)
+        self.assertIn("archived 1, reclaimed 1, 0 error(s)", text)
         self.assertFalse(old.exists())
         self.assertTrue(new.exists())
         self.assertTrue(report.exists())
+        # The verified zstd copy mirrors the job path under the log-archive tree.
+        zst = self.state / "log-archive" / "agentq" / "jobs" / "a1b2c3d4e5f0" / "runs" / "run1" / "pi"
+        self.assertTrue((zst / "stream-label.ndjson.zst").is_file())
+        self.assertEqual(self.client.posts, 1)
+
+    def test_an_unreachable_store_deletes_nothing(self) -> None:
+        self.insert_job("a1b2c3d4e5f0", "done", NOW - 2 * WEEK)
+        old = make_stream(self.home, "a1b2c3d4e5f0", size=230)
+        with mock.patch("dash.logarchive.vlogs.VLogsClient", DeadClient):
+            code, text = self.run_cli(["gc", "--runs-older-than", "7d", "--apply"])
+        self.assertEqual(code, 5, text)
+        self.assertTrue(old.exists())
+        self.assertFalse((self.state / "log-archive" / "agentq").exists())
+
+    def test_a_store_that_does_not_verify_deletes_nothing(self) -> None:
+        self.insert_job("a1b2c3d4e5f0", "done", NOW - 2 * WEEK)
+        old = make_stream(self.home, "a1b2c3d4e5f0", data=stream_bytes())
+        with mock.patch("dash.logarchive.vlogs.VLogsClient", lambda url: SilentClient()):
+            code, text = self.run_cli(["gc", "--runs-older-than", "7d", "--apply"])
+        self.assertEqual(code, 1, text)
+        self.assertIn("differ from sent", text)
+        self.assertTrue(old.exists())
+
+    def test_keep_stripped_leaves_the_stripped_copy_at_the_path(self) -> None:
+        self.insert_job("a1b2c3d4e5f0", "done", NOW - 2 * WEEK)
+        old = make_stream(self.home, "a1b2c3d4e5f0", size=230)
+        code, text = self.run_cli_with_store(["gc", "--runs-older-than", "7d", "--apply", "--keep", "stripped"])
+        self.assertEqual(code, 0, text)
+        self.assertTrue(old.exists())
+        self.assertEqual(old.read_text(), "x" * 230)
 
     def test_a_queued_job_is_untouched(self) -> None:
         self.insert_job("a1b2c3d4e5f2", "queued", None)
         stream = make_stream(self.home, "a1b2c3d4e5f2")
         code, text = self.run_cli(["gc", "--apply"])
         self.assertEqual(code, 0, text)
-        self.assertIn("removed 0 stream file(s)", text)
+        self.assertIn("nothing to reclaim", text)
         self.assertTrue(stream.exists())
 
     def test_a_bad_duration_exits_two(self) -> None:
@@ -367,9 +442,9 @@ class GcCommandTest(unittest.TestCase):
         victim = folder / "stream-victim.ndjson"
         victim.write_text("x" * 130)
         os.utime(victim, (NOW - 2 * WEEK, NOW - 2 * WEEK))
-        code, text = self.run_cli(["gc", "--runs-older-than", "7d", "--apply"])
+        code, text = self.run_cli_with_store(["gc", "--runs-older-than", "7d", "--apply"])
         self.assertEqual(code, 0, text)
-        self.assertIn("removed 0 stream file(s)", text)
+        self.assertIn("nothing to reclaim", text)
         self.assertTrue(victim.exists())
 
     def test_the_default_window_is_seven_days(self) -> None:
@@ -377,7 +452,7 @@ class GcCommandTest(unittest.TestCase):
         stream = make_stream(self.home, "a1b2c3d4e5f6", mtime=NOW - 6 * 86400)
         code, text = self.run_cli(["gc"])
         self.assertEqual(code, 0, text)
-        self.assertIn("would remove 0 stream file(s)", text)
+        self.assertIn("nothing to reclaim", text)
         self.assertTrue(stream.exists())
 
 

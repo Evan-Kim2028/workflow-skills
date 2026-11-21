@@ -120,10 +120,11 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
   python3 agent_dash.py worktrees janitor --repo <path> [--apply] [--artifact-age 24h] [--pressure-pct 12] [--daily-maintenance] [--json]
   python3 agent_dash.py lanes live [--json]
-  python3 agent_dash.py logs archive [--root P]... [--ws ID] [--exclude GLOB]... [--min-idle-hours 3] [--keep remove|stub|stripped] (default: per tool) [--apply]
+  python3 agent_dash.py logs archive [--root P]... [--agentq] [--ws ID] [--exclude GLOB]... [--min-idle-hours 3] [--keep remove|stub|stripped] (default: per tool) [--apply]
   python3 agent_dash.py logs sessions [--apply] [--no-reclaim] [--scheduled] [--tool NAME]... [--limit N] [--max-minutes M] [--url URL] [--dest DIR]
   python3 agent_dash.py logs sessions restore <session-id|unit|archive> [--to DIR]
   python3 agent_dash.py logs sessions status
+  python3 agent_dash.py logs scheduled [--apply] [--url URL]
   python3 agent_dash.py scratch gc [--older-than-days 7] [--finished-after-hours H] [--log-min-mb 100] [--log-idle-hours 6] [--no-compact-logs] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
   python3 agent_dash.py janitor postgres [--min-age 1h] [--apply]
@@ -456,13 +457,15 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "lanes":
         return cmd_lanes(args[1:])
     if cmd == "logs":
-        if len(args) < 2 or args[1] not in ("archive", "sessions"):
+        if len(args) < 2 or args[1] not in ("archive", "sessions", "scheduled"):
             print(USAGE, end="", file=sys.stderr)
             return 2
         if args[1] == "archive":
             from dash import logarchive
 
             return logarchive.main(args[2:])
+        if args[1] == "scheduled":
+            return cmd_logs_scheduled(args[2:])
         from dash import sessionarchive
 
         return sessionarchive.main(args[2:])
@@ -483,6 +486,48 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_postgres(args[2:])
     print(USAGE, end="", file=sys.stderr)
     return 2
+
+
+def cmd_logs_scheduled(argv: list[str] | None = None) -> int:
+    """The hourly launchd pass: native session archive, then the agentq log archive.
+
+    One process, so the plist's ``taskpolicy -b``, ``memcap.sh`` and
+    ``LowPriorityIO`` cover both passes, and each pass takes its own lock. The
+    session pass keeps its own skip rules (20 h since the last success, memory,
+    battery). The agentq pass runs every tick: it is the only thing that moves a
+    finished job's stream into the search store, and it is incremental (a file
+    the manifest already reclaimed is skipped without being read).
+
+    Exit code: the worse of the two (0 ok, 1 failures, 3 lock held, 5 store
+    unreachable, 6 no access for a scheduled run).
+    """
+    apply = False
+    url = None
+    args = list(sys.argv[1:] if argv is None else argv)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--apply":
+            apply = True
+        elif a == "--url":
+            if i + 1 >= len(args):
+                print("--url needs a value", file=sys.stderr)
+                return 2
+            url = args[i + 1]
+            i += 1
+        else:
+            print("unknown logs scheduled argument: %s" % a, file=sys.stderr)
+            return 2
+        i += 1
+    from dash import logarchive, sessionarchive
+
+    print("== logs sessions --scheduled", flush=True)
+    sessions_rc = sessionarchive.run({"apply": apply, "scheduled": True, "url": url})
+    print("== logs archive --agentq --scheduled", flush=True)
+    archive_rc = logarchive.run(
+        {"agentq": True, "apply": apply, "scheduled": True, "url": url or logarchive.vlogs.DEFAULT_URL}
+    )
+    return max(sessions_rc, archive_rc)
 
 
 def cmd_run(argv: list[str] | None = None) -> int:
