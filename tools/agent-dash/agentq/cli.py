@@ -160,11 +160,14 @@ def cmd_submit(args, ctx: Context) -> int:
     dest = db.job_dir(ctx.home, job_id) / "prompt.md"
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(prompt, dest)
+    max_runtime = args.max_runtime
+    if max_runtime is None:
+        max_runtime = db.default_max_runtime(args.kind, broker_lib.load_config(ctx.home)["max_runtime"])
     job = {
         "id": job_id, "lane": lane, "kind": args.kind, "res": args.res, "tier": tier,
         "label": label, "workspace": workspace, "session": ctx.session,
         "harness": ctx.harness, "prompt_path": str(dest),
-        "max_runtime_s": args.max_runtime, "in_place": int(args.in_place),
+        "max_runtime_s": max_runtime, "in_place": int(args.in_place),
     }
     with db.tx(conn):
         db.insert_job(conn, job, ctx.now())
@@ -623,8 +626,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tier")
     p.add_argument("--label")
     p.add_argument("--res", choices=db.RESOURCES, default="light")
-    p.add_argument("--max-runtime", type=float, default=db.MAX_RUNTIME_S, metavar="SECONDS",
-                   help="kill the worker after this long (default 21600)")
+    p.add_argument("--max-runtime", type=float, default=None, metavar="SECONDS",
+                   help="kill the worker after this long (default: 7200 write, 5400 read, 3600 review)")
     p.set_defaults(func=cmd_submit)
 
     p = sub.add_parser("wait", help="block until the named jobs are terminal")
@@ -689,7 +692,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--res", choices=db.RESOURCES, default="light")
     b.add_argument("--workspace", help="folder the jobs run in (default the current directory)")
     b.add_argument("--tier", help="tier for every job (default by kind)")
-    b.add_argument("--max-runtime", metavar="DURATION", help="wall-clock cap per job, e.g. 2h (default six hours)")
+    b.add_argument("--max-runtime", metavar="DURATION",
+                   help="wall-clock cap per job, e.g. 2h (kept when lower than the kind's default)")
     b.set_defaults(func=cmd_backlog_add)
     b = bsub.add_parser("ls", help="templates with interval, state, last and next submission, last job")
     b.set_defaults(func=cmd_backlog_ls)

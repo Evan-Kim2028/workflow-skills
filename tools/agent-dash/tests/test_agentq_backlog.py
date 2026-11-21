@@ -241,6 +241,19 @@ class SubmitTests(BacklogTestCase):
         self.assertEqual(labeler.calls, [("read", "backlog-nightly")])
         self.assertEqual(self.template()["last_submitted"], self.clock.t)
 
+    def test_a_template_cap_lower_than_the_kind_default_is_kept(self):
+        """A template's own cap wins when it is lower; a higher one is cut to the kind's default."""
+        self.add_template("short", "6h", "--max-runtime", "10m")
+        self.add_template("long", "6h", "--max-runtime", "6h")
+        self.broker().submit_backlog(self.conn(), self.clock.t, idle())
+        caps = {job["label"]: job["max_runtime_s"] for job in self.jobs()}
+        self.assertEqual(caps["hub-exec-backlog-short"], 600.0)
+        self.assertEqual(caps["hub-exec-backlog-long"], 5400.0)
+
+    def test_a_template_with_no_cap_takes_the_kind_default(self):
+        self.broker().submit_backlog(self.conn(), self.clock.t, idle())
+        self.assertEqual(self.jobs()[0]["max_runtime_s"], 5400.0)
+
     def test_the_label_comes_from_the_real_label_helper(self):
         broker = self.broker(labeler=B.label_for)
         broker.submit_backlog(self.conn(), self.clock.t, idle())

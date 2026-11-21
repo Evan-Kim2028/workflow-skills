@@ -10,6 +10,7 @@ import io
 import json
 import os
 import plistlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -854,6 +855,193 @@ class ReviewFixTests(ProcessCleanup):
     def test_16_submit_takes_max_runtime(self):
         job_id = submit(self.env, self.prompt, "--max-runtime", "120", label="mr")
         self.assertEqual(row(self.home, job_id)["max_runtime_s"], 120.0)
+
+    def test_17_submit_defaults_max_runtime_by_kind(self):
+        """A write job gets two hours, a read job 90 min, a review one hour (2026-11-21)."""
+        for kind, expected in (("read", 5400.0), ("write", 7200.0), ("review", 3600.0)):
+            job_id = submit(self.env, self.prompt, "--kind", kind, label=f"mr-{kind}")
+            self.assertEqual(row(self.home, job_id)["max_runtime_s"], expected, kind)
+
+    def test_18_broker_json_overrides_the_per_kind_default(self):
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "broker.json").write_text(
+            json.dumps({"max_runtime": {"write": 900, "read": "soon"}}), encoding="utf-8")
+        write = submit(self.env, self.prompt, "--kind", "write", label="mr-w")
+        read = submit(self.env, self.prompt, "--kind", "read", label="mr-r")
+        self.assertEqual(row(self.home, write)["max_runtime_s"], 900.0)
+        self.assertEqual(row(self.home, read)["max_runtime_s"], 5400.0)
+
+    def test_19_the_max_runtime_flag_still_wins_over_the_kind_default(self):
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "broker.json").write_text(
+            json.dumps({"max_runtime": {"write": 900}}), encoding="utf-8")
+        job_id = submit(self.env, self.prompt, "--kind", "write", "--max-runtime", "60", label="mr-flag")
+        self.assertEqual(row(self.home, job_id)["max_runtime_s"], 60.0)
+
+    def test_20_insert_job_fills_the_per_kind_default_when_none_is_given(self):
+        """A backlog seed row passes ``max_runtime_s=None``; the store fills the kind's cap."""
+        conn = db.connect(self.home)
+        with db.tx(conn):
+            db.insert_job(conn, {
+                "id": "seed1", "lane": "backlog", "kind": "read", "res": "light",
+                "tier": "pi-deepseek-flash", "label": "seed", "workspace": str(self.tmp),
+                "session": "s", "harness": "pi", "prompt_path": str(self.prompt),
+                "max_runtime_s": None,
+            }, 1000.0)  # fmt: skip
+        self.assertEqual(row(self.home, "seed1")["max_runtime_s"], 5400.0)
+
+
+class SpinWatchTests(ProcessCleanup):
+    """The spin rule: a stream that keeps growing while nothing outside it changes.
+
+    A pi worker that loops keeps writing its event stream, so the 45 min stall check (which
+    watches the whole run folder) never fires. The spin rule watches the stream's size against
+    everything else: the run folder's report/out files and, for a write job, its worktree's git
+    state. Synthetic run folders here; the broker-level test drives a real tick.
+    """
+
+    def watch(self, **settings):
+        return B.SpinWatch({**B.DEFAULT_SPIN, **settings})
+
+    def run_dir(self, label="spin", stream=0):
+        run_dir = self.tmp / "run"
+        pi = run_dir / "pi"
+        pi.mkdir(parents=True, exist_ok=True)
+        (pi / f"out-{label}.md").write_text("", encoding="utf-8")
+        (run_dir / f"err-{label}.log").write_text("", encoding="utf-8")
+        if stream:
+            (pi / f"stream-{label}.ndjson").write_bytes(b"x" * stream)
+        return run_dir
+
+    def job(self, run_dir, kind="read", workspace=None, label="spin"):
+        return {"id": "j1", "kind": kind, "label": label, "run_dir": str(run_dir),
+                "workspace": str(workspace or self.tmp)}  # fmt: skip
+
+    def grow(self, run_dir, label="spin", size=2 * 1024 * 1024, at=None):
+        path = Path(run_dir) / "pi" / f"stream-{label}.ndjson"
+        with open(path, "ab") as fh:
+            fh.write(b"x" * size)
+        if at is not None:
+            os.utime(path, (at, at))
+        return path
+
+    def test_a_growing_stream_with_no_progress_trips_after_the_window(self):
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir)
+        self.assertIsNone(watch.observe(job, 1000.0))
+        self.grow(run_dir)
+        self.assertIsNone(watch.observe(job, 1060.0))
+        self.assertIsNone(watch.observe(job, 3699.0))
+        trip = watch.observe(job, 3700.0)
+        self.assertEqual(trip, "spinning: stream grew 2.0 MB in 45 min with no file or git progress")
+
+    def test_a_report_change_restarts_the_window(self):
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir)
+        watch.observe(job, 1000.0)
+        self.grow(run_dir)
+        watch.observe(job, 1060.0)
+        (Path(run_dir) / "pi" / "out-spin.md").write_text("PASS\nall green\n", encoding="utf-8")
+        self.assertIsNone(watch.observe(job, 3700.0))
+        self.grow(run_dir)
+        self.assertIsNone(watch.observe(job, 6399.0))
+        self.assertIsNotNone(watch.observe(job, 6400.0))
+
+    def test_the_stream_is_not_progress(self):
+        run_dir = self.run_dir(stream=10)
+        before = B.run_progress(run_dir, "spin")
+        self.grow(run_dir)
+        self.assertEqual(B.run_progress(run_dir, "spin"), before)
+
+    def test_a_small_stream_growth_does_not_trip(self):
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir)
+        watch.observe(job, 1000.0)
+        self.grow(run_dir, size=100 * 1024)
+        self.assertIsNone(watch.observe(job, 3700.0))
+
+    def test_the_sample_is_taken_at_most_once_a_minute(self):
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir)
+        calls = []
+        real = B.stream_bytes
+        with mock.patch.object(B, "stream_bytes", lambda *a: calls.append(1) or real(*a)):
+            for at in (1000.0, 1001.0, 1030.0, 1059.0, 1060.0):
+                watch.observe(job, at)
+        self.assertEqual(len(calls), 2)
+
+    def test_the_rule_is_off_with_the_switch(self):
+        watch = self.watch(enabled=False)
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir)
+        watch.observe(job, 1000.0)
+        self.grow(run_dir)
+        self.assertIsNone(watch.observe(job, 3700.0))
+
+    def test_an_unreadable_git_state_never_trips(self):
+        """A write job whose workspace is not a git checkout has no progress signal: never trip."""
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir, kind="write", workspace=self.tmp / "not-a-repo")
+        watch.observe(job, 1000.0)
+        self.grow(run_dir)
+        self.assertIsNone(watch.observe(job, 3700.0))
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed here")
+    def test_a_git_change_restarts_the_window(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "a.txt").write_text("one\n", encoding="utf-8")
+        subprocess.run([*git, "add", "a.txt"], check=True)
+        subprocess.run([*git, "commit", "-qm", "one"], check=True)
+        watch = self.watch()
+        run_dir = self.run_dir(stream=1024)
+        job = self.job(run_dir, kind="write", workspace=repo)
+        watch.observe(job, 1000.0)
+        self.grow(run_dir)
+        watch.observe(job, 1060.0)
+        (repo / "a.txt").write_text("two\n", encoding="utf-8")
+        self.assertIsNone(watch.observe(job, 3700.0))
+        self.grow(run_dir)
+        self.assertIsNone(watch.observe(job, 6399.0))
+        self.assertIsNotNone(watch.observe(job, 6400.0))
+
+    def test_a_spinning_worker_is_requeued_once_then_failed(self):
+        job_id = submit(self.env, self.prompt, "--max-runtime", "21600", label="spin")
+        launcher = self.fake(live_s=30, report=False)
+        real = time.time()
+        clock = Clock(real)
+        broker = make_broker(self.home, launcher, clock=clock)
+        broker.tick()
+        clock.t = real + 60
+        broker.tick()
+        run_dir = Path(row(self.home, job_id)["run_dir"])
+        self.grow(run_dir, at=clock.t)
+        clock.t = real + B.STALL_S + 60
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual((job["state"], job["watchdog_trips"], job["attempt"]), ("running", 1, 1))
+        events = db.connect(self.home).execute(
+            "SELECT detail FROM events WHERE job_id = ? AND kind = 'requeue'", (job_id,)).fetchall()
+        self.assertIn("spinning: stream grew 2.0 MB in 45 min", events[-1]["detail"])
+        self.assertEqual(launcher.procs[0].wait(timeout=10), -signal.SIGTERM)
+        second = Path(job["run_dir"])
+        self.assertNotEqual(second, run_dir)
+        clock.t = real + 2 * (B.STALL_S + 60)
+        self.grow(second, at=clock.t)
+        broker.tick()
+        self.grow(second, at=clock.t)
+        clock.t = real + 3 * (B.STALL_S + 60)
+        broker.tick()
+        job = row(self.home, job_id)
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("spinning", job["detail"])
 
 
 class PiErrorDeathTests(ProcessCleanup):

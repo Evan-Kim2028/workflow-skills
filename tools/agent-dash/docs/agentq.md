@@ -43,7 +43,10 @@ agentq daemon                                    # the broker loop; launchd runs
 - `wait` blocks until every named job (or every open job of this session with
   `--mine`) is done, failed or cancelled. It prints `id verdict report_path` per
   job. It can be called from any process, at any time.
-- `--max-runtime` sets the job's wall-clock cap (default 21600 s, six hours).
+- `--max-runtime` sets the job's wall-clock cap. The default is per kind: 7200 s
+  (two hours) for `write`, 5400 s (90 min) for `read`, 3600 s (one hour) for
+  `review`. `broker.json` `max_runtime` overrides a kind's default, and the flag
+  still wins over both.
 - `escalate` moves jobs to the `urgent` lane. A running job speeds up on its next
   request through the proxy. Each escalation is logged in `events` with the session.
 - `result ID` prints the report path and verdict, and the job detail when it has
@@ -190,7 +193,8 @@ A backlog template is a prompt the broker resubmits on a timer, so Morph capacit
 stays busy when real work runs short. `agentq backlog add` copies the prompt to
 `$AGENTQ_HOME/backlog/<name>.md`, so later edits to the source file do not change
 the template. `--every` takes `30m`, `6h`, `1d` (or `90s`); `--max-runtime` takes
-the same units.
+the same units. A template's own cap is kept when it is lower than the kind's
+default and cut to the default when it is higher.
 
 - Each tick, after the launches, the broker submits one job for every enabled
   template that is due (never run, or its interval has passed). The job goes in
@@ -513,6 +517,15 @@ with each job.
 - Watchdog, for a live worker: past `max_runtime_s` it is killed and the job fails
   with the reason. Silent for 45 min (no file in the run folder changed) it is
   killed and requeued once if it has no report; a second stall fails it.
+- Spin rule, in the same watchdog: a live job whose pi stream keeps growing while
+  nothing outside it changes is spending tokens in a loop. Once a minute the broker
+  samples the stream's size and a fingerprint of the run folder's report/out files
+  plus, for a write job, its worktree's git state (`HEAD` and `git status`). If the
+  stream grew at least 1 MB over 45 min with that fingerprint unchanged, the job is
+  stopped with `spinning: stream grew N MB in 45 min with no file or git progress`,
+  requeued once and then failed, exactly like a stall. The stall check cannot see
+  this loop because the stream file itself keeps the run folder fresh. `broker.json`
+  `spin` takes `enabled`, `window_s`, `sample_s` and `min_stream_mb`.
 - Repetition guard, in the launcher (`scripts/launch_pi.py` with
   `agentq/repetition_guard.py`): a pi worker that repeats one tool call 8 times in
   a row, or 12 times in its last 30 calls, or compacts 20 times, is stopped by the
@@ -536,7 +549,7 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 |---|---|
 | `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_audits`, `filler_prs`, `filler_targets` (older, read once by the migration), `filler_state`. `proxy_minutes` belongs to the proxy |
 | `backlog/<name>.md` | a backlog template's prompt copy |
-| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings, the per-tier `tiers_thinking` levels, the `fill` and `pacing` settings, and the `janitor` knobs (see above) |
+| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings, the per-kind `max_runtime` caps, the `spin` rule, the per-tier `tiers_thinking` levels, the `fill` and `pacing` settings, and the `janitor` knobs (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
 | `jobs/<id>/runs/<n>/` | the run folder of each launch (run_worker's files live here) |

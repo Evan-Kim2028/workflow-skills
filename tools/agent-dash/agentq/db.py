@@ -34,7 +34,12 @@ DEFAULT_TIER = "pi-deepseek-flash"
 OPEN_STATES = ("queued", "running")
 TERMINAL_STATES = ("done", "failed", "cancelled")
 AGING_S = 15 * 60
+#: The cap for a kind with no entry in ``DEFAULT_MAX_RUNTIME_S``.
 MAX_RUNTIME_S = 6 * 3600
+#: Per-kind wall-clock caps. A write job gets two hours, a read job 90 min, a review one hour: a job that
+#: outlives these is spinning, not working (2026-11-21: 20 jobs died at the old six-hour cap in 24 h).
+#: ``broker.json`` ``max_runtime`` overrides them per kind; ``--max-runtime`` on submit still wins.
+DEFAULT_MAX_RUNTIME_S = {"write": 7200, "read": 5400, "review": 3600}
 DEFAULT_HOME = "~/.local/state/agentq"
 BUSY_TIMEOUT_MS = 30000
 CONNECT_TIMEOUT_S = 30
@@ -188,6 +193,24 @@ def default_tier(kind: str) -> str:
     return REVIEW_TIER if kind == "review" else DEFAULT_TIER
 
 
+def default_max_runtime(kind: str, overrides=None) -> float:
+    """The wall-clock cap for a job of ``kind``: its per-kind default, else ``MAX_RUNTIME_S``.
+
+    ``overrides`` is the ``max_runtime`` section of ``broker.json`` (kind to seconds); a value that is
+    not a positive number is ignored, so a bad setting never shortens or lengthens a cap by accident.
+    """
+    caps = {name: float(seconds) for name, seconds in DEFAULT_MAX_RUNTIME_S.items()}
+    if isinstance(overrides, dict):
+        for name, value in overrides.items():
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            if seconds > 0:
+                caps[str(name)] = seconds
+    return caps.get(kind, float(MAX_RUNTIME_S))
+
+
 def home_dir(env=None) -> Path:
     """The agentq home: ``$AGENTQ_HOME``, else ``~/.local/state/agentq``."""
     env = os.environ if env is None else env
@@ -338,7 +361,7 @@ def insert_job(conn, job: dict, now: float) -> None:
     """Queue a new job at the back of the queue. Call inside ``tx``."""
     seq = conn.execute("SELECT COALESCE(MAX(queue_seq), 0) + 1 FROM jobs").fetchone()[0]
     row = {
-        "max_runtime_s": MAX_RUNTIME_S,
+        "max_runtime_s": default_max_runtime(job["kind"]),
         **job,
         "queue_seq": seq,
         "state": "queued",
@@ -347,6 +370,8 @@ def insert_job(conn, job: dict, now: float) -> None:
         "submitted_at": now,
         "priority_age_at": now + AGING_S,
     }
+    if row["max_runtime_s"] is None:
+        row["max_runtime_s"] = default_max_runtime(job["kind"])
     columns = ", ".join(row)
     marks = ", ".join("?" for _ in row)
     conn.execute(f"INSERT INTO jobs ({columns}) VALUES ({marks})", tuple(row.values()))
