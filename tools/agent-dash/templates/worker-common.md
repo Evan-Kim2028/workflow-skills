@@ -84,6 +84,11 @@ worker, name it in your report; the lead submits it.
   `codegraph <subcommand> -p <main checkout>`. `cg` works from a worktree and
   reads the main checkout's index; run it before any grep over source code.
   Grep and Read are for non-code text or one detail; never run `cg init` in a worktree.
+- Filler findings: for a write task, run
+  `agentq filler findings --repo <repo> --path <files you will edit>` first and
+  fix or mention any open high finding in those files. It lists the newest
+  filler findings for those files and whether the line each cites is still
+  identical at `origin/main` (`still there` means nobody has fixed it yet).
 - Bash: every command already starts in your workspace. Never begin a command
   with `cd <your workspace> &&`, and write paths relative to it; that prefix
   was 18% of all worker bash output (2026-11-18). `cd` only to reach a

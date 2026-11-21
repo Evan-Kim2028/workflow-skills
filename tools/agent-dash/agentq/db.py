@@ -10,6 +10,7 @@ row, writes no event, and the caller sees ``False``.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import random
 import re
@@ -377,6 +378,49 @@ def transition(conn, job_id: str, from_states, now: float, kind: str | None, not
 def count_events(conn, job_id: str, kind: str) -> int:
     row = conn.execute("SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?", (job_id, kind)).fetchone()
     return row[0]
+
+
+def first_started_at(conn, job_id: str) -> float | None:
+    """The first ``started`` event for a job, or None when it never started.
+
+    ``jobs.started_at`` is overwritten when a job is requeued after a death or a stall, so it is the *last* start.
+    The event log keeps every start, and the first one is when the job actually left the queue.
+    """
+    row = conn.execute("SELECT MIN(ts) FROM events WHERE job_id = ? AND kind = 'started'", (job_id,)).fetchone()
+    return None if row is None or row[0] is None else float(row[0])
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """The nearest-rank percentile of ``values``, or None when there are none."""
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    rank = max(1, min(len(ordered), math.ceil(pct / 100.0 * len(ordered))))
+    return float(ordered[rank - 1])
+
+
+def queue_wait_stats(conn, since: float, until: float | None = None) -> dict:
+    """Queue wait for jobs submitted in ``[since, until)``: count, p50, p90, p99 and max, in seconds.
+
+    Wait is the first ``started`` event minus ``submitted_at``, not ``jobs.started_at`` minus it: a requeue
+    overwrites ``started_at``, so a stalled first run would otherwise count as queue wait. A job that never
+    started is left out. One set-based query; the first start per job is a MIN over the events table.
+    """
+    rows = conn.execute(
+        """SELECT j.submitted_at AS submitted_at, MIN(e.ts) AS started_at
+           FROM jobs AS j JOIN events AS e ON e.job_id = j.id AND e.kind = 'started'
+           WHERE j.submitted_at >= ? AND (? IS NULL OR j.submitted_at < ?)
+           GROUP BY j.id""",
+        (since, until, until),
+    ).fetchall()
+    waits = [max(0.0, float(row[1]) - float(row[0])) for row in rows if row[1] is not None]
+    return {
+        "count": len(waits),
+        "p50": _percentile(waits, 50),
+        "p90": _percentile(waits, 90),
+        "p99": _percentile(waits, 99),
+        "max": max(waits) if waits else None,
+    }
 
 
 def front_queue_seq(conn, lane: str) -> int:

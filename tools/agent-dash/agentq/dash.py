@@ -37,6 +37,8 @@ from urllib.parse import parse_qs, urlsplit
 # ``agentq/dash.py``), so the package root is not on the path yet. The verdict
 # vocabulary and its buckets live in ``agentq.verdict``, shared with the broker.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from agentq import db as agentq_db_lib  # noqa: E402
+from agentq import findings as findings_lib  # noqa: E402
 from agentq import verdict as verdict_lib  # noqa: E402
 
 DEFAULT_PORT = 18791
@@ -47,6 +49,12 @@ RANGE_HOURS = (1, 6, 24, 168)
 BUCKET_S = {1: 60, 6: 60, 24: 300, 168: 1800}
 DEFAULT_HOURS = 6
 RECENT_JOBS = 200
+#: Findings the card lists. The index is newest first, so these are the newest open high findings.
+FINDINGS_CARD_ROWS = 8
+#: The window the queue-wait figure covers. Wait is the first ``started`` event minus ``submitted_at``.
+QUEUE_WAIT_WINDOW_S = 48 * 3600
+#: How long the findings card reuses one read. The index changes only when a filler job finishes.
+FINDINGS_CACHE_S = 60.0
 LIMIT_WINDOW_MINUTES = 5
 LIVE_MINUTE_MIN_ELAPSED_S = 10
 LIVE_PACE_KEYS = (
@@ -101,7 +109,7 @@ PACING_HOLD = re.compile(
 )
 PROXY_WAIT_HOLD = re.compile(r"^proxy (\w+) waiting (\d+)")
 PROXY_BUDGET_LABELS = {"total": "the Morph total pool", "output": "DeepSeek's output budget", "uncached_ds": "DeepSeek's uncached-input budget"}
-HOLD_GROUP_ORDER = ("pacing", "proxy", "laptop", "ssh", "slots", "workspace", "tier", "other")
+HOLD_GROUP_ORDER = ("pacing", "proxy", "laptop", "ssh", "slots", "workspace", "tier", "launch", "other")
 HOLD_GROUP_KEYS = {group: f"held_{group}" for group in HOLD_GROUP_ORDER}
 RATE_WINDOW_MINUTES = 60
 SAMPLE_INTERVAL_S = 60.0
@@ -409,6 +417,18 @@ td.wrap .cont { color: var(--ink-3); display: block; }
 .unlaunched-line button { border: 1px solid var(--ring); border-radius: 6px; padding: 1px 8px; font-size: 11px; background: none; color: var(--ink-2); }
 .unlaunched-list { margin: 4px 0 6px 12px; max-height: 220px; overflow: auto; }
 .unlaunched-list div { color: var(--ink-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.findings-panel { margin-bottom: 12px; }
+.findings { max-height: 240px; overflow: auto; }
+.findings .row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; border-top: 1px solid var(--grid); font-size: 12px; }
+.findings .row:first-child { border-top: 0; }
+.findings .repo { color: var(--ink-2); font-size: 11px; white-space: nowrap; }
+.findings .loc { font-family: var(--mono, ui-monospace, monospace); font-size: 11px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+.findings .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.findings .st { font-size: 11px; white-space: nowrap; }
+.findings .st.same { color: var(--crit); }
+.findings .st.changed { color: var(--ink-3); }
+.findings .st.gone, .findings .st.unknown { color: var(--ink-3); }
+.findings a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--ring); }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 10px; font-size: 12px; color: var(--ink-2); margin-top: 8px; }
 .pager button { border: 1px solid var(--ring); border-radius: 6px; padding: 3px 10px; font-size: 12px; }
 .pager button:disabled { color: var(--ink-3); cursor: default; }
@@ -445,9 +465,15 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     <div class="stat"><div class="label">Waiting at the proxy</div><div class="value" id="k-waiting">—</div><div class="note" id="k-waiting-note">—</div></div>
     <div class="stat"><div class="label">DeepSeek in flight / limit</div><div class="value" id="p-inflight">—</div><div class="note">sent upstream, not yet answered; limit is the DeepSeek cap (shadow: the cap it would set)</div></div>
     <div class="stat"><div class="label">DeepSeek runs active</div><div class="value" id="r-ds">—</div><div class="note" id="r-ds-note">—</div></div>
-    <div class="stat"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note">waiting for a worker</div></div>
+    <div class="stat"><div class="label">Jobs queued</div><div class="value" id="r-queued">—</div><div class="note" id="r-queued-note">waiting for a worker</div></div>
     <div class="stat"><div class="label">Filler runs</div><div class="value" id="r-filler">—</div><div class="note">backlog audits running now</div></div>
   </div>
+
+  <section class="panel findings-panel" aria-labelledby="g-findings">
+    <h3 class="group" id="g-findings">Filler findings, <span class="rng">open high</span></h3>
+    <div class="note-line" id="findings-note">—</div>
+    <div class="findings" id="findings-list"></div>
+  </section>
 
   <div class="panels">
     <section class="panel" aria-labelledby="g-cap">
@@ -732,6 +758,12 @@ td.wrap .cont { color: var(--ink-3); display: block; }
   }
   function seconds(ms) {
     return ms === null || ms === undefined ? "—" : (ms / 1000).toFixed(2) + " s";
+  }
+  function dur(s) {
+    if (s === null || s === undefined) return "—";
+    if (s < 90) return Math.round(s) + " s";
+    if (s < 5400) return Math.round(s / 60) + " m";
+    return (s / 3600).toFixed(1) + " h";
   }
   function svgEl(tag, attrs, parent) {
     var node = document.createElementNS(NS, tag);
@@ -1357,7 +1389,53 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     setText("r-ds-note", "of cap " + count(rk.cap_deepseek));
     var queued = ((d.jobs || {}).by_state || {}).queued;
     setTile("r-queued", queued === undefined ? null : queued);
+    var wait = d.queue_wait || {};
+    setText("r-queued-note", wait.count
+      ? "wait 48 h: p50 " + dur(wait.p50) + " · p90 " + dur(wait.p90) + " · p99 " + dur(wait.p99)
+      : "waiting for a worker");
     setTile("r-filler", (d.jobs || {}).filler_running);
+  }
+
+  var FINDING_STATUS = { same: "still there", changed: "line changed", gone: "line gone", unknown: "unchecked" };
+  function renderFindings(d) {
+    var f = d.findings || { rows: [], total: 0, repos: {} };
+    var host = $("findings-list");
+    host.innerHTML = "";
+    var repos = Object.keys(f.repos || {}).sort(function (a, b) { return f.repos[b] - f.repos[a]; });
+    setText("findings-note", f.error ? "unavailable: " + f.error
+      : (f.total ? count(f.total) + " open high finding(s) in " + repos.length + " repo(s): "
+          + repos.map(function (r) { return r + " " + f.repos[r]; }).join(" · ")
+        : "no open high findings"));
+    (f.rows || []).forEach(function (row) {
+      var line = document.createElement("div");
+      line.className = "row";
+      var repo = document.createElement("span");
+      repo.className = "repo";
+      repo.textContent = row.repo;
+      line.appendChild(repo);
+      var loc = document.createElement("span");
+      loc.className = "loc";
+      loc.textContent = row.loc;
+      loc.title = row.loc;
+      line.appendChild(loc);
+      var title = document.createElement("span");
+      title.className = "title";
+      title.textContent = row.title;
+      title.title = row.title;
+      line.appendChild(title);
+      var st = document.createElement("span");
+      st.className = "st " + row.status;
+      st.textContent = FINDING_STATUS[row.status] || row.status;
+      line.appendChild(st);
+      if (row.report) {
+        var link = document.createElement("a");
+        link.href = "file://" + row.report;
+        link.textContent = "report";
+        link.title = row.report;
+        line.appendChild(link);
+      }
+      host.appendChild(line);
+    });
   }
 
   function renderPerf(d) {
@@ -1876,6 +1954,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     renderRuns(d);
     renderTop(d);
     renderJobs(d);
+    renderFindings(d);
     renderUnlaunched(d);
     renderMinuteTable(d);
     renderStatus();
@@ -3052,6 +3131,35 @@ def _guard(name: str, errors: dict, fn, default, *args):
         return default
 
 
+def read_queue_wait(agentq_db: Path, since: float) -> dict:
+    """Queue wait over the jobs submitted since ``since``, from the first ``started`` event per job. Read-only."""
+    connection = readonly_connection(agentq_db)
+    try:
+        return agentq_db_lib.queue_wait_stats(connection, since)
+    finally:
+        connection.close()
+
+
+def read_findings(home: Path, limit: int = FINDINGS_CARD_ROWS, now: float | None = None) -> dict:
+    """The newest open high filler findings, with the cited line's status at origin/main. Read-only.
+
+    Cached for ``FINDINGS_CACHE_S``: the index only changes when a filler job finishes, and the read costs about
+    0.4 s (a 724 KB index, a report header per row and one ``git rev-parse`` per repo), which is a quarter of a
+    summary build on a five-second poll.
+    """
+    now = time.time() if now is None else now
+    key = (str(home), limit)
+    cached = _FINDINGS_CACHE.get(key)
+    if cached is not None and 0 <= now - cached[0] < FINDINGS_CACHE_S:
+        return cached[1]
+    result = findings_lib.open_findings(home, limit=limit)
+    _FINDINGS_CACHE[key] = (now, result)
+    return result
+
+
+_FINDINGS_CACHE: dict = {}
+
+
 def resolve_limits(live: dict | None) -> dict[str, int]:
     """The limit per budget: the proxy's live figure where it gives one, else the documented constant."""
     limits = {name: LIMITS[name] for name in LIMIT_KEYS}
@@ -3407,6 +3515,8 @@ def hold_kind(gate: str, reason: str) -> tuple[str, str]:
         return "slots", "tests ceiling"
     if reason == "tier cap full":
         return "tier", f"{gate} tier cap"
+    if gate == "launch-cap":
+        return "launch", "launch cap"
     return "other", re.sub(r"[\d,.]+", "N", f"{gate}: {reason}" if gate else reason)
 
 
@@ -3771,6 +3881,11 @@ def build_summary(
     admitted = _guard("admitted", errors, read_calib, {}, agentq_db, since, until)
     live = _guard("live", errors, fetch_live, None)
     jobs = _guard("jobs", errors, read_jobs, None, agentq_db)
+    queue_wait = _guard("queue_wait", errors, read_queue_wait,
+                         {"count": 0, "p50": None, "p90": None, "p99": None, "max": None},
+                         agentq_db, float(now - QUEUE_WAIT_WINDOW_S))
+    findings = _guard("findings", errors, read_findings, {"rows": [], "total": 0, "repos": {}, "error": None},
+                      home, FINDINGS_CARD_ROWS, float(now))
     calib_429s = _guard("calib_429s", errors, read_calib_429s, None, home) if read_logs else None
     samples = _guard("workers", errors, read_samples, [], home / DASH_DB_NAME, float(since))
     run_rows = _guard("runs", errors, read_run_rows, [], agentq_db, int(now - RUN_LOOKBACK_S))
@@ -3853,6 +3968,8 @@ def build_summary(
         "token_axes": axes,
         "range_totals": range_totals(raw, since, until, runs, range_verdicts),
         "jobs": jobs,
+        "queue_wait": queue_wait,
+        "findings": findings,
         "workers": workers_bucketed,
         "runs_axis": runs_axis(workers_bucketed, caps),
         "caps": caps,

@@ -446,6 +446,26 @@
       "test_agentq_broker",
       "test_agentq_janitor"
     ],
+    "agentq/cli.py": [
+      "test_agentq_findings",
+      "test_agentq_queue_wait",
+      "test_agentq_broker"
+    ],
+    "agentq/dash.py": [
+      "test_agentq_dash"
+    ],
+    "agentq/db.py": [
+      "test_agentq_queue_wait",
+      "test_agentq_broker",
+      "test_agentq_filler_supply"
+    ],
+    "agentq/filler.py": [
+      "test_agentq_filler_supply",
+      "test_agentq_findings"
+    ],
+    "agentq/findings.py": [
+      "test_agentq_findings"
+    ],
     "agentq/janitor.py": [
       "test_agentq_janitor"
     ],

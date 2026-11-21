@@ -150,7 +150,32 @@ class KindDueTests(Temp):
     def test_other_kinds_stay_due_after_one_kind_runs(self):
         self.insert_job("j1", "done")
         self.submit(F.audit_work(self.target, "bugs", "h1"), "j1")
-        self.assertEqual(F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h1"), ["tests", "docs", "risk"])
+        self.assertEqual(F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h1", NOW), ["tests", "docs", "risk"])
+
+    def test_docs_is_not_due_again_within_a_week_even_when_the_target_moved(self):
+        self.insert_job("j1", "done")
+        self.submit(F.audit_work(self.target, "docs", "h1"), "j1")
+        self.assertNotIn("docs", F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h2", NOW + 6 * 86400))
+        self.assertIn("docs", F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h2", NOW + 7 * 86400))
+
+    def test_docs_stays_out_after_a_week_when_the_target_did_not_move(self):
+        self.insert_job("j1", "done")
+        self.submit(F.audit_work(self.target, "docs", "h1"), "j1")
+        self.assertNotIn("docs", F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h1", NOW + 30 * 86400))
+
+    def test_the_other_kinds_keep_their_own_cadence(self):
+        self.insert_job("j1", "done")
+        self.submit(F.audit_work(self.target, "bugs", "h1"), "j1")
+        self.assertIn("bugs", F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h2", NOW + 60))
+
+    def test_tests_comes_before_docs_when_both_are_due(self):
+        for kind, job in (("bugs", "j1"), ("risk", "j2")):
+            self.insert_job(job, "done")
+            self.submit(F.audit_work(self.target, kind, "h1"), job)
+        self.assertEqual(F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h1", NOW), ["tests", "docs"])
+
+    def test_a_docs_audit_that_never_ran_is_due_at_once(self):
+        self.assertIn("docs", F.due_kinds(self.conn, self.target, F.DEFAULT_KINDS, "h1", NOW))
 
     def test_a_kind_with_an_open_job_is_not_due(self):
         self.insert_job("open", "queued")

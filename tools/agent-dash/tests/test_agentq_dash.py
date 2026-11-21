@@ -207,6 +207,69 @@ class MissingDataTest(unittest.TestCase):
             self.assertEqual(summary["jobs"]["recent"][0]["state"], "queued")
 
 
+class FindingsCardTest(unittest.TestCase):
+    """The dashboard card that reads the filler findings index, and the queue-wait figure beside it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = make_home(Path(self.tmp.name))
+        self.root = Path(self.tmp.name) / "reports"
+        (self.home / "backlog-seed.json").write_text(json.dumps({"filler": {
+            "report_dir": str(self.root),
+            "repos": {"workflow-skills": {"workspace": str(Path(self.tmp.name) / "repo")}},
+        }}), encoding="utf-8")
+
+    def write_index(self, findings):
+        folder = self.root / "filler" / "workflow-skills" / "docs"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "broker-py-0a1b2c3d.md").write_text(
+            "# Audit\n\n- Module: `agentq/broker.py` (10 lines)\n- Commit: " + "a" * 40 + "\n", encoding="utf-8")
+        body = "# Filler findings\n\n## 2026-11-12 11:00Z — hub-exec-backlog-filler-docs-workflow-ski-broker-py-0a1b2c3d\n"
+        body += "".join(f"- **{s}** `{loc}` — {t}\n" for s, loc, t in findings)
+        (self.root / "filler" / "INDEX.md").write_text(body, encoding="utf-8")
+
+    def test_the_summary_carries_the_newest_high_findings(self) -> None:
+        self.write_index([("high", "agentq/broker.py:12", "a real one"), ("low", "agentq/broker.py:13", "a low one")])
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=no_proxy)
+        self.assertEqual([r["title"] for r in summary["findings"]["rows"]], ["a real one"])
+        self.assertEqual(summary["findings"]["total"], 1)
+        self.assertNotIn("findings", summary["errors"])
+
+    def test_a_missing_index_degrades_to_an_error_not_a_crash(self) -> None:
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=no_proxy)
+        self.assertEqual(summary["findings"]["rows"], [])
+        self.assertIn("no filler index", summary["findings"]["error"])
+
+    def test_queue_wait_uses_the_first_started_event(self) -> None:
+        conn = sqlite3.connect(self.home / "agentq.db")
+        conn.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+                     "job_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT)")
+        # Submitted 30 s before NOW, started at once, requeued and started again 20 s ago: the wait is 0 s.
+        conn.execute("INSERT INTO events (ts, job_id, kind) VALUES (?, ?, 'started')", (NOW - 30, "a" * 12))
+        conn.execute("INSERT INTO events (ts, job_id, kind) VALUES (?, ?, 'started')", (NOW - 20, "a" * 12))
+        conn.commit()
+        conn.close()
+        summary = dash.build_summary(self.home, 1, now=NOW, fetch_live=no_proxy)
+        self.assertEqual(summary["queue_wait"]["count"], 1)
+        self.assertEqual(summary["queue_wait"]["p50"], 0.0)
+        self.assertNotIn("queue_wait", summary["errors"])
+
+    def test_the_page_has_the_card_and_its_renderer(self) -> None:
+        self.assertIn('id="findings-list"', dash.PAGE_HTML)
+        self.assertIn("function renderFindings", dash.PAGE_HTML)
+        self.assertIn('id="r-queued-note"', dash.PAGE_HTML)
+
+    def test_the_card_reuses_one_read_inside_the_cache_window(self) -> None:
+        self.write_index([("high", "agentq/broker.py:12", "a real one")])
+        first = dash.read_findings(self.home, 8, NOW)
+        self.write_index([("high", "agentq/broker.py:12", "a newer one")])
+        self.assertEqual(dash.read_findings(self.home, 8, NOW + 30)["rows"][0]["title"], "a real one")
+        self.assertEqual(dash.read_findings(self.home, 8, NOW + dash.FINDINGS_CACHE_S + 1)["rows"][0]["title"],
+                         "a newer one")
+        self.assertEqual(first["total"], 1)
+
+
 class SamplerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -3171,3 +3234,8 @@ class HoldKindTest(unittest.TestCase):
     def test_the_fixed_cap_keeps_its_per_resource_key(self) -> None:
         self.assertEqual(dash.hold_kind("tests", "slots full"), ("slots", "tests slots"))
         self.assertEqual(dash.hold_kind("ssh", "slots full"), ("ssh", "ssh slots"))
+
+    def test_the_launch_cap_is_its_own_group(self) -> None:
+        self.assertEqual(dash.hold_kind("launch-cap", "8 launches in flight"), ("launch", "launch cap"))
+        self.assertIn("launch", dash.HOLD_GROUP_ORDER)
+        self.assertIn("held_launch", dash.HOLD_GROUP_KEYS.values())

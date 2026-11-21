@@ -1391,8 +1391,13 @@ class Broker:
         holds: dict[str, tuple[str, tuple[str, str]]] = {}
         launched: list[str] = []
         locally_held = 0
-        for job in order_queue(ready, now):
+        queue = order_queue(ready, now)
+        for position, job in enumerate(queue):
             if len(self._inflight) >= MAX_CONCURRENT_LAUNCHES:
+                # The loop stops before evaluating these jobs, so without a hold line they are invisible in the
+                # log and the dashboard. One line per skipped job, rate-limited like every other hold.
+                for skipped in queue[position:]:
+                    holds[skipped["id"]] = ("launch-cap", plain_hold(f"{MAX_CONCURRENT_LAUNCHES} launches in flight"))
                 break
             name, reason, local_gate = job["res"], None, False
             if on:
@@ -1665,6 +1670,7 @@ class Broker:
         settings, prs = self._work.snapshot()
         works = filler_lib.due_works(
             conn, settings.targets, kinds=settings.kinds, head_of=filler_lib.module_head, prs=prs, count=count,
+            now=now,
         )
         submitted = []
         for work in works:

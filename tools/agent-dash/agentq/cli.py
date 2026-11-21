@@ -23,6 +23,7 @@ from pathlib import Path
 from agentq import backlog as backlog_lib
 from agentq import fill as fill_lib
 from agentq import filler as filler_lib
+from agentq import findings as findings_lib
 from agentq import broker as broker_lib
 from agentq import db
 from agentq import gc as gc_lib
@@ -37,6 +38,8 @@ HARNESS_VARS = (
     ("MUSE_SESSION_ID", "muse"),
 )
 HARNESS_BINARIES = ("claude", "codex", "muse", "pi")
+#: The window ``agentq status`` reports queue wait over. Wait is the first ``started`` event minus ``submitted_at``.
+QUEUE_WAIT_WINDOW_S = 48 * 3600
 
 
 def _ps_parent_and_args(pid: int):
@@ -400,6 +403,10 @@ def cmd_status(args, ctx: Context) -> int:
         "SELECT COUNT(*) FROM jobs WHERE state = 'running' AND label LIKE ?", (fill_lib.FILLER_LABEL_LIKE,)
     ).fetchone()[0]
     ctx.print(f"filler: {filler_state}; filler jobs running: {filler_running}")
+    wait = db.queue_wait_stats(conn, ctx.now() - QUEUE_WAIT_WINDOW_S)
+    if wait["count"]:
+        ctx.print(f"queue wait {QUEUE_WAIT_WINDOW_S // 3600}h (first start): p50 {_secs(wait['p50'])} "
+                  f"p90 {_secs(wait['p90'])} p99 {_secs(wait['p99'])} max {_secs(wait['max'])} of {wait['count']} job(s)")
     proxy = broker_lib.proxy_status()
     ctx.print(f"proxy: {'reachable' if proxy is not None else 'unreachable (static slots)'}")
     ctx.print(slots_lib.status_hint(ctx.home, now=ctx.now()))
@@ -468,6 +475,17 @@ def cmd_inflight_report(args, ctx: Context) -> int:
 
 def _when(ts) -> str:
     return "never" if ts is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _secs(value) -> str:
+    """A duration in seconds as ``45s``, ``12m`` or ``1.2h``; ``-`` when there is no value."""
+    if value is None:
+        return "-"
+    if value < 90:
+        return f"{value:.0f}s"
+    if value < 5400:
+        return f"{value / 60:.0f}m"
+    return f"{value / 3600:.1f}h"
 
 
 def _next_due(conn, template: dict, now: float) -> str:
@@ -542,6 +560,23 @@ def cmd_filler_repair_failed(args, ctx: Context) -> int:
     return answer(ctx, f"{result['failed_jobs']} failed filler job(s) with reason=bad-label: {verb} "
                        f"{result['audit_rows']} audit row(s) and {result['pr_rows']} PR row(s)"
                        + ("" if args.apply else "; dry run, add --apply to clear them"), 0)
+
+
+def cmd_filler_findings(args, ctx: Context) -> int:
+    """The newest open filler findings, newest first, with whether the cited line is still at origin/main."""
+    result = findings_lib.open_findings(
+        ctx.home, repo=args.repo, severity=args.severity, paths=args.path, limit=args.limit,
+    )
+    if args.json:
+        ctx.print(json.dumps(result, indent=2))
+    else:
+        for line in findings_lib.format_rows(result, args.limit):
+            ctx.print(line)
+    if result["error"]:
+        return answer(ctx, f"filler findings: {result['error']}", 1)
+    repos = ", ".join(f"{name} {count}" for name, count in sorted(result["repos"].items())) or "none"
+    shown = min(len(result["rows"]), args.limit)
+    return answer(ctx, f"{result['total']} open {args.severity} finding(s) ({repos}); showing {shown}", 0)
 
 
 def cmd_thinking_report(args, ctx: Context) -> int:
@@ -673,11 +708,20 @@ def build_parser() -> argparse.ArgumentParser:
     report = tsub.add_parser("report", help="per thinking level: verdicts, output per job and per turn, billed tokens")
     report.add_argument("--since", metavar="ISO", help="only jobs submitted at or after this UTC time")
     report.set_defaults(func=cmd_thinking_report)
-    filler = sub.add_parser("filler", help="filler work supply: repairs")
+    filler = sub.add_parser("filler", help="filler work supply: repairs and findings")
     fsub = filler.add_subparsers(dest="filler_cmd", required=True)
     repair = fsub.add_parser("repair-failed", help="make targets whose filler job failed with a bad label due again")
     repair.add_argument("--apply", action="store_true", help="clear the rows (default: dry run, count only)")
     repair.set_defaults(func=cmd_filler_repair_failed)
+    found = fsub.add_parser("findings", help="open filler findings, newest first, with the cited line's status")
+    found.add_argument("--repo", help="only this repo")
+    found.add_argument("--severity", choices=findings_lib.SEVERITIES, default="high", help="default high")
+    found.add_argument("--path", action="append", metavar="FILE",
+                       help="only findings that cite this file (repeatable; a bare file name matches)")
+    found.add_argument("--limit", type=int, default=findings_lib.DEFAULT_LIMIT, metavar="N",
+                       help=f"at most N rows (default {findings_lib.DEFAULT_LIMIT})")
+    found.add_argument("--json", action="store_true", help="the whole result as JSON")
+    found.set_defaults(func=cmd_filler_findings)
     return parser
 
 
