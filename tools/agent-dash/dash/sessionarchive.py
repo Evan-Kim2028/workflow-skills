@@ -9,9 +9,13 @@ after a longer idle window, deletes the original once the archive has been
 re-verified. Any unit can be restored byte-for-byte.
 
 Unlike ``dash.logarchive`` (which strips base64 images), this archive is
-lossless: the tar holds the original bytes, and the store row text is the
-original line. The two share the manifest/lock conventions, the
-``open_paths`` liveness probe and the zstd helpers.
+lossless: the tar holds the original bytes. The store row text is *not*
+lossless: base64 runs are replaced by a marker (``dash.logfilter``) before
+``vlogs.make_row``, so the searchable copy stays lean while the tar remains
+the source of truth. A row carries ``path`` (the unit id) and ``label`` (the
+session id) only; the old duplicate ``unit``/``session`` fields are gone.
+The two share the manifest/lock conventions, the ``open_paths`` liveness
+probe and the zstd helpers.
 
 Pieces:
 
@@ -25,7 +29,8 @@ Pieces:
   every member's sha256 and size before the atomic rename.
 * ``ingest_unit`` is at-least-once: every row carries ``line``, verification
   is ``count_uniq(member, line)``, and a retry resends from the last
-  confirmed line. A rewrite bumps ``rev``.
+  confirmed line. A rewrite bumps ``rev``. Base64 is stripped from the row
+  text and the stripped byte count is recorded in the manifest.
 * ``reclaim_unit`` is a journaled two-phase move: preconditions, a
   ``reclaiming`` manifest record, rename into ``state/trash``, re-hash, then
   delete the trash. ``recover_trash`` resolves a crash at any step.
@@ -55,7 +60,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dash import logarchive, vlogs
+from dash import logarchive, logfilter, vlogs
 from dash.dataroot import state_dir as _state_dir
 
 #: The archive dest. It must stay outside the macOS privacy (TCC) folders
@@ -1279,6 +1284,40 @@ def _cursor_rows(member: Member, fallback_ms: int):
         _discard_tree(tmp)
 
 
+class _RowsKind:
+    """The one attribute ``extract`` reads from a member: its row kind."""
+
+    __slots__ = ("rows",)
+
+    def __init__(self, rows: str) -> None:
+        self.rows = rows
+
+
+def iter_stream_rows(tool: str, rows: str, fh, fallback_ms: int, skip: int = 0):
+    """Yield ``(text, type, ms, project, model, subtype, line)`` from a byte stream.
+
+    The shared row reader for a live member file and an archived tar member,
+    so a rebuild from the archive produces exactly the rows the original
+    ingest produced. ``rows`` is the member's row kind (``jsonl`` or ``log``).
+    """
+    if rows not in ("jsonl", "log"):
+        return
+    stub = _RowsKind(rows)
+    for line_no, line in enumerate(_split_lines(fh), 1):
+        if line_no <= skip:
+            continue
+        info = extract(tool, line, stub, fallback_ms)
+        yield (
+            line.decode("utf-8", "replace"),
+            info["type"],
+            info["ms"],
+            info["project"],
+            info["model"],
+            info["subtype"],
+            line_no,
+        )
+
+
 def iter_member_rows(member: Member, unit: Unit, skip: int = 0):
     """Yield ``(text, type, ms, project, model, subtype, line)`` per row.
 
@@ -1295,19 +1334,16 @@ def iter_member_rows(member: Member, unit: Unit, skip: int = 0):
         return
     if member.rows not in ("jsonl", "log"):
         return
-    for line_no, line in enumerate(_iter_lines(member.path), 1):
-        if line_no <= skip:
-            continue
-        info = extract(unit.tool, line, member, fallback)
-        yield (
-            line.decode("utf-8", "replace"),
-            info["type"],
-            info["ms"],
-            info["project"],
-            info["model"],
-            info["subtype"],
-            line_no,
-        )
+    if member.path.endswith(".zst"):
+        proc = subprocess.Popen([_zstd_bin(), "-dc", ZSTD_LONG, member.path], stdout=subprocess.PIPE)
+        try:
+            yield from iter_stream_rows(unit.tool, member.rows, proc.stdout, fallback, skip)
+        finally:
+            proc.stdout.close()
+            proc.wait()
+        return
+    with open(member.path, "rb") as fh:
+        yield from iter_stream_rows(unit.tool, member.rows, fh, fallback, skip)
 
 
 def count_member_rows(member: Member, unit: Unit) -> int:
@@ -1345,7 +1381,15 @@ def _prefix_sha(path: str, n: int) -> str:
     return digest.hexdigest()
 
 
-def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str, line_no: int) -> bytes:
+def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str, line_no: int) -> tuple[bytes, int]:
+    """One store row for a live-history line, plus the base64 bytes stripped.
+
+    The row carries ``path`` (the unit id) and ``label`` (the session id);
+    the old duplicate ``unit``/``session`` fields are gone, so a reader
+    filters on ``path``/``label``. Base64 images are replaced by a marker
+    before the row is built: the live file on disk keeps the original
+    bytes, and the session archive's tar is the lossless copy.
+    """
     obj = _json(line)
     type_ = "raw"
     session = ""
@@ -1356,17 +1400,16 @@ def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str, line_no: int
             obj.get("sessionId") or obj.get("session_id") or obj.get("session") or ""
         )
         ms = _line_ms(obj, ms)
+    text, removed, _replaced = logfilter.strip_text(line.decode("utf-8", "replace"))
     extra = {
         "tool": tool,
-        "session": session,
-        "unit": uid,
         "member": rel,
         "rev": rev,
         "line": str(line_no),
     }
     row, _truncated, _redactions = vlogs.make_row(
         time_iso=iso_from_ms(ms),
-        msg=line.decode("utf-8", "replace"),
+        msg=text,
         ws="native/" + tool,
         label=session or os.path.basename(rel),
         type_=type_,
@@ -1374,10 +1417,10 @@ def _live_row(tool: str, uid: str, rel: str, line: bytes, rev: str, line_no: int
         path=uid,
         extra=extra,
     )
-    return row
+    return row, removed
 
 
-def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
+def ingest_live(tool: str, path: str, manifest: Manifest, client, stats: dict | None = None) -> int:
     """Ingest complete new lines of a live history from its stored offset.
 
     A shrink or a change in the sha256 of the first ``min(size, 4096)``
@@ -1410,9 +1453,10 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
         line_no = 0
     new_offset = offset
     sent = 0
+    stripped = 0
     if size > offset:
         def gen():
-            nonlocal new_offset, line_no
+            nonlocal new_offset, line_no, stripped
             with open(path, "rb") as fh:
                 fh.seek(offset)
                 for line, end, complete in _iter_lines_offsets(fh):
@@ -1421,7 +1465,9 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
                         break
                     new_offset = offset + end
                     line_no += 1
-                    yield _live_row(tool, uid, rel, line, rev, line_no)
+                    row, removed = _live_row(tool, uid, rel, line, rev, line_no)
+                    stripped += removed
+                    yield row
 
         sent = client.insert(gen())
         client.flush()
@@ -1431,6 +1477,8 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
             "store has %d distinct (member,line) rows for %s rev %s, expected %d"
             % (got, uid, rev, line_no)
         )
+    if stats is not None:
+        stats["stripped_bytes"] = stripped
     manifest.write(
         {
             "unit": uid,
@@ -1444,6 +1492,7 @@ def ingest_live(tool: str, path: str, manifest: Manifest, client) -> int:
             "rev": rev,
             "line": line_no,
             "lines": line_no,
+            "stripped_bytes": stripped,
         }
     )
     return sent
@@ -1458,7 +1507,12 @@ def _quote(value: str) -> str:
 
 
 def count_rows(client, unit_uid: str, rev: str | None = None) -> int:
-    query = 'unit:="%s"' % _quote(unit_uid)
+    """Rows stored for one unit, by ``path`` (the unit id).
+
+    ``path`` is the unit id and ``label`` is the session id; the store no
+    longer carries the duplicate ``unit``/``session`` fields.
+    """
+    query = 'path:="%s"' % _quote(unit_uid)
     if rev is not None:
         query += ' rev:="%s"' % _quote(rev)
     query += " | stats count() n"
@@ -1467,13 +1521,13 @@ def count_rows(client, unit_uid: str, rev: str | None = None) -> int:
 
 
 def count_uniq_rows(client, unit_uid: str, rev: str) -> int:
-    """Distinct ``(member, line)`` pairs stored for ``(unit, rev)``.
+    """Distinct ``(member, line)`` pairs stored for ``(path, rev)``.
 
     This is the ingest verification count. A resend after a crash stores
     duplicate rows, which are harmless and invisible here; the docs give
-    the analytics dedupe pattern ``| uniq by (unit, member, rev, line)``.
+    the analytics dedupe pattern ``| uniq by (path, member, rev, line)``.
     """
-    query = 'unit:="%s" rev:="%s" | stats count_uniq(member, line) n' % (
+    query = 'path:="%s" rev:="%s" | stats count_uniq(member, line) n' % (
         _quote(unit_uid),
         _quote(rev),
     )
@@ -1498,7 +1552,9 @@ def _prefix_matches(path: str, old: dict) -> bool:
     return seen == size and digest.hexdigest() == old.get("sha256")
 
 
-def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> tuple[str, int, int]:
+def ingest_unit(
+    unit: Unit, records: list[dict], prior: dict | None, client, stats: dict | None = None
+) -> tuple[str, int, int]:
     """Send the unit's rows, verify the store, and return ``(rev, total, sent)``.
 
     At-least-once: a rerun resends from the last line the manifest confirmed
@@ -1508,6 +1564,11 @@ def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> 
     the new file is a rewrite: the unit ``rev`` is bumped and every member is
     resent at the new rev. Verification and append planning use only the
     current rev, so rows kept from an older rev never block growth.
+
+    Base64 images are replaced by a marker before the row is built (the tar
+    keeps the original bytes), and the row carries ``path``/``label`` only:
+    the duplicate ``unit``/``session`` fields are gone. ``stats``, when given,
+    receives ``stripped_bytes`` and ``stripped_rows`` for the manifest.
     """
     prior_members = {m["rel"]: m for m in (prior or {}).get("members", [])}
     prior_rev = str((prior or {}).get("rev", "0"))
@@ -1547,17 +1608,22 @@ def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> 
             plan.append((member, 0))
 
     sent = 0
+    stripped = 0
+    stripped_rows = 0
     if plan:
         def gen():
+            nonlocal stripped, stripped_rows
             for member, skip in plan:
                 for text, type_, ms, project, model, subtype, line_no in iter_member_rows(member, unit, skip):
+                    text, removed, replaced = logfilter.strip_text(text)
+                    if removed:
+                        stripped += removed
+                        stripped_rows += 1
                     extra = {
                         "tool": unit.tool,
-                        "session": unit.session,
                         "project": project,
                         "model": model,
                         "subtype": subtype,
-                        "unit": unit.uid,
                         "member": member.rel,
                         "rev": rev,
                         "line": str(line_no),
@@ -1583,6 +1649,9 @@ def ingest_unit(unit: Unit, records: list[dict], prior: dict | None, client) -> 
             "store has %d distinct (member,line) rows for %s rev %s, expected %d"
             % (got, unit.uid, rev, total)
         )
+    if stats is not None:
+        stats["stripped_bytes"] = stripped
+        stats["stripped_rows"] = stripped_rows
     return rev, total, sent
 
 
@@ -2512,7 +2581,8 @@ def process_unit(
             }
         )
 
-    rev, total, sent = ingest_unit(unit, records, prior, client)
+    stats: dict = {}
+    rev, total, sent = ingest_unit(unit, records, prior, client, stats)
     rec = {
         "unit": unit.uid,
         "tool": unit.tool,
@@ -2528,10 +2598,14 @@ def process_unit(
         "seq": seq,
         "archives": archives,
         "raw_bytes": unit.raw_bytes,
+        "newest_mtime": unit.newest_mtime,
         "rev": rev,
         "lines": total,
         "members": records,
         "status": "archived",
+        # Base64 bytes replaced by a marker before ingest (the tar keeps them).
+        "stripped_bytes": int(stats.get("stripped_bytes") or 0),
+        "stripped_rows": int(stats.get("stripped_rows") or 0),
     }
     manifest.write(rec)
     print(

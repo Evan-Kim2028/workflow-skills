@@ -128,6 +128,8 @@ USAGE = """agent-dash: local read-only execution dashboard
       [--max-minutes N] [--max-unit-mib N] [--dest DIR]
   python3 agent_dash.py logs sessions manifest compact [--apply] [--older-than-days 7] [--dest DIR]
   python3 agent_dash.py logs scheduled [--apply] [--url URL]
+  python3 agent_dash.py logs rebuild-store --data-dir DIR --port P [--apply] [--parallel N] [--limit N] [--no-resume] [--keep-running] [--url URL] [--dest DIR] [--no-memcap]
+  python3 agent_dash.py logs cutover-store --from DIR [--apply] [--url URL] [--dest DIR] [--live-data DIR] [--port P]
   python3 agent_dash.py storage budget [--json] [--no-record] [--history PATH] [--url URL]
   python3 agent_dash.py scratch gc [--older-than-days 7] [--finished-after-hours H] [--log-min-mb 100] [--log-idle-hours 6] [--no-compact-logs] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
@@ -462,7 +464,13 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "lanes":
         return cmd_lanes(args[1:])
     if cmd == "logs":
-        if len(args) < 2 or args[1] not in ("archive", "sessions", "scheduled"):
+        if len(args) < 2 or args[1] not in (
+            "archive",
+            "sessions",
+            "scheduled",
+            "rebuild-store",
+            "cutover-store",
+        ):
             print(USAGE, end="", file=sys.stderr)
             return 2
         if args[1] == "archive":
@@ -471,6 +479,10 @@ def main(argv: list[str] | None = None) -> int:
             return logarchive.main(args[2:])
         if args[1] == "scheduled":
             return cmd_logs_scheduled(args[2:])
+        if args[1] in ("rebuild-store", "cutover-store"):
+            from dash import storebuild
+
+            return storebuild.main(args[1:])
         from dash import sessionarchive
 
         return sessionarchive.main(args[2:])

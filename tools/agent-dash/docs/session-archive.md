@@ -20,7 +20,8 @@ from `dash/logarchive.py`, but not the base64 filter.
 | Archive pass | `dash/sessionarchive.py` | Unit discovery, `tar.zst` packing, ingestion, reclaim, restore, census. |
 | CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore`, `status`, `recompress` and `manifest compact`. |
 | Store client | `dash/vlogs.py` | `make_row(..., extra=...)` adds the native fields; redaction and truncation apply as before. |
-| Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`; `VLOGS_MAX_DISK=none` (or empty) omits the cap. |
+| Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` feeds `-storageDataPath`; `VLOGS_MIN_FREE` (default 20GiB) feeds `-storage.minFreeDiskSpaceBytes`, so a full disk makes the store read-only and loud instead of evicting history. |
+| Store rebuild | `dash/storebuild.py` | `logs rebuild-store` re-ingests both archives into a scratch store and verifies it; `logs cutover-store` swaps it in. See [store rebuild](store-rebuild.md). |
 | Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`, running the deployed release (`~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash`). The plist runs `agent_dash.py logs scheduled --apply`, which runs this pass and then the agentq log archive (`logs archive --agentq --apply`) in one process, so both get the same taskpolicy, memcap and LowPriorityIO. |
 
 ## Config
@@ -89,10 +90,12 @@ Nothing this job writes is ever deleted for age or space:
 - **Archives are kept forever.** `<dest>/archive/**/*.tar.zst` is never
   pruned by the pass, by `--scheduled`, or by the installer.
 - **Store rows are kept forever.** The VictoriaLogs store runs with
-  `-retentionPeriod=100y`. On this laptop it is installed with
-  `VLOGS_MAX_DISK=none`, which omits
-  `-retention.maxDiskSpaceUsageBytes` entirely, so the store never evicts
-  rows to stay under a disk cap. Other installs keep the 20GiB default.
+  `-retentionPeriod=100y` and no disk-usage cap: the installer writes no
+  `-retention.maxDiskSpaceUsageBytes` (or `maxDiskUsagePercent`) line, so
+  the store never evicts a partition to stay under a disk budget. Instead
+  it runs with `-storage.minFreeDiskSpaceBytes=20GiB`: below that floor it
+  refuses writes and logs loudly, and the owner frees space. An older
+  plist's cap line is dropped on the next install.
 - **Only original session files are reclaimed**, and only after
   `reclaim_days` of idleness and a full re-verify (see step 7 below).
   `--no-reclaim` disables even that.

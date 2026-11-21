@@ -86,6 +86,27 @@ class ReplacementRuleTest(unittest.TestCase):
         self.assertEqual(int(m.group(2)), len(B64))
 
 
+class StripTextTest(unittest.TestCase):
+    """``strip_text``: the one-shot form the session archive uses per row."""
+
+    def test_a_line_without_a_run_comes_back_unchanged(self):
+        text = '{"type":"user","message":{"role":"user","content":"hi"}}'
+        self.assertEqual(logfilter.strip_text(text), (text, 0, 0))
+
+    def test_a_long_run_is_replaced_and_counted(self):
+        text = '{"data":"%s"}' % B64
+        out, removed, replaced = logfilter.strip_text(text)
+        self.assertEqual(replaced, 1)
+        self.assertEqual(removed, len(B64))
+        self.assertIn("<img sha256=", out)
+        self.assertNotIn(B64[:40], out)
+        self.assertEqual(json.loads(out)["data"][:5], "<img ")
+
+    def test_a_short_run_is_kept(self):
+        text = '{"data":"%s"}' % B64[:1999]
+        self.assertEqual(logfilter.strip_text(text), (text, 0, 0))
+
+
 class ChunkIndependenceTest(unittest.TestCase):
     def test_result_does_not_depend_on_chunk_size(self):
         raw = b'{"k":1}\n' + _line(B64 + "=", "abc") + b'{"s":"' + B64[:50].encode() + b'"}\n' + _line(B64[:700]) + _line(B64 * 3)

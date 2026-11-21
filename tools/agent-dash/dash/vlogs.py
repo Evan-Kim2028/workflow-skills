@@ -37,15 +37,46 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 # Secret-shaped strings. Order matters: specific token shapes first, the
 # generic ``*_KEY=`` / ``*_TOKEN=`` assignment last. Each replacement
 # keeps the shape of the surrounding text so the row stays readable.
+#
+# Each entry carries ``groups``: tuples of alternative literals, all of which
+# must be present for the pattern to have any chance of matching. A row is
+# mostly prose, so the cheap ``in`` tests skip almost every regex scan.
+# Without them, redacting one 2 KB row costs about 6 ms, which is the whole
+# cost of a store rebuild.
 _REDACTORS = [
-    (re.compile(r"\bsk-(?:ant-|proj-|live-|or-)?[A-Za-z0-9_\-]{16,}"), "sk-REDACTED"),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "gh_REDACTED"),
-    (re.compile(r"\bgithub[_]pat_[A-Za-z0-9_]{20,}"), "github-pat-REDACTED"),
-    (re.compile(r"\btk_live_[A-Za-z0-9]{8,}"), "tk_live_REDACTED"),
-    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]{12,}"), "Bearer REDACTED"),
-    (re.compile(r"(?i)\b(?:[a-z][a-z0-9+.\-]*://)[^\s/:@\"'\\]+:[^\s/@\"'\\]+@"), None),
+    (
+        (("sk-",),),
+        re.compile(r"\bsk-(?:ant-|proj-|live-|or-)?[A-Za-z0-9_\-]{16,}"),
+        "sk-REDACTED",
+    ),
+    (
+        (("ghp_", "gho_", "ghu_", "ghs_", "ghr_"),),
+        re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+        "gh_REDACTED",
+    ),
+    (
+        (("github_pat_",),),
+        re.compile(r"\bgithub[_]pat_[A-Za-z0-9_]{20,}"),
+        "github-pat-REDACTED",
+    ),
+    (
+        (("tk_live_",),),
+        re.compile(r"\btk_live_[A-Za-z0-9]{8,}"),
+        "tk_live_REDACTED",
+    ),
+    (
+        (("bearer",),),
+        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]{12,}"),
+        "Bearer REDACTED",
+    ),
+    (
+        (("://",), ("@",)),
+        re.compile(r"(?i)\b(?:[a-z][a-z0-9+.\-]*://)[^\s/:@\"'\\]+:[^\s/@\"'\\]+@"),
+        None,
+    ),
     # value: "quoted", 'quoted', JSON-escaped \"quoted\", or a bare run
     (
+        (("_key", "_token"), ("=",)),
         re.compile(r"(?i)\b([A-Za-z0-9_]*_(?:KEY|TOKEN))=(?:\\\"[^\\\"\n]*\\\"|\"[^\"\n]*\"|'[^'\n]*'|[^\s\"'\\&,;]+)"),
         r"\1=REDACTED",
     ),
@@ -59,14 +90,25 @@ def _url_userinfo(match: re.Match) -> str:
 
 
 def redact(text: str) -> tuple[str, int]:
-    """Return ``(redacted_text, count)``. Pure; never raises on text."""
+    """Return ``(redacted_text, count)``. Pure; never raises on text.
+
+    A pattern runs only when one of its ``needles`` is present, so a row of
+    ordinary prose costs one lowercase pass and a few substring scans
+    instead of seven regex passes. The needles are lowercase and the test
+    runs on the folded text, which is a superset for a case-sensitive
+    pattern too: a false positive only costs one regex scan.
+    """
     count = 0
-    for pattern, repl in _REDACTORS:
+    folded = text.lower()
+    for groups, pattern, repl in _REDACTORS:
+        if not all(any(needle in folded for needle in group) for group in groups):
+            continue
         if repl is None:
             text, n = pattern.subn(_url_userinfo, text)
         else:
             text, n = pattern.subn(repl, text)
         count += n
+        folded = text.lower()
     return text, count
 
 
