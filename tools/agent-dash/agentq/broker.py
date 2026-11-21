@@ -1967,7 +1967,8 @@ class Broker:
             detail=None, thinking_used=level,
         ):  # fmt: skip
             return False
-        env = dict(os.environ, AGENTQ_JOB=job["id"], AGENTQ_HOME=str(self.home))
+        env = dict(os.environ, AGENTQ_JOB=job["id"], AGENTQ_HOME=str(self.home),
+                   AGENTQ_DEADLINE=str(int(now + job["max_runtime_s"])))
         env.pop("AGENTQ_RESUME_SESSION", None)
         env.pop("AGENTQ_RESUME_DIR", None)
         env.pop("AGENTQ_THINKING", None)

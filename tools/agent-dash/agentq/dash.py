@@ -488,6 +488,13 @@ td.wrap .cont { color: var(--ink-3); display: block; }
         <div class="chart" id="c-workers"></div>
       </section>
     </div>
+    <section class="card" aria-labelledby="h-limits">
+      <div class="card-head">
+        <h2 id="h-limits">DeepSeek limits used per minute: output, uncached input, total pool</h2>
+        <div class="legend" id="lg-limits"></div>
+      </div>
+      <div class="chart" id="c-limits"></div>
+    </section>
   </section>
 
   <section class="card" aria-labelledby="h-tokens">
@@ -913,6 +920,9 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     function X(t) { return m.l + ((t - x0) / Math.max(1, x1 - x0)) * iw; }
     function Y(v) { return m.t + ih - ((v - cfg.y.min) / (cfg.y.max - cfg.y.min || 1)) * ih; }
     function Yc(v) { return Y(cfg.y.clip !== undefined && v > cfg.y.clip ? cfg.y.clip : v); }
+    var y2 = cfg.y2;
+    function Y2(v) { return m.t + ih - ((Math.min(v, y2.max) - y2.min) / (y2.max - y2.min || 1)) * ih; }
+    function yFor(s) { return s.axis === "right" && y2 ? Y2 : Yc; }
 
     cfg.y.ticks.forEach(function (v) {
       svgEl("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: v === cfg.y.min ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }, svg);
@@ -920,6 +930,21 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     });
     xTicks(svg, cfg, iw, H, m, X, fmtX);
     if (cfg.y.label) svgEl("text", { x: m.l, y: 12, class: "tick" }, svg).textContent = cfg.y.label;
+    if (y2) {
+      y2.ticks.forEach(function (v) {
+        svgEl("text", { x: W - m.r + 8, y: Y2(v) + 4, class: "tick" }, svg).textContent = y2.fmt(v);
+      });
+      if (y2.label) svgEl("text", { x: W - 2, y: 12, "text-anchor": "end", class: "tick" }, svg).textContent = y2.label;
+    }
+    (cfg.events || []).forEach(function (e) {
+      if (e.t < x0 || e.t > x1) return;
+      svgEl("line", { x1: X(e.t), x2: X(e.t), y1: m.t, y2: plotBottom, stroke: "var(--ink-2)", "stroke-width": 1.5, "stroke-dasharray": "3 3" }, svg);
+      var flip = X(e.t) + 4 + measure(svg, e.label, "direct") > W - m.r;
+      svgEl("text", {
+        x: flip ? X(e.t) - 4 : X(e.t) + 4, y: m.t + 11, class: "direct", "text-anchor": flip ? "end" : "start",
+        style: "fill: var(--ink-2); stroke: var(--surface); stroke-width: 3px; paint-order: stroke"
+      }, svg).textContent = e.label;
+    });
 
     var refs = (cfg.refs || []).slice();
     refs.forEach(function (r) {
@@ -1019,7 +1044,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
           var p = points[i];
           var v = p[s.key];
           if (v === null || v === undefined) { lastPoint = null; continue; }
-          d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + Yc(v).toFixed(1);
+          d += (lastPoint ? " L" : " M") + X(p.t).toFixed(1) + "," + yFor(s)(v).toFixed(1);
           lastPoint = p;
         }
         var attrs = {
@@ -1047,7 +1072,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
             }, svg);
           }
         }
-        if (cfg.y.clip !== undefined) {
+        if (cfg.y.clip !== undefined && s.axis !== "right") {
           points.forEach(function (p) {
             if (p[s.key] > cfg.y.clip) {
               var cx = X(p.t);
@@ -1096,7 +1121,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       var span = cfg.bucket_s && cfg.bucket_s > 60 ? " – " + hm(p.t + cfg.bucket_s) : "";
       var rows = cfg.series.map(function (s) {
         var v = p[s.key];
-        var text = s.name + ": " + (v === null || v === undefined ? "—" : fmtY(v, true));
+        var text = s.name + ": " + (v === null || v === undefined ? "—" : (s.fmt || fmtY)(v, true));
         var note = s.overNote && typeof v === "number" && v > 1 ? s.overNote : null;
         return { color: s.color, text: text, note: note };
       });
@@ -1380,13 +1405,14 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       title: "Morph total-token limit used per minute",
       kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: PAIR_LAYOUT.margin, group: "capacity",
       x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
-      points: withHourly(minutes, hourlyRows),
+      points: withHourly(completeMinutes, hourlyRows),
       series: [
         { key: "pct_total", name: "Per minute", color: COLORS.s1, width: 1.25, opacity: 0.4 },
         { key: "hourly", name: "Hourly average", color: COLORS.s3, width: 2.5 }
       ],
       y: labelled(pctAxis, "% of 10M tokens/min"),
       refs: [{ v: 1, label: "Morph limit (10M/min)" }],
+      events: d.annotations || [],
       fmt: pctFmt
     });
     registerChart("c-workers", {
@@ -1406,7 +1432,35 @@ td.wrap .cont { color: var(--ink-3); display: block; }
       refs: axis.caps.filter(function (c) { return c.on_scale; }).map(function (c) { return { v: c.value, label: c.label }; }),
       fmt: intFmt
     });
+    var limitCaps = d.limits || {};
+    var capLabel = function (name, fallback) {
+      var b = limitCaps[name] || {};
+      return fallback + " (" + (b.limit ? fmtTokens(b.limit) : "?") + "/min" + (b.target_frac ? ", target " + Math.round(b.target_frac * 100) + "%" : "") + ")";
+    };
+    var limitSeries = [
+      { key: "pct_ds_output", name: capLabel("output", "DeepSeek output"), color: COLORS.s2, width: 1.5 },
+      { key: "pct_ds_uncached", name: capLabel("uncached_ds", "DeepSeek uncached input"), color: COLORS.s3, width: 1.5 },
+      { key: "total_per_min", name: capLabel("total", "Total pool") + ", tokens/min (right axis)", color: COLORS.s1, width: 1.5, axis: "right", fmt: fmtTokens }
+    ];
+    var totalCap = ((limitCaps.total || {}).limit) || 10000000;
+    var limitPoints = completeMinutes.map(function (p) {
+      return Object.assign({}, p, { total_per_min: p.total === null || p.total === undefined ? null : p.total / (p.minutes || 1) });
+    });
+    registerChart("c-limits", {
+      title: "DeepSeek limits used per minute",
+      kind: "line", bucket_s: bucket, tickFmt: fmtX, margin: { l: PAIR_LAYOUT.margin.l, r: 56, t: PAIR_LAYOUT.margin.t, b: PAIR_LAYOUT.margin.b }, group: "capacity",
+      x0: win.start, x1: win.end, height: PAIR_LAYOUT.height,
+      points: limitPoints,
+      series: limitSeries,
+      y: labelled(pctAxis, "% of output / uncached limit"),
+      y2: { min: 0, max: totalCap * 1.2, ticks: [0, 0.2, 0.4, 0.6, 0.8, 1, 1.2].map(function (f) { return f * totalCap; }), fmt: fmtTokens, label: "total pool, tokens/min" },
+      events: d.annotations || [],
+      refs: [{ v: 1, label: "100% of limit" }, { v: 0.95, label: "95%" }],
+      fmt: pctFmt
+    });
+    legendFor($("lg-limits"), limitSeries.map(function (s) { return { name: s.name, color: s.color }; }));
     var mix = d.token_mix || [];
+    mix = mix.filter(function (p) { return !p.partial; });
     var tokenLimit = d.token_limit || { value: 0 };
     registerChart("c-tokens", {
       title: "Tokens billed per " + tunit + ", with cumulative total on the right axis",
@@ -3810,8 +3864,26 @@ def build_summary(
         "laptop": laptop_now,
         "perf_kpis": perf_kpis(raw, since, until, runs, now, live),
         "top_consumers": top_consumers(runs, since, kpis["active_lifetime_tokens"]),
+        "annotations": read_annotations(home, since, until),
         "errors": errors,
     }
+
+
+ANNOTATIONS_FILE = "dash_annotations.json"
+
+
+def read_annotations(home: Path, since: float, until: float) -> list[dict]:
+    """Operator change markers inside the window, oldest first, from ``dash_annotations.json``: a list of
+    ``{"t": epoch_s, "label": str}``. A missing or malformed file means no markers."""
+    try:
+        rows = json.loads((Path(home) / ANNOTATIONS_FILE).read_text())
+    except (OSError, ValueError):
+        return []
+    marks = [
+        {"t": float(row["t"]), "label": str(row["label"])}
+        for row in rows if isinstance(row, dict) and isinstance(row.get("t"), (int, float)) and row.get("label")
+    ]
+    return sorted((m for m in marks if since <= m["t"] <= until + 60), key=lambda m: m["t"])
 
 
 def shape_runs(rows: list[dict], now: float) -> list[dict]:

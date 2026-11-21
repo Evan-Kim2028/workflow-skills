@@ -1195,6 +1195,7 @@ class YAxisLabelTest(unittest.TestCase):
     LABELS = {
         "c-billed": 'labelled(pctAxis, "% of 10M tokens/min")',
         "c-workers": 'labelled({ min: 0, max: axis.max, ticks: axis.ticks, fmt: intFmt }, "runs / jobs")',
+        "c-limits": 'labelled(pctAxis, "% of output / uncached limit")',
         "c-kimi": 'labelled(smallPctAxis, "% of 24,290 tokens/min")',
         "c-dsu": 'labelled(smallPctAxis, "% of 400k tokens/min")',
         "c-429": 'labelled(niceTicks(Math.max(maxR, 1), 2), "429s per minute")',

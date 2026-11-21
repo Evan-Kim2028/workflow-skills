@@ -27,6 +27,7 @@ shim_real() {
     _shim_skipped=
     for _d in $PATH; do
         case $_d in
+            */agentq/shims) continue ;;
             /*) ;;
             *) continue ;;
         esac
