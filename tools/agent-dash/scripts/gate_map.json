@@ -321,6 +321,14 @@
     "dash/sessionarchive.py": [
       "test_sessionarchive"
     ],
+    "dash/scratchgc.py": [
+      "test_scratchgc",
+      "test_pgjanitor",
+      "test_laptop_janitor"
+    ],
+    "scripts/pg_scratch.py": [
+      "test_pg_scratch"
+    ],
     "scripts/session_archive_install.sh": [
       "test_sessionarchive"
     ],

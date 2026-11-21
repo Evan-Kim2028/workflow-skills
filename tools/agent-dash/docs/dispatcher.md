@@ -95,6 +95,15 @@ run's `running/<label>` or `<label>.pid` names a live process, a process has a f
 it as its cwd, the newest file is under the cutoff, or the folder has no owner marker. Each candidate
 is checked again just before removal.
 
+`scratch gc` also compacts big logs, in every scratch folder and whatever the folder's age: a regular
+`*.log` over 100 MB (`--log-min-mb`) that has not been written for 6 h (`--log-idle-hours`) and that
+no process holds open is compressed with `zstd` to `<name>.log.zst` next to it. The `.zst` is verified
+before the plain `.log` is removed, so the log content is kept, never deleted; a log a running
+Postgres still holds open is left alone. `--no-compact-logs` skips the step. A worker's local
+Postgres should be started with `python3 ~/.claude/scripts/pg_scratch.py start`, which passes
+warnings-only logging and a 50 MB, hourly-truncated collector log, so a scratch cluster does not
+write a multi-GB log in the first place.
+
 `ws archive <ID>` cleans up after a successful archive: it runs `logs archive --ws <ID> --apply` when
 that service is installed, then removes the workstream's scratch folders. Cleanup is refused, and the
 archive still succeeds, while the workstream has live runs. `--keep-scratch` skips the scratch removal.

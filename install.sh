@@ -79,6 +79,6 @@ for dir in "$ROOT"/tools/*/; do
   link_one "$ROOT/tools/$name" "$CLAUDE/tools/$name"
 done
 link_one "$AGENT_DASH/templates/worker-common.md" "$CLAUDE/templates/worker-common.md"
-for name in worker-watch.sh muse-usage.py hub-usage.sh memcap.sh; do
+for name in worker-watch.sh muse-usage.py hub-usage.sh memcap.sh pg_scratch.py; do
   link_one "$AGENT_DASH/scripts/$name" "$CLAUDE/scripts/$name"
 done
