@@ -324,11 +324,18 @@ class RetentionTests(Base):
         self.assertGreater(report["bytes"], 0)
         self.assertEqual(report["files"], 3)
 
-    def test_retention_deletes_a_file_over_the_gzip_cap(self):
-        job_id, _job_root, stream, _err, _session, _out = self.big_job(size=4096)
-        janitor.retention(self.home, [self.row(job_id)], now=self.now, keep_days=7.0, gzip_max=1024)
-        self.assertFalse(stream.exists())
+    def test_retention_leaves_a_file_over_the_gzip_cap_for_the_archive(self):
+        # Never deleted: a log leaves its path only after the log archive has a
+        # verified zstd copy and its rows are in the store (docs/log-archive.md).
+        job_id, _job_root, stream, err, session, _out = self.big_job(size=4096)
+        report = janitor.retention(self.home, [self.row(job_id)], now=self.now, keep_days=7.0, gzip_max=1024)
+        self.assertTrue(stream.is_file())
+        self.assertTrue(err.is_file())
+        self.assertTrue(session.is_file())
         self.assertFalse(stream.with_name(stream.name + ".gz").exists())
+        self.assertEqual(report["needs_archive"], 3)
+        self.assertEqual(report["files"], 0)
+        self.assertEqual(report["bytes"], 0)
 
     def test_retention_leaves_a_job_inside_the_window_alone(self):
         job_id, _job_root, stream, _err, _session, _out = self.big_job(finished_at=self.now - 6 * DAY)

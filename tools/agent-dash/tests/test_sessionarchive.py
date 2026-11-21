@@ -870,7 +870,11 @@ class InstallerTest(unittest.TestCase):
             lint = subprocess.run(["plutil", "-lint", str(plist)], capture_output=True, text=True)
             self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
             text = plist.read_text(encoding="utf-8")
-            self.assertIn("<string>--scheduled</string>", text)
+            # One process runs both passes: the native session archive, then the
+            # agentq log archive, under the same taskpolicy, memcap and nice.
+            self.assertIn("<string>logs</string>\n        <string>scheduled</string>", text)
+            self.assertIn("<string>--apply</string>", text)
+            self.assertNotIn("<string>sessions</string>", text)
             self.assertIn("<integer>3600</integer>", text)
             self.assertIn("<key>LowPriorityIO</key>", text)
             self.assertIn("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", text)

@@ -21,7 +21,7 @@ from `dash/logarchive.py`, but not the base64 filter.
 | CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore` and `status`. |
 | Store client | `dash/vlogs.py` | `make_row(..., extra=...)` adds the native fields; redaction and truncation apply as before. |
 | Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`; `VLOGS_MAX_DISK=none` (or empty) omits the cap. |
-| Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`, running the deployed release (`~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash`). |
+| Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`, running the deployed release (`~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash`). The plist runs `agent_dash.py logs scheduled --apply`, which runs this pass and then the agentq log archive (`logs archive --agentq --apply`) in one process, so both get the same taskpolicy, memcap and LowPriorityIO. |
 
 ## Config
 
@@ -338,6 +338,9 @@ zstd -dc <dest>/archive/<tool>/<unit>.tar.zst | tar -tvf -
 ```sh
 # install / update the hourly agent (idempotent)
 sh tools/agent-dash/scripts/session_archive_install.sh
+
+# what the agent runs: sessions, then the agentq job folders, in one process
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs scheduled --apply
 
 # census only (reads, writes nothing)
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions

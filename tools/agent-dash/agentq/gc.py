@@ -5,11 +5,23 @@ A job's run folders keep every byte its workers emitted. The pi event streams
 across 2,199 files for about 30 live workers, and nothing reads a finished run's
 stream except a cold store rebuild. ``report.md``, the run's ``out-*.md`` and
 ``*.meta.json`` are what ``agentq result`` and the dashboards need, so this
-command removes the stream files only, and only for jobs that finished more than
-N days ago.
+command reclaims the stream files only, and only for jobs that finished more
+than N days ago.
 
-Dry run unless ``--apply``: the plan is printed with a per-job breakdown and a
-total, and nothing is unlinked. Nothing live is ever touched:
+**Nothing is deleted before it is archived.** The owner rule is that logs are
+historical data: a file may leave its path only when a verified compressed copy
+exists and its rows are verified in the search store. So ``--apply`` does not
+unlink anything itself. It hands the planned files to ``dash.logarchive``, which
+measures each one, writes the stripped zstd copy under
+``<state>/log-archive/agentq/jobs/...``, ingests the rows into VictoriaLogs,
+verifies the row count and token sums, and only then applies the per-tool
+``--keep`` (``docs/log-archive.md``, "Per-kind decision"). A file whose archive
+fails stays where it is and is reported; an unreachable store stops the run with
+exit 5 and deletes nothing.
+
+Dry run unless ``--apply``: the plan is printed with a per-job breakdown, a
+total, and how many files already have a verified archive. Nothing live is ever
+touched:
 
 - only jobs in a terminal state (``done``, ``failed``, ``cancelled``) with a
   ``finished_at`` older than the cutoff are considered;
@@ -30,6 +42,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import stat
 import time
 from pathlib import Path
 
@@ -105,13 +118,17 @@ def stream_files(root: Path):
     return found
 
 
-def job_runs_root(home, job_id):
+def job_runs_root(home, job_id, jobs_resolved=None):
     """``(<home>/jobs/<id>/runs, None)``, or ``(None, reason)`` when it is not a plain folder.
 
     The id must be plain lowercase hex, and the resolved ``runs`` folder must sit
     inside the resolved ``jobs`` folder, so an id with path parts or a symlinked
     folder can never point the plan at another tree. The folder is returned as
     written (not resolved) so planned paths stay under ``$AGENTQ_HOME``.
+
+    ``jobs_resolved`` is the already-resolved ``<home>/jobs``: a full scan calls
+    this once per job, and resolving the same parent 15,000 times is most of the
+    scan's cost.
     """
     if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
         return None, "job id is not plain hex"
@@ -121,6 +138,19 @@ def job_runs_root(home, job_id):
         return None, "runs folder is a symlink"
     if not job_root.is_dir():
         return None, "no runs folder"
+    if jobs_resolved is not None:
+        # The caller resolved <home>/jobs once. With no symlink at runs/ (above)
+        # or at <id> (below), the resolved path is the written one, so one lstat
+        # replaces a realpath chain per job.
+        try:
+            job_st = os.lstat(str(jobs_dir / job_id))
+        except OSError:
+            return None, "no runs folder"
+        if stat.S_ISLNK(job_st.st_mode):
+            return None, "runs folder resolves outside the jobs tree"
+        if not stat.S_ISDIR(job_st.st_mode):
+            return None, "no runs folder"
+        return job_root, None
     try:
         resolved = job_root.resolve(strict=True)
         jobs_resolved = jobs_dir.resolve(strict=True)
@@ -192,6 +222,7 @@ def plan(home, jobs, *, older_than_s: float, now: float, live=run_dir_live):
                 items.append(
                     {
                         "job_id": job_id,
+                        "job": job,
                         "root": str(job_root),
                         "path": str(path),
                         "size": stat.st_size,
@@ -201,38 +232,81 @@ def plan(home, jobs, *, older_than_s: float, now: float, live=run_dir_live):
     return items, skipped
 
 
-def apply(items, unlink=os.unlink):
-    """Unlink the planned files. Returns ``(removed, freed_bytes, errors)``.
+def entries_for(home, items):
+    """The ``logarchive.Entry`` for each planned item, plus the items refused before archiving.
 
-    Each path is re-confined to its planned job ``runs`` folder before the
-    unlink, so an item built by hand (or a folder swapped after planning) cannot
-    delete outside the tree. A path that is already gone is not an error.
+    An item is refused when its path is not confined to its planned job ``runs``
+    folder (``confined``), so a folder swapped after planning, or an item built by
+    hand, cannot make the archive read or remove anything outside the tree.
     """
-    removed = 0
-    freed = 0
-    errors = []
+    from dash import logarchive  # lazy: logarchive imports this module for job discovery
+
+    entries = []
+    refused = []
     for item in items:
         path = str(item.get("path") or "")
-        candidate = Path(path)
-        try:
-            present = candidate.exists() or candidate.is_symlink()
-        except OSError:
-            present = False
-        if not present:
+        if not os.path.exists(path):
+            # Gone since the plan was made: nothing to archive, nothing to reclaim.
             continue
         if not confined(path, item.get("root")):
-            errors.append({"path": path, "error": "outside the job runs tree"})
+            refused.append({"path": path, "error": "outside the job runs tree"})
             continue
-        try:
-            unlink(item["path"])
-        except FileNotFoundError:
+        job = item.get("job") or {"id": item.get("job_id")}
+        entry = logarchive.agentq_entry(path, job, home)
+        if entry is None:
+            refused.append({"path": path, "error": "not a stream or session file"})
             continue
-        except OSError as exc:
-            errors.append({"path": item["path"], "error": exc.__class__.__name__})
-            continue
-        removed += 1
-        freed += int(item.get("size") or 0)
-    return removed, freed, errors
+        entries.append(entry)
+    return entries, refused
+
+
+def archive_status(home, items, *, state=None) -> dict:
+    """``{path: status}`` from the log-archive manifest: ``reclaimed``, ``archived``, ``error``, ``none``.
+
+    ``archived`` means a verified zstd copy exists and its rows are in the store;
+    ``reclaimed`` means the path already holds the archive's own copy. ``none``
+    means the file has no verified archive and must not be deleted.
+    """
+    from dash import logarchive  # lazy: see entries_for
+
+    entries, _refused = entries_for(home, items)
+    by_rel = logarchive.archive_status(entries, state=state)
+    return {entry.path: by_rel.get(entry.rel, "none") for entry in entries}
+
+
+def archive_and_reclaim(home, items, *, apply: bool, keep=None, url=None, out=None, state=None,
+                        client=None, now=None) -> dict:
+    """Archive every planned file, then reclaim it. Never unlinks an un-archived file.
+
+    ``apply=False`` measures only (a dry run that writes nothing). ``apply=True``
+    runs the archive pipeline: measure, verify the zstd copy, ingest, verify the
+    store, then apply the per-tool keep. Returns a report with ``archived``,
+    ``reclaimed``, ``errors``, ``refused``, ``exit`` and the archive ``totals``.
+    """
+    from dash import logarchive  # lazy: see entries_for
+
+    entries, refused = entries_for(home, items)
+    rc, totals, results, _plans = logarchive.archive_entries(
+        entries,
+        apply=apply,
+        keep=keep,
+        url=url,
+        out=out,
+        state=state,
+        min_idle_hours=0.0,
+        ws_scoped=True,
+        client=client,
+        now=now,
+    )
+    return {
+        "entries": len(entries),
+        "refused": refused,
+        "archived": results.get("archived", 0),
+        "reclaimed": results.get("reclaimed", 0),
+        "errors": results.get("errors", 0) + len(refused),
+        "exit": rc,
+        "totals": totals,
+    }
 
 
 def human_bytes(size: float) -> str:

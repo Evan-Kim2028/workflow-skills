@@ -282,7 +282,14 @@ def cmd_cancel(args, ctx: Context) -> int:
 
 
 def cmd_gc(args, ctx: Context) -> int:
-    """Reclaim stream files of finished jobs older than N. Dry run unless --apply."""
+    """Archive, then reclaim, stream files of finished jobs older than N. Dry run unless --apply.
+
+    Nothing is unlinked before it is archived: ``--apply`` hands the plan to the
+    log archive, which writes a verified zstd copy, ingests the rows into the
+    search store, verifies them, and only then applies the per-tool keep. A file
+    whose archive fails stays where it is; an unreachable store stops the run
+    with exit 5 and deletes nothing.
+    """
     try:
         older_than_s = gc_lib.parse_duration(args.runs_older_than)
     except gc_lib.DurationError as exc:
@@ -292,23 +299,52 @@ def cmd_gc(args, ctx: Context) -> int:
     items, skipped = gc_lib.plan(ctx.home, jobs, older_than_s=older_than_s, now=ctx.now())
     for line in gc_lib.summarize(items):
         ctx.print(line)
+    if not items:
+        return answer(ctx, f"nothing to reclaim (finished jobs older than {args.runs_older_than})", 0)
+    status = gc_lib.archive_status(ctx.home, items)
+    counts: dict = {}
+    for value in status.values():
+        counts[value] = counts.get(value, 0) + 1
+    verified = counts.get("archived", 0) + counts.get("reclaimed", 0)
+    ctx.print(
+        "archive: %d of %d file(s) verified (%d already reclaimed), %d not archived yet, %d error(s)"
+        % (verified, len(items), counts.get("reclaimed", 0), counts.get("none", 0), counts.get("error", 0))
+    )
+    total = gc_lib.human_bytes(sum(int(i["size"]) for i in items))
     if not args.apply:
-        ctx.print("dry run: nothing removed (add --apply to remove these files)")
+        ctx.print("dry run: nothing removed. --apply archives each file first, then reclaims it.")
         return answer(
             ctx,
-            f"would remove {len(items)} stream file(s), {gc_lib.human_bytes(sum(int(i['size']) for i in items))}"
+            f"would archive then reclaim {len(items)} stream file(s), {total}"
             f" (finished jobs older than {args.runs_older_than})",
             0,
         )
-    removed, freed, errors = gc_lib.apply(items)
-    for err in errors:
-        ctx.print(f"failed: {err['path']} ({err['error']})")
+    report = gc_lib.archive_and_reclaim(
+        ctx.home, items, apply=True, keep=args.keep, out=ctx.out, now=ctx.now()
+    )
+    for err in report["refused"]:
+        ctx.print(f"refused: {err['path']} ({err['error']})")
+    totals = report["totals"]
+    ctx.print(
+        "archived %d, reclaimed %d, %d error(s); raw %s, stripped %s, zstd %s, reclaimed %s"
+        % (
+            report["archived"],
+            report["reclaimed"],
+            report["errors"],
+            gc_lib.human_bytes(totals.raw),
+            gc_lib.human_bytes(totals.stripped),
+            gc_lib.human_bytes(totals.zst),
+            gc_lib.human_bytes(totals.reclaimable),
+        )
+    )
     return answer(
         ctx,
-        f"removed {removed} stream file(s), freed {gc_lib.human_bytes(freed)}"
-        + (f", {len(errors)} error(s)" if errors else "")
+        f"archived and reclaimed {report['reclaimed']} of {len(items)} stream file(s),"
+        f" freed {gc_lib.human_bytes(totals.reclaimable)}"
+        + (f", {report['errors']} error(s)" if report["errors"] else "")
         + (f", {len(skipped)} job(s)/run folder(s) skipped" if skipped else ""),
-        1 if errors else 0,
+        # The archive's own code: 5 store unreachable, 3 lock held, 1 failures.
+        report["exit"] or (1 if report["errors"] else 0),
     )
 
 
@@ -669,10 +705,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print the history as JSON")
     p.set_defaults(func=cmd_slots)
 
-    p = sub.add_parser("gc", help="reclaim stream files of finished jobs (dry run unless --apply)")
+    p = sub.add_parser("gc", help="archive, then reclaim, stream files of finished jobs (dry run unless --apply)")
     p.add_argument("--runs-older-than", default=gc_lib.DEFAULT_DURATION, metavar="DURATION",
                    help="keep runs that finished within this window: 30m, 12h, 7d (default 7d)")
-    p.add_argument("--apply", action="store_true", help="remove the files; without it, only report")
+    p.add_argument("--keep", choices=("remove", "stub", "stripped"), default="remove",
+                   help="what stays at the path after a verified archive: remove (default), a stub "
+                        "pointer, or the stripped copy (the archive's own per-tool default)")
+    p.add_argument("--apply", action="store_true",
+                   help="archive each file, then reclaim it; without it, only report")
     p.set_defaults(func=cmd_gc)
 
     p = sub.add_parser("verdicts", help="re-parse report.md of finished jobs whose verdict is none (dry run unless --apply)")

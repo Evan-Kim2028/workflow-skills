@@ -21,9 +21,11 @@ folders. This module is the broker's answer, and it runs from ``Broker.tick``:
 - :func:`retention` shrinks the job folder of a terminal job older than
   ``janitor.jobs_keep_days`` (default 7). ``prompt.md``, ``report.md`` and the
   run's ``out-*.md`` stay, and the verdict lives in the job row; the pi streams,
-  session logs and err logs are gzipped in place, or deleted when a single file
-  is larger than :data:`GZIP_MAX_BYTES` (compressing a multi-gigabyte stream is
-  not worth a broker tick).
+  session logs and err logs are gzipped in place. A single file larger than
+  :data:`GZIP_MAX_BYTES` is **not** deleted: compressing a multi-gigabyte stream
+  is not worth a broker tick, and the owner rule keeps logs until a verified
+  archive exists, so it is left for the hourly log archive pass
+  (``agent_dash.py logs archive --agentq``) and counted as ``needs_archive``.
 - :func:`disk_state` reads free space on the volume holding the scratch root
   against ``slots.disk_floor_gb`` (default 25). Below the floor the broker holds
   new ``write`` and ``tests`` admissions (they queue, they never fail) and runs
@@ -68,7 +70,9 @@ JANITOR_INTERVAL_S = 300.0
 #: Retention work per pass, so one tick never walks thousands of job folders.
 RETENTION_JOBS_PER_PASS = 10
 RETENTION_FILES_PER_JOB = 20
-#: A file larger than this is deleted rather than gzipped.
+#: A file larger than this is left for the log archive pass instead of being
+#: gzipped in a broker tick. It is never deleted: the owner rule keeps logs until
+#: a verified archive exists (``dash/logarchive.py``).
 GZIP_MAX_BYTES = 32 * 1024 * 1024
 
 #: Files kept at the job root whatever their size: the prompt, the report, the verdict.
@@ -453,7 +457,7 @@ def retention(home, jobs, *, now: float, keep_days: float, gzip_max: int = GZIP_
             continue
         freed = 0
         gzipped = 0
-        deleted = 0
+        needs_archive = 0
         for path in files:
             try:
                 size = path.stat().st_size
@@ -461,23 +465,24 @@ def retention(home, jobs, *, now: float, keep_days: float, gzip_max: int = GZIP_
                 continue
             try:
                 if size > gzip_max:
-                    path.unlink()
-                    freed += size
-                    deleted += 1
-                else:
-                    freed += _gzip_file(path)
-                    gzipped += 1
+                    # Never delete: a log leaves its path only after the archive
+                    # has a verified zstd copy and its rows are in the store.
+                    needs_archive += 1
+                    continue
+                freed += _gzip_file(path)
+                gzipped += 1
             except OSError:
                 continue
-        if not (gzipped or deleted):
+        if not (gzipped or needs_archive):
             continue
-        done.append({"job_id": job_id, "label": job.get("label") or "", "files": gzipped + deleted,
-                     "gzipped": gzipped, "deleted": deleted, "bytes": freed})
-        if record_events:
+        done.append({"job_id": job_id, "label": job.get("label") or "", "files": gzipped,
+                     "gzipped": gzipped, "needs_archive": needs_archive, "bytes": freed})
+        if record_events and gzipped:
             record(home, kind="retention", label=str(job.get("label") or ""), path=job_root,
                    size=freed, now=now)
     return {"jobs": done, "bytes": sum(item["bytes"] for item in done),
-            "files": sum(item["files"] for item in done)}
+            "files": sum(item["files"] for item in done),
+            "needs_archive": sum(item["needs_archive"] for item in done)}
 
 
 def run(home, conn, *, now: float, settings: dict, root=None, record_events: bool = True) -> dict:
@@ -543,6 +548,8 @@ def format_pass(report: dict) -> str:
     return "janitor: scratch %d folder(s) %s, passed worktrees %d, retention %d file(s) %s" % (
         len(scratch["removed"]), gc_lib.human_bytes(scratch["bytes"]), len(worktrees["removed"]),
         kept["files"], gc_lib.human_bytes(kept["bytes"]),
+    ) + (
+        ", %d file(s) left for the log archive" % kept["needs_archive"] if kept.get("needs_archive") else ""
     )
 
 
