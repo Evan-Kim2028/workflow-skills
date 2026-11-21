@@ -594,3 +594,106 @@ class OnePassTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True)
+
+
+class PassWorktreeTests(Base):
+    """A passed job's auto worktree goes; any other outcome, or a dirty tree, keeps it."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+        self.trashed = []
+
+    def settings(self, **over):
+        cfg = janitor.settings()
+        cfg.update(over)
+        return cfg
+
+    def wt_job(self, *, verdict="PASS", state="done", finished_ago=3600.0, prompt="Do the thing.\n"):
+        job_id = self.job(state=state, verdict=verdict, finished_at=self.now - finished_ago, kind="write",
+                          prompt=prompt)
+        path = self.tmp / "worktrees" / "repo" / f"agentq-{job_id}"
+        git(self.repo, "worktree", "add", "-q", "-b", f"agentq/{job_id}", str(path), "main")
+        (path / ".venv").mkdir()
+        (path / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        git(path, "add", ".gitignore")
+        git(path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work")
+        self.conn.execute("UPDATE jobs SET workspace=?, orig_workspace=? WHERE id=?",
+                          (str(path), str(self.repo), job_id))
+        self.conn.commit()
+        return job_id, path
+
+    def reap(self, cwds=lambda: [], **over):
+        return janitor.reap_pass_worktrees(self.home, db.select_jobs(self.conn), now=self.now,
+                                           settings=self.settings(**over), cwds=cwds,
+                                           empty=self.trashed.append)
+
+    def test_a_passed_clean_worktree_is_removed_and_its_branch_kept(self):
+        job_id, path = self.wt_job()
+        report = self.reap()
+        self.assertEqual([item["job_id"] for item in report["removed"]], [job_id])
+        self.assertFalse(path.exists())
+        self.assertNotIn(str(path), git(self.repo, "worktree", "list").stdout)
+        self.assertEqual(git(self.repo, "branch", "--list", f"agentq/{job_id}").stdout.strip(), f"agentq/{job_id}")
+        self.assertEqual(len(self.trashed), 1)
+        self.assertEqual([row["kind"] for row in slots.read_events(self.home)], ["worktree"])
+
+    def test_blocked_partial_dead_and_cancelled_jobs_keep_their_worktree(self):
+        paths = [self.wt_job(verdict="BLOCKED")[1], self.wt_job(verdict="PARTIAL")[1],
+                 self.wt_job(state="failed", verdict="DEAD")[1], self.wt_job(state="cancelled", verdict=None)[1]]
+        report = self.reap()
+        self.assertEqual(report["removed"], [])
+        self.assertTrue(all(path.exists() for path in paths))
+
+    def test_a_pass_inside_the_grace_is_kept(self):
+        _, path = self.wt_job(finished_ago=60.0)
+        self.assertEqual(self.reap()["removed"], [])
+        self.assertTrue(path.exists())
+
+    def test_uncommitted_work_keeps_the_worktree(self):
+        _, path = self.wt_job()
+        (path / "notes.txt").write_text("unsaved\n", encoding="utf-8")
+        report = self.reap()
+        self.assertEqual(report["removed"], [])
+        self.assertEqual(report["kept"][0]["reason"], "uncommitted or untracked files")
+        self.assertTrue(path.exists())
+
+    def test_a_process_inside_the_worktree_keeps_it(self):
+        _, path = self.wt_job()
+        report = self.reap(cwds=lambda: [os.path.realpath(path / "sub")])
+        self.assertEqual(report["kept"][0]["reason"], "a process is working inside it")
+        self.assertTrue(path.exists())
+
+    def test_a_failed_process_scan_keeps_everything(self):
+        _, path = self.wt_job()
+        report = self.reap(cwds=lambda: None)
+        self.assertEqual(report["kept"][0]["reason"], "process scan failed")
+        self.assertTrue(path.exists())
+
+    def test_keep_worktree_in_the_front_matter_opts_out(self):
+        _, path = self.wt_job(prompt="---\nkeep_worktree: true\n---\nDo the thing.\n")
+        self.assertEqual(self.reap()["kept"][0]["reason"], "keep_worktree")
+        self.assertTrue(path.exists())
+
+    def test_a_folder_on_another_branch_is_never_removed(self):
+        job_id, path = self.wt_job()
+        git(path, "checkout", "-q", "-b", "someone-else")
+        self.assertIn("not agentq/", self.reap()["kept"][0]["reason"])
+        self.assertTrue(path.exists())
+
+    def test_the_pass_limit_caps_removals(self):
+        paths = [self.wt_job()[1] for _ in range(3)]
+        report = self.reap(pass_worktrees_per_pass=2)
+        self.assertEqual(len(report["removed"]), 2)
+        self.assertEqual(sum(path.exists() for path in paths), 1)
+
+    def test_a_job_without_an_auto_worktree_is_ignored(self):
+        self.job(finished_at=self.now - 3600.0)
+        self.assertEqual(self.reap(), {"removed": [], "kept": []})

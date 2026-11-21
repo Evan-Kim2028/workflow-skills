@@ -101,6 +101,19 @@ running or queued job's scratch is never touched, and neither is a job whose run
 folder still has a live pid in `running/`. A job opts out with `keep_scratch:
 true` in its prompt front matter; an unreadable prompt counts as an opt-out.
 
+**Passed-job worktrees.** A write job's auto worktree (`agentq-<id>` on branch
+`agentq/<id>`) goes once the job is `done` with verdict `PASS` and
+`janitor.pass_worktree_grace_s` (default `900`) has passed. Any other outcome
+(`BLOCKED`, `PARTIAL`, `DEAD`, cancelled) keeps its worktree for the lead. It goes
+only when git confirms the folder is a worktree of the job's `orig_workspace` on
+`agentq/<id>`, `git status --porcelain` is empty, the run folder has no live pid,
+`lsof` finds no process with its cwd inside, and the prompt does not set
+`keep_worktree: true`. The branch stays, so `git worktree add <path> agentq/<id>`
+brings the checkout back. The folder is renamed into `.agentq-trash/` beside it,
+`git worktree prune` drops it, and a detached `nice rm -rf` empties the trash, so
+the tick never waits on deleting a `.venv`. At most
+`janitor.pass_worktrees_per_pass` (default `8`) go per pass.
+
 **Job-dir retention.** A terminal job older than `janitor.jobs_keep_days`
 (default `7`) keeps `prompt.md`, `report.md` and the run's `out-*.md`, and the
 verdict stays in the job row. Its pi streams, pi session logs and err logs are
@@ -123,7 +136,8 @@ on every tick instead of every five minutes.
 ```json
 {
   "slots": {"disk_floor_gb": 25},
-  "janitor": {"scratch_grace_s": 3600, "jobs_keep_days": 7}
+  "janitor": {"scratch_grace_s": 3600, "jobs_keep_days": 7,
+              "pass_worktree_grace_s": 900, "pass_worktrees_per_pass": 8}
 }
 ```
 

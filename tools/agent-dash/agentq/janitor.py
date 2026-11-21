@@ -14,6 +14,10 @@ folders. This module is the broker's answer, and it runs from ``Broker.tick``:
   agentq did not create, or one belonging to another job that reused the label,
   is never touched. A job opts out with ``keep_scratch: true`` in its prompt
   front matter.
+- :func:`reap_pass_worktrees` removes the auto worktree of a job that finished
+  with verdict ``PASS`` once ``janitor.pass_worktree_grace_s`` (default 15
+  minutes) has passed and the tree is clean; the branch stays. Other verdicts
+  keep their worktree. Guards: :mod:`agentq.wtreap`.
 - :func:`retention` shrinks the job folder of a terminal job older than
   ``janitor.jobs_keep_days`` (default 7). ``prompt.md``, ``report.md`` and the
   run's ``out-*.md`` stay, and the verdict lives in the job row; the pi streams,
@@ -46,6 +50,7 @@ from pathlib import Path
 
 from agentq import db
 from agentq import gc as gc_lib
+from agentq import wtreap
 
 #: The scratch root override ``dash/scratchdir.py`` reads, and its default.
 SCRATCH_ROOT_ENV = "AGENT_DASH_SCRATCH_ROOT"
@@ -83,6 +88,8 @@ DEFAULT_SETTINGS = {
     "scratch_grace_s": DEFAULT_SCRATCH_GRACE_S,
     "jobs_keep_days": DEFAULT_JOBS_KEEP_DAYS,
     "disk_floor_gb": DEFAULT_DISK_FLOOR_GB,
+    "pass_worktree_grace_s": wtreap.DEFAULT_GRACE_S,
+    "pass_worktrees_per_pass": wtreap.DEFAULT_PER_PASS,
 }
 
 
@@ -474,13 +481,29 @@ def retention(home, jobs, *, now: float, keep_days: float, gzip_max: int = GZIP_
 
 
 def run(home, conn, *, now: float, settings: dict, root=None, record_events: bool = True) -> dict:
-    """One janitor pass: reap finished scratch, then shrink old job folders."""
+    """One janitor pass: reap finished scratch, remove passed jobs' worktrees, shrink old job folders."""
     jobs = db.select_jobs(conn)
     scratch = reap_scratch(home, jobs, now=now, grace_s=settings["scratch_grace_s"], root=root,
                            record_events=record_events)
+    worktrees = reap_pass_worktrees(home, jobs, now=now, settings=settings, record_events=record_events)
     kept = retention(home, jobs, now=now, keep_days=settings["jobs_keep_days"],
                      record_events=record_events)
-    return {"scratch": scratch, "retention": kept}
+    return {"scratch": scratch, "worktrees": worktrees, "retention": kept}
+
+
+def reap_pass_worktrees(home, jobs, *, now: float, settings: dict, record_events: bool = True,
+                        cwds=None, empty=None) -> dict:
+    """Remove the auto worktrees of jobs that passed (see :mod:`agentq.wtreap`), recording each one."""
+    report = wtreap.reap(
+        jobs, now=now, grace_s=settings["pass_worktree_grace_s"],
+        limit=int(settings["pass_worktrees_per_pass"]), front_matter=front_matter,
+        run_dir_live=gc_lib.run_dir_live, cwds=cwds or wtreap.process_cwds,
+        empty=empty or wtreap.empty_trash,
+    )  # fmt: skip
+    if record_events:
+        for item in report["removed"]:
+            record(home, kind="worktree", label=item["label"], path=item["path"], size=0, now=now)
+    return report
 
 
 def held_count(conn) -> int:
@@ -516,8 +539,9 @@ def format_pass(report: dict) -> str:
     """One log line for a janitor pass that reclaimed anything."""
     scratch = report["scratch"]
     kept = report["retention"]
-    return "janitor: scratch %d folder(s) %s, retention %d file(s) %s" % (
-        len(scratch["removed"]), gc_lib.human_bytes(scratch["bytes"]),
+    worktrees = report.get("worktrees") or {"removed": []}
+    return "janitor: scratch %d folder(s) %s, passed worktrees %d, retention %d file(s) %s" % (
+        len(scratch["removed"]), gc_lib.human_bytes(scratch["bytes"]), len(worktrees["removed"]),
         kept["files"], gc_lib.human_bytes(kept["bytes"]),
     )
 
@@ -525,4 +549,9 @@ def format_pass(report: dict) -> str:
 def reclaimed(report: dict) -> int:
     """Total bytes a pass reclaimed."""
     return int(report["scratch"]["bytes"]) + int(report["retention"]["bytes"])
+
+
+def did_work(report: dict) -> bool:
+    """True when a pass reclaimed bytes or removed a passed job's worktree."""
+    return bool(reclaimed(report) or (report.get("worktrees") or {}).get("removed"))
 

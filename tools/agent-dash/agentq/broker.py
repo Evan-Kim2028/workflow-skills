@@ -1278,10 +1278,11 @@ class Broker:
         held, state = self._disk_gate(conn, settings)
         if not (held or now >= self._janitor_at):
             return {"scratch": {"removed": [], "kept": [], "bytes": 0},
+                    "worktrees": {"removed": [], "kept": []},
                     "retention": {"jobs": [], "bytes": 0, "files": 0}}
         self._janitor_at = now + janitor_lib.JANITOR_INTERVAL_S
         report = janitor_lib.run(self.home, conn, now=now, settings=settings)
-        if janitor_lib.reclaimed(report):
+        if janitor_lib.did_work(report):
             self.log(janitor_lib.format_pass(report))
         return report
 

@@ -433,6 +433,16 @@
     "dash/worktrees.py": [
       "test_worktrees"
     ],
+    "agentq/broker.py": [
+      "test_agentq_broker",
+      "test_agentq_janitor"
+    ],
+    "agentq/janitor.py": [
+      "test_agentq_janitor"
+    ],
+    "agentq/wtreap.py": [
+      "test_agentq_janitor"
+    ],
     "dash/wtjanitor.py": [
       "test_wtjanitor"
     ],
