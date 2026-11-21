@@ -363,6 +363,14 @@ class LaneAndSlotTests(ProcessCleanup):
             broker.tick()
         self.assertEqual([call["id"] for call in launcher.calls], [a, d, c, b])
 
+    def test_worker_env_carries_the_watchdog_deadline_as_epoch_seconds(self):
+        write_config(self.home, slots={"light": 1, "tests": 0, "ssh": 0})
+        job_id = submit(self.env, self.prompt, label="deadline", now=Clock(1000.0))
+        launcher = self.fake(live_s=0)
+        make_broker(self.home, launcher, clock=Clock(1000.0)).tick()
+        max_runtime = row(self.home, job_id)["max_runtime_s"]
+        self.assertEqual(launcher.calls[0]["env"]["AGENTQ_DEADLINE"], str(int(1000.0 + max_runtime)))
+
     def test_urgent_holds_at_most_its_share_while_normal_jobs_wait(self):
         write_config(self.home, slots={"light": 10, "tests": 0, "ssh": 0})
         urgent = [submit(self.env, self.prompt, "--urgent", label=f"u{i}") for i in range(6)]
