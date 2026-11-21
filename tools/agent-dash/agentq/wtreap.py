@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ DEFAULT_PER_PASS = 8
 TRASH_DIR = ".agentq-trash"
 GIT_TIMEOUT_S = 30.0
 SCAN_TIMEOUT_S = 20.0
+SBIN_DIRS = ("/usr/sbin", "/usr/bin", "/sbin")
 JOB_ID_RE = re.compile(r"[0-9a-f]{6,64}")
 TRUE_WORDS = ("1", "true", "yes", "on")
 
@@ -59,10 +61,18 @@ def _git(cwd, *args) -> subprocess.CompletedProcess | None:
 
 
 def process_cwds() -> list[str] | None:
-    """The cwd of every process ``lsof`` can see, or None when the scan failed."""
+    """The cwd of every process ``lsof`` can see, or None when the scan failed.
+
+    launchd starts the broker with a PATH that leaves out ``/usr/sbin``, where macOS
+    keeps ``lsof``, so the system folders are searched after PATH.
+    """
+    search = os.pathsep.join([os.environ.get("PATH", ""), *SBIN_DIRS])
+    lsof = shutil.which("lsof", path=search)
+    if lsof is None:
+        return None
     try:
         done = subprocess.run(
-            ["lsof", "-w", "-d", "cwd", "-Fn"], capture_output=True, text=True,
+            [lsof, "-w", "-d", "cwd", "-Fn"], capture_output=True, text=True,
             timeout=SCAN_TIMEOUT_S, check=False, stdin=subprocess.DEVNULL,
         )  # fmt: skip
     except (OSError, subprocess.SubprocessError):
