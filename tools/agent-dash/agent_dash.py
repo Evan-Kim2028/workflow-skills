@@ -124,11 +124,16 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py logs sessions [--apply] [--no-reclaim] [--scheduled] [--tool NAME]... [--limit N] [--max-minutes M] [--url URL] [--dest DIR]
   python3 agent_dash.py logs sessions restore <session-id|unit|archive> [--to DIR]
   python3 agent_dash.py logs sessions status
+  python3 agent_dash.py logs sessions recompress [--apply] [--limit N] [--tool NAME]...
+      [--max-minutes N] [--max-unit-mib N] [--dest DIR]
+  python3 agent_dash.py logs sessions manifest compact [--apply] [--older-than-days 7] [--dest DIR]
   python3 agent_dash.py logs scheduled [--apply] [--url URL]
+  python3 agent_dash.py storage budget [--json] [--no-record] [--history PATH] [--url URL]
   python3 agent_dash.py scratch gc [--older-than-days 7] [--finished-after-hours H] [--log-min-mb 100] [--log-idle-hours 6] [--no-compact-logs] [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
   python3 agent_dash.py janitor postgres [--min-age 1h] [--apply]
   python3 agent_dash.py janitor temp [--min-age 5h] [--apply]
+  python3 agent_dash.py janitor agentq [--older-than-days 7] [--apply] [--json]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -473,11 +478,22 @@ def main(argv: list[str] | None = None) -> int:
         from dash.scratchgc import cmd_scratch
 
         return cmd_scratch(args[1:])
+    if cmd == "storage":
+        if len(args) < 2 or args[1] != "budget":
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+        from dash import storagebudget
+
+        return storagebudget.main(args[1:])
     if cmd == "janitor":
         if len(args) >= 2 and args[1] == "temp":
             from dash.tempjanitor import cmd_temp
 
             return cmd_temp(args[2:])
+        if len(args) >= 2 and args[1] == "agentq":
+            from dash.agentqjanitor import cmd_agentq
+
+            return cmd_agentq(args[2:])
         if len(args) < 2 or args[1] != "postgres":
             print(USAGE, end="", file=sys.stderr)
             return 2
@@ -519,7 +535,7 @@ def cmd_logs_scheduled(argv: list[str] | None = None) -> int:
             print("unknown logs scheduled argument: %s" % a, file=sys.stderr)
             return 2
         i += 1
-    from dash import logarchive, sessionarchive
+    from dash import agentqjanitor, logarchive, sessionarchive, storagebudget
 
     print("== logs sessions --scheduled", flush=True)
     sessions_rc = sessionarchive.run({"apply": apply, "scheduled": True, "url": url})
@@ -527,7 +543,21 @@ def cmd_logs_scheduled(argv: list[str] | None = None) -> int:
     archive_rc = logarchive.run(
         {"agentq": True, "apply": apply, "scheduled": True, "url": url or logarchive.vlogs.DEFAULT_URL}
     )
-    return max(sessions_rc, archive_rc)
+    # agentq's own backup cruft (broker.json.bak-*, agentq.db.bak-*,
+    # ws-live-edits-*.patch) is compressed in place, never deleted. It is a
+    # no-op when nothing is older than 7 days, so the hourly tick costs one
+    # directory listing.
+    print("== janitor agentq", flush=True)
+    janitor_rc = agentqjanitor.run(apply=apply)
+    # The storage budget measures once a day (it skips when the last sample is
+    # under 20 h old). It never deletes anything; an alert exits 1 so the
+    # launchd job's failure is visible, and the doctor check reads the same
+    # history file for the dashboard.
+    print("== storage budget", flush=True)
+    # A dry run measures and prints but records no sample: only --apply (what
+    # the launchd job runs) writes history.
+    storage_rc = storagebudget.run({"scheduled": True, "url": url, "record": bool(apply)})
+    return max(sessions_rc, archive_rc, janitor_rc, storage_rc)
 
 
 def cmd_run(argv: list[str] | None = None) -> int:

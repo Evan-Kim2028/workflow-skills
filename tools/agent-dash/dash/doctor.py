@@ -287,6 +287,7 @@ def collect_problems(
     _collect_labels(ctx)
     _collect_page(ctx)
     _collect_config(ctx)
+    _collect_storage(ctx)
     _collect_linear(ctx)
     _collect_checkout(ctx)
     _collect_build(ctx)
@@ -1556,6 +1557,55 @@ def _collect_config(ctx) -> None:
 
 LINEAR_OUTBOX_MAX_ROWS = 50
 LINEAR_STALE_S = 600.0
+
+
+def _collect_storage(ctx) -> None:
+    """The daily storage budget: disk share and days to 80% (dash.storagebudget).
+
+    Reads the last line of the history file only, so a doctor pass costs one
+    small read and never walks a tree or calls the store. A missing history
+    is not a problem: the hourly archive job writes the first sample, and
+    until then the check reports that it has nothing to say.
+    """
+    try:
+        from dash import storagebudget
+    except Exception:  # pragma: no cover - an import error is not a doctor problem
+        return
+    try:
+        payload = storagebudget.latest(ctx.cfg, now=ctx.now)
+    except Exception as exc:
+        _check(ctx, "storage", False, "storage budget unreadable: %s" % exc)
+        return
+    sample = payload.get("sample")
+    if not sample:
+        _check(ctx, "storage", True, "no storage sample yet")
+        return
+    disk = sample.get("disk") or {}
+    days = (payload.get("projection") or {}).get("days") or {}
+    detail = "disk %.1f%% used, %.1f GiB free, %s to 80%% at the 7-day rate" % (
+        float(disk.get("pct") or 0.0),
+        float(disk.get("free") or 0) / 1024.0 ** 3,
+        storagebudget.human_days(days.get("80")),
+    )
+    state = payload.get("state")
+    if state == "alert":
+        _check(ctx, "storage", False, detail)
+        _add(
+            ctx, "storage-budget", "critical", "global", None,
+            "Storage budget alert",
+            detail,
+            "python3 agent_dash.py storage budget",
+        )
+    elif state == "warn":
+        _check(ctx, "storage", False, detail)
+        _add(
+            ctx, "storage-budget", "warn", "global", None,
+            "Storage budget warning",
+            detail,
+            "python3 agent_dash.py storage budget",
+        )
+    else:
+        _check(ctx, "storage", True, detail)
 
 
 def _linear_epoch(value):

@@ -6,7 +6,7 @@ and, for each finished one, does this, in order:
 
 1. **measure** (one streaming pass, bounded memory): base64 runs are
    replaced with ``dash.logfilter`` markers, the stripped bytes go through
-   ``zstd -9`` into the mirror path under ``<state>/log-archive/``, and both
+   ``zstd -9 --long=27`` into the mirror path under ``<state>/log-archive/``, and both
    the raw and the stripped bytes are scanned for line count and assistant
    token totals (``message_end``, role assistant: input, output, cacheRead).
    A sha256 of the stripped bytes is kept.
@@ -87,6 +87,10 @@ def default_roots() -> list[str]:
 
 MIN_IDLE_HOURS = 3.0
 ZSTD_LEVEL = "-9"
+#: -9 with a 128 MiB window: -19 --long=31 saved 2-5% for 20-180x the CPU
+#: (2026-11-21 measurement), too costly on the shared laptop. Readers pass the
+#: same window flag.
+ZSTD_LONG = "--long=27"
 #: Largest message_end line whose body is kept for token parsing. Larger
 #: lines are counted but not parsed; the verify step then refuses them.
 PARSE_CAP = 64 * 2**20
@@ -812,7 +816,7 @@ def measure(path: str, zst_out: str | None, tok: str = DEFAULT_TOKEN_TYPE, compr
     raw_scan, out_scan = Scan(tok), Scan(tok)
     digest = hashlib.sha256()
     zproc = subprocess.Popen(
-        [_zstd_path(), ZSTD_LEVEL, "-q", "-c"],
+        [_zstd_path(), ZSTD_LEVEL, ZSTD_LONG, "-q", "-c"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
     )
@@ -862,7 +866,7 @@ def measure(path: str, zst_out: str | None, tok: str = DEFAULT_TOKEN_TYPE, compr
 
 def decompressed_sha256(zst_path: str) -> str:
     """sha256 of the zstd file's decompressed content, streamed."""
-    proc = subprocess.Popen([_zstd_path(), "-d", "-q", "-c", zst_path], stdout=subprocess.PIPE)
+    proc = subprocess.Popen([_zstd_path(), "-d", ZSTD_LONG, "-q", "-c", zst_path], stdout=subprocess.PIPE)
     digest = hashlib.sha256()
     try:
         while True:
@@ -908,7 +912,7 @@ def _iter_stored_lines(zst_path: str):
     ``total_len`` is the whole line length. The final line without a
     newline is yielded too, as in ``Scan``.
     """
-    proc = subprocess.Popen([_zstd_path(), "-d", "-q", "-c", zst_path], stdout=subprocess.PIPE)
+    proc = subprocess.Popen([_zstd_path(), "-d", ZSTD_LONG, "-q", "-c", zst_path], stdout=subprocess.PIPE)
     cap = vlogs.MAX_MSG_BYTES
     prefix = bytearray()
     total = 0
@@ -1128,7 +1132,7 @@ def reclaim(entry: Entry, zst: Path, keep: str, manifest_rec: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(body)
     elif keep == "stripped":
-        proc = subprocess.Popen([_zstd_path(), "-d", "-q", "-c", str(zst)], stdout=subprocess.PIPE)
+        proc = subprocess.Popen([_zstd_path(), "-d", ZSTD_LONG, "-q", "-c", str(zst)], stdout=subprocess.PIPE)
         with open(tmp, "wb") as fh:
             shutil.copyfileobj(proc.stdout, fh)
         proc.stdout.close()
@@ -1323,7 +1327,7 @@ def print_totals(totals: Totals, plans: list[Plan], out) -> None:
     print("totals (%d files):" % totals.files, file=out)
     print("  raw        %s  (%d bytes)" % (_fmt(totals.raw), totals.raw), file=out)
     print("  stripped   %s  (%d bytes)" % (_fmt(totals.stripped), totals.stripped), file=out)
-    print("  zstd -9    %s  (%d bytes)" % (_fmt(totals.zst), totals.zst), file=out)
+    print("  zstd %-5s %s  (%d bytes)" % (ZSTD_LEVEL, _fmt(totals.zst), totals.zst), file=out)
     print("  reclaimable %s  (%d bytes)" % (_fmt(totals.reclaimable), totals.reclaimable), file=out)
     for tool in sorted(totals.by_tool):
         row = totals.by_tool[tool]

@@ -24,8 +24,8 @@ Code, pi, muse) is handled by a separate, lossless job: see
 
 ## The archive pass, per file
 
-1. **measure** (one streaming pass): filter, count lines and assistant tokens on the raw and stripped bytes, write zstd -9 to a temp file, keep the stripped sha256.
-2. **verify the copy**: `zstd -d` of the copy must hash to the stripped sha256; raw and stripped line counts and token sums must be equal; no unparsed message lines.
+1. **measure** (one streaming pass): filter, count lines and assistant tokens on the raw and stripped bytes, write `zstd -19 --long=31` to a temp file, keep the stripped sha256.
+2. **verify the copy**: `zstd -d --long=31` of the copy must hash to the stripped sha256; raw and stripped line counts and token sums must be equal; no unparsed message lines.
 3. **ingest**: rows are read back from the zstd copy (never the raw file), redacted, truncated if over 1.8 MiB, posted with `Content-Type: application/stream+json`. Before posting, the store is asked how many rows the path already has: 0 means ingest; the expected count means done (skip the POST); anything else is an error that names the path and stops that file.
 4. **verify the store**: row count equals the line count; stored token sums (`unpack_json` over `_msg`) equal the sums over the rows sent.
 5. **reclaim** (`--apply` only): re-check size, mtime and open handles, then apply `--keep`.
@@ -46,7 +46,7 @@ Run 2026-11-06, `python3 agent_dash.py logs archive` (defaults: both hub roots, 
 | Ignored (not a stream) | 2 (`runs.ndjson`, `silver_pop_report.ndjson`) |
 | Raw | 13.43 GB |
 | Stripped | 3.13 GB |
-| zstd -9 | 0.19 GB |
+| zstd -9 (the level at the time; new copies use -19 --long=31) | 0.19 GB |
 | Reclaimable with `--keep remove` for every tool (the first run; per-tool defaults are below) | 13.43 GB |
 
 The brief's raw (13.43 GB), stripped (3.13 GB) and zstd (0.18 GB, here 0.19 GB) figures reproduce. The VictoriaLogs disk figure (0.25 GB) was not measured in this pass.

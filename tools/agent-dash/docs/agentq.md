@@ -197,6 +197,13 @@ on every tick instead of every five minutes.
 }
 ```
 
+**Backup cruft.** `~/.local/state/agentq` also collects `broker.json.bak-*`,
+`agentq.db.bak-*`, `ws-live-edits-*.patch` and `*.plist.bak-*` files that nothing
+pruned. `agent_dash.py janitor agentq` zstd-compresses a backup older than 7 days
+in place and removes the plain file only after the compressed copy verifies; it
+never deletes history. The hourly archive tick runs it with `--apply`. See
+[storage-budget.md](storage-budget.md#agentq-backup-cruft).
+
 `agentq status` and `agentq slots` print one line for it: free GB, the floor, how
 many jobs the gate is holding, and whether the gate is open or held. Every reap
 appends a `reclaimed` row to `slots/events.jsonl` with the bytes, so

@@ -74,9 +74,17 @@ DEFAULT_RECLAIM_DAYS = 14.0
 DEFAULT_MAX_MINUTES = 90.0
 #: Warn (but still run) when the dest volume has less free space than this.
 DISK_WARN_GB = 30.0
-ZSTD_LEVEL = "-12"
-ZSTD_LONG = "--long=27"
+#: zstd settings for new units. ``-19 --long=31`` is the slow, small end of
+#: the range: a unit is written once and read rarely, so the CPU is spent
+#: once and the bytes are saved for the life of the archive. ``--long=31``
+#: needs a 2 GiB window to decompress, so every reader passes ZSTD_LONG
+#: (``-dc --long=31``); a plain ``zstd -d`` on a long-window frame fails.
+ZSTD_LEVEL = "-19"
+ZSTD_LONG = "--long=31"
 ZSTD_THREADS = "-T2"
+#: The level older units were written with; ``recompress`` upgrades them.
+LEGACY_ZSTD_LEVEL = "-12"
+LEGACY_ZSTD_LONG = "--long=27"
 READ_CHUNK = 1 << 20
 #: A line longer than this is truncated to ``vlogs.MAX_MSG_BYTES`` and the
 #: rest is discarded while streaming, so RSS stays bounded.
@@ -802,6 +810,266 @@ def _sha256_file(path: str) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# --------------------------------------------------------------- recompress
+
+#: A dry run measures this many units by default (the largest ones, so the
+#: sample is the units that matter); ``--apply`` defaults to every unit.
+RECOMPRESS_SAMPLE = 20
+#: Wall-clock budget for one ``recompress`` run. A unit is never interrupted
+#: mid-write, so the budget is checked between units and a run can overrun by
+#: one unit; ``--max-unit-mib`` bounds that overshoot.
+RECOMPRESS_MINUTES = 20.0
+#: Units larger than this (compressed) are reported and left for a run that
+#: raises the cap, so one huge rollout cannot eat a whole budget.
+RECOMPRESS_MAX_UNIT_MIB = 256.0
+
+
+def _decompressed_sha(path: str) -> tuple[str, int]:
+    """``(sha256, bytes)`` of the decompressed stream, streamed.
+
+    This is the identity check: two frames with the same decompressed
+    sha256 and length hold the same tar bytes, whatever the level.
+    """
+    proc = subprocess.Popen([_zstd_bin(), "-dc", ZSTD_LONG, path], stdout=subprocess.PIPE)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        while True:
+            chunk = proc.stdout.read(READ_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise ArchiveError("zstd -dc exited %d on %s" % (rc, path))
+    return digest.hexdigest(), total
+
+
+def _compress_file(src: str, dst: str) -> None:
+    """Compress ``src`` to ``dst`` at ZSTD_LEVEL/ZSTD_LONG (never in place)."""
+    proc = subprocess.run(
+        [_zstd_bin(), ZSTD_LEVEL, ZSTD_LONG, ZSTD_THREADS, "-q", "-f", "-o", dst, src],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise ArchiveError(
+            "zstd %s exited %d: %s" % (ZSTD_LEVEL, proc.returncode, proc.stderr.decode("utf-8", "replace")[:200])
+        )
+
+
+def _recompress_stream(src: str, dst: str) -> None:
+    """Decompress ``src`` and recompress the stream into ``dst`` at ZSTD_LEVEL.
+
+    A pipe, not a temp plain file: the archive is 11 GiB and a second
+    uncompressed copy would not fit beside it.
+    """
+    dec = subprocess.Popen([_zstd_bin(), "-dc", ZSTD_LONG, src], stdout=subprocess.PIPE)
+    enc = subprocess.Popen(
+        [_zstd_bin(), ZSTD_LEVEL, ZSTD_LONG, ZSTD_THREADS, "-q", "-f", "-o", dst],
+        stdin=dec.stdout,
+    )
+    dec.stdout.close()
+    rc_enc = enc.wait()
+    rc_dec = dec.wait()
+    if rc_dec != 0:
+        raise ArchiveError("zstd -dc exited %d on %s" % (rc_dec, src))
+    if rc_enc != 0:
+        raise ArchiveError("zstd %s exited %d on %s" % (ZSTD_LEVEL, rc_enc, dst))
+
+
+def recompress_unit(path, *, apply: bool = False) -> dict:
+    """Recompress one archive file to ZSTD_LEVEL, verified, then replace it.
+
+    The new frame is written beside the old one, decompressed back and
+    compared to the old frame's decompressed sha256 and length. Only an
+    identical stream replaces the old file (``os.replace``, atomic on the
+    same filesystem). A dry run does the same work and deletes the temp
+    file, so the reported saving is measured, not estimated.
+    """
+    path = str(path)
+    before = os.path.getsize(path)
+    old_sha, old_len = _decompressed_sha(path)
+    tmp = path + ".recompress.tmp"
+    try:
+        _recompress_stream(path, tmp)
+        after = os.path.getsize(tmp)
+        try:
+            new_sha, new_len = _decompressed_sha(tmp)
+        except ArchiveError as exc:
+            return {"path": path, "before": before, "after": after, "ok": False, "reason": str(exc)}
+        if new_sha != old_sha or new_len != old_len:
+            return {
+                "path": path, "before": before, "after": after, "ok": False,
+                "reason": "decompressed content differs (sha %s/%s, bytes %d/%d)"
+                % (old_sha[:12], new_sha[:12], old_len, new_len),
+            }
+        if apply:
+            os.replace(tmp, path)
+            _fsync_dir(os.path.dirname(path))
+        return {"path": path, "before": before, "after": after, "ok": True, "reason": ""}
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _fsync_dir(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _archive_files(state_dir, tools=None) -> list[Path]:
+    """Every ``<dest>/archive/<tool>/**/*.tar.zst``, largest first.
+
+    ``state_dir`` is ``<dest>/state``; the archive tree is its sibling, and a
+    unit key can carry a subdirectory (``proj/a.jsonl``), so the walk is
+    recursive.
+    """
+    base = Path(state_dir).parent / "archive"
+    out: list[Path] = []
+    if not base.is_dir():
+        return out
+    wanted = set(tools or ())
+    for tool_dir in sorted(base.iterdir()):
+        if not tool_dir.is_dir() or (wanted and tool_dir.name not in wanted):
+            continue
+        for path in tool_dir.rglob("*.tar.zst"):
+            if path.is_file() and not path.is_symlink():
+                out.append(path)
+    out.sort(key=lambda p: (-p.stat().st_size, str(p)))
+    return out
+
+
+def recompress(state_dir, *, apply: bool = False, limit: int | None = None,
+               tools=None, out=None, now: float | None = None,
+               max_minutes: float | None = None,
+               max_unit_mib: float | None = None) -> int:
+    """Upgrade archive units to ZSTD_LEVEL, one unit at a time.
+
+    Dry run unless ``apply``. ``limit`` defaults to :data:`RECOMPRESS_SAMPLE`
+    for a dry run and to every unit for ``--apply``. A unit already at the
+    current level (the manifest records ``zstd_level``/``zstd_long``) is
+    skipped, so a second run is a no-op. ``max_minutes`` stops between units
+    (default :data:`RECOMPRESS_MINUTES`; 0 means no budget) and
+    ``max_unit_mib`` leaves a unit bigger than that for a later run (default
+    :data:`RECOMPRESS_MAX_UNIT_MIB`; 0 means no cap). Both exist because
+    ``-19 --long=31`` costs 20 to 100 times the CPU of the old level: the
+    whole 11 GiB archive is many hours of work, so a run reports what it
+    covered and the next run continues where it stopped.
+
+    Returns 0, or 1 when a unit failed its identity check (the old file is
+    left untouched).
+    """
+    out = out or sys.stdout
+    now = time.time() if now is None else float(now)
+    max_minutes = RECOMPRESS_MINUTES if max_minutes is None else float(max_minutes)
+    max_unit_mib = RECOMPRESS_MAX_UNIT_MIB if max_unit_mib is None else float(max_unit_mib)
+    deadline = (time.time() + max_minutes * 60.0) if max_minutes > 0 else None
+    unit_cap = int(max_unit_mib * 1024 * 1024) if max_unit_mib > 0 else 0
+    state_dir = Path(_abs_path(state_dir))
+    manifest = Manifest(state_dir)
+    by_archive = {}
+    for rec in manifest.latest.values():
+        if rec.get("archive"):
+            by_archive[os.path.realpath(rec["archive"])] = rec
+    files = _archive_files(state_dir, tools)
+    if limit is None:
+        limit = 0 if apply else RECOMPRESS_SAMPLE
+    planned = files[: int(limit)] if limit else files
+    print(
+        "recompress %s: %d unit(s) at %s %s%s (budget %s min, unit cap %s MiB)"
+        % (state_dir, len(planned), ZSTD_LEVEL, ZSTD_LONG, "" if apply else " (dry run)",
+           ("%.0f" % max_minutes) if max_minutes > 0 else "none",
+           ("%.0f" % max_unit_mib) if max_unit_mib > 0 else "none"),
+        file=out, flush=True,
+    )
+    before_total = after_total = 0
+    done = skipped = failed = too_big = not_reached = 0
+    for index, path in enumerate(planned):
+        rec = by_archive.get(os.path.realpath(str(path)))
+        if rec and rec.get("zstd_level") == ZSTD_LEVEL and rec.get("zstd_long") == ZSTD_LONG:
+            skipped += 1
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if unit_cap and size > unit_cap:
+            too_big += 1
+            print("  skip %s: %.0f MiB is over the %.0f MiB unit cap" % (path.name, size / 1048576.0, max_unit_mib),
+                  file=out, flush=True)
+            continue
+        if deadline is not None and time.time() > deadline:
+            not_reached = len(planned) - index
+            print("  stop: out of budget (%s min); %d unit(s) left for the next run"
+                  % ("%.0f" % max_minutes, not_reached), file=out, flush=True)
+            break
+        started = time.time()
+        try:
+            res = recompress_unit(path, apply=apply)
+        except (ArchiveError, OSError) as exc:
+            failed += 1
+            print("  FAIL %s: %s" % (path.name, exc), file=out, flush=True)
+            continue
+        if not res["ok"]:
+            failed += 1
+            print("  FAIL %s: %s" % (path.name, res["reason"]), file=out, flush=True)
+            continue
+        done += 1
+        before_total += res["before"]
+        after_total += res["after"]
+        print(
+            "  %s %s  %d -> %d  (%+.1f%%)  in %.1fs"
+            % ("done" if apply else "would", path.name, res["before"], res["after"],
+               100.0 * (res["after"] - res["before"]) / res["before"] if res["before"] else 0.0,
+               time.time() - started),
+            file=out, flush=True,
+        )
+        if apply and rec:
+            manifest.write(
+                dict(
+                    rec,
+                    archive_bytes=res["after"],
+                    zstd_level=ZSTD_LEVEL,
+                    zstd_long=ZSTD_LONG,
+                    recompressed_ts=round(now, 3),
+                )
+            )
+    saved = before_total - after_total
+    pct = (100.0 * saved / before_total) if before_total else 0.0
+    print(
+        "%s %d unit(s): %d -> %d bytes, saved %d (%.1f%%); %d already current, %d failed,"
+        " %d over the unit cap, %d not reached"
+        % ("recompressed" if apply else "would recompress", done, before_total, after_total, saved, pct,
+           skipped, failed, too_big, not_reached),
+        file=out, flush=True,
+    )
+    if done and before_total and planned:
+        whole = sum(p.stat().st_size for p in files if p.is_file())
+        print(
+            "  measured %.1f%% of the archive's %d bytes; a whole-archive pass at this rate saves about %d bytes"
+            % (100.0 * (before_total) / whole if whole else 0.0, whole,
+               int(round(whole * (pct / 100.0)))),
+            file=out, flush=True,
+        )
+    if not apply and done:
+        print("dry run: nothing replaced; re-run with --apply", file=out, flush=True)
+    return 1 if failed else 0
 
 
 # --------------------------------------------------------------- rows
@@ -1779,12 +2047,294 @@ def recover_trash(dest, manifest: Manifest, out) -> int:
 
 # --------------------------------------------------------------- manifest
 
+#: Where the rolled-off manifest records live, under the state dir.
+MANIFEST_SEGMENTS = "manifest-segments"
+#: Records older than this many days are rolled into a segment.
+MANIFEST_KEEP_DAYS = 7.0
+#: Level for a segment. The manifest is 36k lines of near-identical JSON
+#: records, so the ratio flattens out far below the archive level: measured
+#: on a 100 MB slice, ``-9 --long=27`` took 4.3 s and gave 13.7 MB, while
+#: ``-19 --long=31`` took 238 s (55x) for 11.3 MB (18% less). 30 MB is not
+#: worth 49 minutes, so a segment is written at -9.
+MANIFEST_ZSTD_LEVEL = "-9"
+MANIFEST_ZSTD_LONG = "--long=27"
+
+
+def _segment_dir(state_dir) -> Path:
+    return Path(state_dir) / MANIFEST_SEGMENTS
+
+
+def manifest_segments(state_dir) -> list[Path]:
+    """The segment files, oldest first.
+
+    The name is ``seg-<newest-ts-ms>-<seq>.jsonl.zst``, so a plain name sort
+    is chronological: every segment holds records older than the cutoff at
+    the time it was written, and a later segment holds later records.
+    """
+    base = _segment_dir(state_dir)
+    if not base.is_dir():
+        return []
+    return sorted(p for p in base.glob("*.jsonl.zst") if p.is_file() and not p.is_symlink())
+
+
+def _iter_segment_lines(path):
+    """Yield the raw lines of one compressed segment (no truncation).
+
+    Manifest lines carry a member list and can be long, so this reads whole
+    lines rather than the bounded ``_split_lines`` used for log text.
+    """
+    proc = subprocess.Popen([_zstd_bin(), "-dc", ZSTD_LONG, str(path)], stdout=subprocess.PIPE)
+    try:
+        for line in proc.stdout:
+            yield line.decode("utf-8", "replace")
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise ArchiveError("zstd -dc exited %d on %s" % (rc, path))
+
+
+def _line_ts(line: str):
+    """The record's ``ts``, or ``None`` when the line is not a record."""
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    ts = rec.get("ts")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    return None
+
+
+def _next_segment_path(state_dir, newest_ts: float) -> Path:
+    base = _segment_dir(state_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    stem = "seg-%013d" % int(newest_ts * 1000)
+    seq = 0
+    while (base / ("%s-%04d.jsonl.zst" % (stem, seq))).exists():
+        seq += 1
+    return base / ("%s-%04d.jsonl.zst" % (stem, seq))
+
+
+def compact_manifest(state_dir, *, apply: bool = False, older_than_days: float = MANIFEST_KEEP_DAYS,
+                     out=None, now: float | None = None) -> int:
+    """Roll manifest records older than the cutoff into a zstd segment.
+
+    Lossless: every line is moved byte for byte, never re-serialized, and a
+    line whose ``ts`` cannot be read stays in the plain file (nothing is
+    dropped for being unparseable). The segment is written streaming - the
+    moved lines go through a pipe into ``zstd``, so the manifest is never
+    held in memory and never written out as a second plain copy - and it is
+    verified (the decompressed segment's sha256 and length equal the sha256
+    and length of the bytes that were moved) before the plain file is
+    replaced. Both replaces are atomic, and a crash between them leaves the
+    records in both places, which the "last record wins" read rule
+    tolerates.
+
+    Dry run unless ``apply``: it still writes and compresses the segment to
+    measure the real saving, then deletes it. Takes ``archive.lock`` so it
+    never races a pack. Returns 0, or 1 when the verification failed
+    (nothing replaced).
+    """
+    out = out or sys.stdout
+    now = time.time() if now is None else float(now)
+    state_dir = Path(_abs_path(state_dir))
+    path = state_dir / "manifest.jsonl"
+    if not path.exists():
+        print("manifest compact: no manifest at %s" % path, file=out)
+        return 0
+    cutoff = now - float(older_than_days) * 86400.0
+    before = path.stat().st_size
+    lock_fh = open(state_dir / "archive.lock", "a+")
+    try:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("manifest compact: another logs sessions run holds the lock", file=out)
+            return 3
+        # Pass 1 over the manifest: which lines move, and the newest of them
+        # (it names the segment). Nothing is held but the counts.
+        moved = 0
+        kept = 0
+        kept_bytes = 0
+        newest = 0.0
+        with open(path, "rb") as fh:
+            for raw in fh:
+                if not raw.strip():
+                    continue
+                ts = _line_ts(raw.decode("utf-8", "replace"))
+                if ts is not None and ts < cutoff:
+                    moved += 1
+                    newest = max(newest, ts)
+                else:
+                    kept += 1
+                    kept_bytes += len(raw)
+        if not moved:
+            print(
+                "manifest compact: nothing older than %.0f days (%d line(s) kept, %s)"
+                % (older_than_days, kept, _fmt(before)),
+                file=out,
+            )
+            return 0
+        segment = _next_segment_path(state_dir, newest)
+        tmp_seg = str(segment) + ".tmp"
+        tmp_manifest = str(path) + ".compact.tmp"
+        try:
+            want_sha, want_len, moved_bytes = _write_segment(path, tmp_seg, cutoff)
+        except ArchiveError as exc:
+            print("manifest compact: segment write failed (%s); nothing replaced" % exc, file=out)
+            _unlink_quiet(tmp_seg, tmp_manifest)
+            return 1
+        if moved_bytes != moved:
+            print(
+                "manifest compact: manifest changed while compacting (%d -> %d old line(s)); nothing replaced"
+                % (moved, moved_bytes),
+                file=out,
+            )
+            _unlink_quiet(tmp_seg, tmp_manifest)
+            return 3
+        try:
+            got_sha, got_len = _decompressed_sha(tmp_seg)
+        except ArchiveError as exc:
+            print("manifest compact: cannot read the new segment back (%s); nothing replaced" % exc, file=out)
+            _unlink_quiet(tmp_seg, tmp_manifest)
+            return 1
+        if got_sha != want_sha or got_len != want_len:
+            print(
+                "manifest compact: segment verification failed (sha %s/%s, bytes %d/%d); nothing replaced"
+                % (want_sha[:12], got_sha[:12], want_len, got_len),
+                file=out,
+            )
+            _unlink_quiet(tmp_seg, tmp_manifest)
+            return 1
+        seg_bytes = os.path.getsize(tmp_seg)
+        # Pass 2: the live tail, written to its own temp. It is the small
+        # half (records newer than the cutoff), so this one plain temp is
+        # bounded by the cutoff, not by the history.
+        kept_now = _write_tail(path, tmp_manifest, cutoff)
+        after = os.path.getsize(tmp_manifest)
+        try:
+            if apply:
+                os.replace(tmp_seg, segment)
+                _fsync_dir(str(segment.parent))
+                os.replace(tmp_manifest, path)
+                _fsync_dir(str(path.parent))
+            print(
+                "%s %d line(s) -> %s (%s); manifest %s -> %s; saved %s (%.1f%%)"
+                % (
+                    "rolled" if apply else "would roll",
+                    moved,
+                    segment.name,
+                    _fmt(seg_bytes),
+                    _fmt(before),
+                    _fmt(after),
+                    _fmt(before - after),
+                    100.0 * (before - after) / before if before else 0.0,
+                ),
+                file=out,
+            )
+            if kept_now != kept:
+                print(
+                    "note: %d record(s) were appended while compacting; they stay in the live tail"
+                    % (kept_now - kept),
+                    file=out,
+                )
+            if not apply:
+                print("dry run: nothing replaced; re-run with --apply", file=out)
+            return 0
+        finally:
+            _unlink_quiet(tmp_manifest)
+    finally:
+        lock_fh.close()
+
+
+def _unlink_quiet(*paths) -> None:
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _write_segment(manifest_path: Path, tmp_zst: str, cutoff: float) -> tuple[str, int, int]:
+    """Stream the old lines through ``zstd`` into ``tmp_zst``; return the check.
+
+    The moved bytes go straight into the compressor's stdin, so the manifest
+    is never held in memory and never written out as a second plain copy: at
+    36k lines and 1.2 GiB the old version of this wrote a 1.2 GiB plain temp.
+    The sha256 and length are of exactly the bytes that went in, which is
+    what the caller verifies against the decompressed segment.
+    """
+    digest = hashlib.sha256()
+    total = 0
+    lines = 0
+    enc = subprocess.Popen(
+        [_zstd_bin(), MANIFEST_ZSTD_LEVEL, MANIFEST_ZSTD_LONG, ZSTD_THREADS, "-q", "-f", "-o", tmp_zst],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with open(manifest_path, "rb") as src:
+            for raw in src:
+                if not raw.strip():
+                    continue
+                ts = _line_ts(raw.decode("utf-8", "replace"))
+                if ts is None or ts >= cutoff:
+                    continue
+                if not raw.endswith(b"\n"):
+                    raw += b"\n"
+                enc.stdin.write(raw)
+                digest.update(raw)
+                total += len(raw)
+                lines += 1
+        enc.stdin.close()
+    except BaseException:
+        enc.kill()
+        enc.wait()
+        raise
+    err = enc.stderr.read() if enc.stderr else b""
+    if enc.stderr:
+        enc.stderr.close()
+    rc = enc.wait()
+    if rc != 0:
+        raise ArchiveError(
+            "zstd %s exited %d: %s" % (MANIFEST_ZSTD_LEVEL, rc, err.decode("utf-8", "replace")[:200])
+        )
+    return digest.hexdigest(), total, lines
+
+
+def _write_tail(manifest_path: Path, tmp_manifest: str, cutoff: float) -> int:
+    """Write the live tail (records at or newer than the cutoff) to a temp."""
+    kept = 0
+    with open(manifest_path, "rb") as src, open(tmp_manifest, "wb") as dst:
+        for raw in src:
+            if not raw.strip():
+                continue
+            ts = _line_ts(raw.decode("utf-8", "replace"))
+            if ts is not None and ts < cutoff:
+                continue
+            if not raw.endswith(b"\n"):
+                raw += b"\n"
+            dst.write(raw)
+            kept += 1
+    return kept
+
+
 class Manifest:
     """Append-only JSON lines; the last record for a unit wins.
 
     ``dest`` is the archive dest this manifest belongs to (``state_dir``'s
     parent). Stored paths are resolved against it at read time, so a record
     written under an older dest still resolves after the data moves.
+
+    The manifest is split in two: ``manifest.jsonl`` holds the live tail
+    (records newer than the compaction cutoff) and
+    ``manifest-segments/*.jsonl.zst`` hold the older records, compressed.
+    Segments are read first, oldest first, then the plain file, so the
+    "last record wins" rule is unchanged. ``compact_manifest`` does the
+    rolling; a manifest with no segments reads exactly as before.
     """
 
     def __init__(self, state_dir: Path) -> None:
@@ -1792,15 +2342,26 @@ class Manifest:
         self.dest = self.state_dir.parent
         self.path = self.state_dir / "manifest.jsonl"
         self.latest: dict[str, dict] = {}
+        self.lines = 0
+        for segment in manifest_segments(self.state_dir):
+            for line in _iter_segment_lines(segment):
+                self._add(line)
         if self.path.exists():
             with open(self.path, "r", encoding="utf-8") as fh:
                 for line in fh:
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(rec, dict) and rec.get("unit"):
-                        self.latest[rec["unit"]] = rec
+                    self._add(line)
+
+    def _add(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return
+        if isinstance(rec, dict) and rec.get("unit"):
+            self.latest[rec["unit"]] = rec
+            self.lines += 1
 
     def write(self, rec: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1962,6 +2523,8 @@ def process_unit(
         "archive": str(archive),
         "archive_rel": dest_rel(archive, state_dir),
         "archive_bytes": os.path.getsize(archive),
+        "zstd_level": ZSTD_LEVEL,
+        "zstd_long": ZSTD_LONG,
         "seq": seq,
         "archives": archives,
         "raw_bytes": unit.raw_bytes,
@@ -2995,6 +3558,94 @@ def _cmd_status(args: list[str], out) -> int:
     return status(dest / "state", out)
 
 
+def _cmd_recompress(args: list[str], out) -> int:
+    """``logs sessions recompress [--apply] [--limit N] [--tool NAME]... [--dest DIR]``."""
+    apply = False
+    limit = None
+    max_minutes = None
+    max_unit_mib = None
+    tools: list[str] = []
+    dest = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--apply":
+            apply = True
+        elif arg in ("--limit", "--tool", "--dest", "--max-minutes", "--max-unit-mib"):
+            if i + 1 >= len(args):
+                print("%s needs a value" % arg, file=sys.stderr)
+                return 2
+            value = args[i + 1]
+            i += 1
+            if arg == "--limit":
+                try:
+                    limit = int(value)
+                except ValueError:
+                    print("--limit needs an integer", file=sys.stderr)
+                    return 2
+            elif arg == "--max-minutes":
+                try:
+                    max_minutes = float(value)
+                except ValueError:
+                    print("--max-minutes needs a number", file=sys.stderr)
+                    return 2
+            elif arg == "--max-unit-mib":
+                try:
+                    max_unit_mib = float(value)
+                except ValueError:
+                    print("--max-unit-mib needs a number", file=sys.stderr)
+                    return 2
+            elif arg == "--tool":
+                if value not in TOOLS:
+                    print("--tool must be one of %s" % ", ".join(TOOLS), file=sys.stderr)
+                    return 2
+                tools.append(value)
+            else:
+                dest = value
+        else:
+            print("unknown logs sessions recompress argument: %s" % arg, file=sys.stderr)
+            return 2
+        i += 1
+    state = Path(dest or load_config()["dest"]) / "state"
+    return recompress(state, apply=apply, limit=limit, tools=tools or None, out=out,
+                      max_minutes=max_minutes, max_unit_mib=max_unit_mib)
+
+
+def _cmd_manifest(args: list[str], out) -> int:
+    """``logs sessions manifest compact [--apply] [--older-than-days N] [--dest DIR]``."""
+    if not args or args[0] != "compact":
+        print("usage: logs sessions manifest compact [--apply] [--older-than-days N] [--dest DIR]", file=sys.stderr)
+        return 2
+    apply = False
+    days = MANIFEST_KEEP_DAYS
+    dest = None
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--apply":
+            apply = True
+        elif arg in ("--older-than-days", "--dest"):
+            if i + 1 >= len(args):
+                print("%s needs a value" % arg, file=sys.stderr)
+                return 2
+            value = args[i + 1]
+            i += 1
+            if arg == "--older-than-days":
+                try:
+                    days = float(value)
+                except ValueError:
+                    print("--older-than-days needs a number", file=sys.stderr)
+                    return 2
+            else:
+                dest = value
+        else:
+            print("unknown logs sessions manifest argument: %s" % arg, file=sys.stderr)
+            return 2
+        i += 1
+    state = Path(dest or load_config()["dest"]) / "state"
+    return compact_manifest(state, apply=apply, older_than_days=days, out=out)
+
+
 def main(argv=None, out=None) -> int:
     out = out or sys.stdout
     args = list(sys.argv[1:] if argv is None else argv)
@@ -3002,6 +3653,10 @@ def main(argv=None, out=None) -> int:
         return _cmd_restore(args[1:], out)
     if args and args[0] == "status":
         return _cmd_status(args[1:], out)
+    if args and args[0] == "recompress":
+        return _cmd_recompress(args[1:], out)
+    if args and args[0] == "manifest":
+        return _cmd_manifest(args[1:], out)
     opts = parse_args(args)
     if isinstance(opts, str):
         print(opts, file=sys.stderr)

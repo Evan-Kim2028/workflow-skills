@@ -571,6 +571,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._feed(query)
             elif path.startswith("/api/logs/"):
                 self._logs(path, query)
+            elif path == "/api/storage/budget":
+                self._storage_budget()
             elif path.startswith("/bundle/"):
                 self._bundle_page(path)
             elif path == "/api/health":
@@ -1564,6 +1566,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, api_error("not found", "not_found", "Try GET /api/logs/search."))
             return
         self._json(out[0], out[1])
+
+    def _storage_budget(self):
+        """``GET /api/storage/budget``: the last daily storage sample.
+
+        Read-only and cheap: ``dash.storagebudget.latest`` reads the last
+        line of the history file and never measures, walks a tree or calls
+        the store. The payload holds sizes, the disk share and the days to
+        80%; no log text and no file paths beyond the volume.
+        """
+        from dash import storagebudget
+
+        self._json(200, storagebudget.latest(self.server.cfg, now=time.time()))
 
     def _bundles(self):
         self._json(200, {"bundles": list_bundles()})
