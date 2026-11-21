@@ -80,6 +80,59 @@ folder cannot reach outside the jobs tree.
 
 The proxy's own log is size-rotated (see [agentq-proxy.md](agentq-proxy.md)).
 
+## Disk janitor
+
+Two things grow without bound on the laptop: worker scratch and the job folders.
+On 2026-11-19 the data volume reached 99% (17 GB free, falling ~15 GB/hour) with
+95 GB of scratch, much of it for jobs that had finished hours earlier, and 36 GB
+of job folders. Nothing removed either. The broker now does, from `Broker.tick`
+(`agentq/janitor.py`), before the launches, so a reap frees space before a job is
+held for it.
+
+**Scratch reaper.** A job that has been `done`/`failed`/`cancelled` for longer
+than `janitor.scratch_grace_s` (default `3600`) loses its scratch folder,
+`~/.cache/agent-dash/scratch/<group>/<label>/` (or under
+`AGENT_DASH_SCRATCH_ROOT`). It only removes a folder that carries the launcher's
+owner marker (`.agent-scratch.json`) naming that job's label, whose recorded run
+folder sits under that job's own `jobs/<id>` tree, and that resolves inside the
+scratch root. So a folder agentq did not create, a folder belonging to another
+job that reused the label, and a symlink out of the root are all left alone. A
+running or queued job's scratch is never touched, and neither is a job whose run
+folder still has a live pid in `running/`. A job opts out with `keep_scratch:
+true` in its prompt front matter; an unreadable prompt counts as an opt-out.
+
+**Job-dir retention.** A terminal job older than `janitor.jobs_keep_days`
+(default `7`) keeps `prompt.md`, `report.md` and the run's `out-*.md`, and the
+verdict stays in the job row. Its pi streams, pi session logs and err logs are
+gzipped in place, or deleted when a single file is over 32 MB (compressing a
+multi-gigabyte stream is not worth a broker tick). A file modified after the
+cutoff is skipped, and so is a job whose run folder is still live. One pass
+touches at most 10 jobs and 20 files per job, so a tick never walks the whole
+history. `agentq gc` is still the manual, wider sweep: any age, dry run unless
+`--apply`.
+
+**Disk-pressure admission.** When free space on the volume holding the scratch
+root is below `slots.disk_floor_gb` (default `25`), new `write` jobs and jobs on
+a `tests` slot are held: they stay `queued` with `detail` `hold disk: disk
+pressure: <free> GB free, floor <floor> GB`, and they never fail. Read and review
+jobs keep launching, so the queue still drains. The gate reopens only at or above
+the floor plus 5 GB, so a reap that frees a few hundred MB does not flap it, and
+an unreadable volume never holds work. While the gate is closed the reapers run
+on every tick instead of every five minutes.
+
+```json
+{
+  "slots": {"disk_floor_gb": 25},
+  "janitor": {"scratch_grace_s": 3600, "jobs_keep_days": 7}
+}
+```
+
+`agentq status` and `agentq slots` print one line for it: free GB, the floor, how
+many jobs the gate is holding, and whether the gate is open or held. Every reap
+appends a `reclaimed` row to `slots/events.jsonl` with the bytes, so
+`agentq slots --history` shows a `reclaim` column per label and a trailing
+`reclaimed X (Y/h) in N reap(s)` line.
+
 ## Backlog templates
 
 A backlog template is a prompt the broker resubmits on a timer, so Morph capacity
@@ -402,11 +455,12 @@ Under `$AGENTQ_HOME` (default `~/.local/state/agentq`):
 |---|---|
 | `agentq.db` | SQLite store: `jobs`, `events`, `backlog_templates`, `filler_audits`, `filler_prs`, `filler_targets` (older, read once by the migration), `filler_state`. `proxy_minutes` belongs to the proxy |
 | `backlog/<name>.md` | a backlog template's prompt copy |
-| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings, the per-tier `tiers_thinking` levels and the `fill` and `pacing` settings (see above) |
+| `broker.json` | optional slot and tier ceilings, the `adaptive` admission settings, the `auto_worktree` settings, the per-tier `tiers_thinking` levels, the `fill` and `pacing` settings, and the `janitor` knobs (see above) |
 | `broker.pid` | the daemon's flock'd pidfile |
 | `jobs/<id>/prompt.md` | the submitted prompt |
 | `jobs/<id>/runs/<n>/` | the run folder of each launch (run_worker's files live here) |
 | `jobs/<id>/report.md` | the finished report |
+| `slots/events.jsonl` | slot acquire/release rows, plus one `reclaimed` row per janitor reap |
 | `logs/broker.log` | broker log |
 
 Install the LaunchAgent (not done by the repo): fill `__PYTHON__` and `__HOME__` in

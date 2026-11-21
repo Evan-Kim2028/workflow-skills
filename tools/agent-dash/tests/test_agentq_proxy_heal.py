@@ -298,7 +298,8 @@ class LifecycleTest(HealTest):
         self.kick_seconds = 0.0
         healer = self.healer_for_lifecycle()
         healer.probe = lambda: probes.append(1) or ("timeout", None)
-        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer,
+                          disk_free=lambda: 1000.0)
         with self.assertRaises(B.DaemonRunning):
             broker.run_forever(tick_s=0.01)
         time.sleep(0.2)
@@ -331,7 +332,8 @@ class LifecycleTest(HealTest):
         for exc in (KeyboardInterrupt, SystemExit):
             with self.subTest(exc=exc.__name__):
                 healer = self.healer_for_lifecycle()
-                broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+                broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer,
+                                  disk_free=lambda: 1000.0)
                 with mock.patch.object(broker, "tick", side_effect=exc):
                     with self.assertRaises(exc):
                         broker.run_forever(tick_s=0.01)
@@ -342,7 +344,8 @@ class LifecycleTest(HealTest):
         from unittest import mock
 
         healer = self.healer_for_lifecycle()
-        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer,
+                          disk_free=lambda: 1000.0)
         seen: list[bool] = []
 
         def tick_once():
@@ -528,7 +531,8 @@ class BrokerTickTest(HealTest):
         self.addCleanup(healer.stop)
         healer.start()
         time.sleep(0.1)
-        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=lambda: None, healer=healer,
+                          disk_free=lambda: 1000.0)
         durations = []
         for _ in range(5):
             started = time.monotonic()
@@ -544,13 +548,14 @@ class BrokerTickTest(HealTest):
         healer.now = time.time
         healer.step()
         proxy = mock.Mock(return_value=None)
-        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=proxy, healer=healer)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=proxy, healer=healer,
+                          disk_free=lambda: 1000.0)
         self.assertEqual(broker._proxy_status(), {"saturated": True})
         proxy.assert_not_called()
 
     def test_a_broker_without_a_healer_probes_the_proxy_itself(self) -> None:
         proxy = mock.Mock(return_value={"saturated": False})
-        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=proxy)
+        broker = B.Broker(self.home, launcher=mock.Mock(), now=time.time, proxy=proxy, disk_free=lambda: 1000.0)
         self.assertEqual(broker._proxy_status(), {"saturated": False})
         proxy.assert_called_once()
 

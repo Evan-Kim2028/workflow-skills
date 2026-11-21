@@ -408,10 +408,15 @@ def events_path(home) -> Path:
 
 
 def record_event(home, *, kind: str, label: str, pid, wait_ms, hold_ms, outcome: str, argv: str = "",
-                 clock=time.time) -> None:
-    """Append one slot event to ``slots/events.jsonl``. Best effort: a failure never fails a run."""
+                 bytes: int = 0, clock=time.time) -> None:
+    """Append one slot event to ``slots/events.jsonl``. Best effort: a failure never fails a run.
+
+    ``bytes`` is the space a ``reclaimed`` row freed (the janitor's scratch and job-dir
+    reaps); every other outcome leaves it at zero.
+    """
     row = {"ts": round(clock(), 3), "kind": kind, "label": label or "-", "pid": pid,
-           "wait_ms": wait_ms, "hold_ms": hold_ms, "outcome": outcome, "argv": argv}
+           "wait_ms": wait_ms, "hold_ms": hold_ms, "outcome": outcome, "argv": argv,
+           "bytes": int(bytes or 0)}
     path = events_path(home)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,8 +479,10 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
     Each label gets ``runs`` (acquires), ``timeouts``, ``reaped``, total ``hold_ms`` and
     ``wait_ms``, their p50 and p95, ``reruns``: an acquire whose test paths are identical to
     a run of the same label that is still holding, so the same command ran twice with no release
-    in between, and ``cache_hits`` / ``cache_misses``: the pytest result cache's decisions
-    (``agentq/pyplugin/agentq_pytest_cache.py``), which take no slot. ``totals`` sums the labels.
+    in between, ``cache_hits`` / ``cache_misses``: the pytest result cache's decisions
+    (``agentq/pyplugin/agentq_pytest_cache.py``), which take no slot, and ``reclaims`` /
+    ``reclaimed_bytes`` from the janitor's ``reclaimed`` rows. ``totals`` adds
+    ``reclaimed_per_hour`` over the window and sums the labels.
     """
     since = (time.time() if now is None else now) - max(0.0, float(since_s))
     labels: dict[str, dict] = {}
@@ -485,6 +492,7 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
     for row in read_events(home, since=since):
         label = row.get("label") or "-"
         entry = labels.setdefault(label, {"label": label, "runs": 0, "timeouts": 0, "reaped": 0,
+                                          "reclaims": 0, "reclaimed_bytes": 0,
                                           "hold_ms": 0.0, "wait_ms": 0.0,
                                           "cache_hits": 0, "cache_misses": 0,
                                           "holds": [], "waits": []})
@@ -508,6 +516,11 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
             entry["timeouts"] += 1
         elif outcome == "reaped":
             entry["reaped"] += 1
+        elif outcome == "reclaimed":
+            entry["reclaims"] += 1
+            size = row.get("bytes")
+            if isinstance(size, (int, float)):
+                entry["reclaimed_bytes"] += int(size)
         else:
             continue
         wait = row.get("wait_ms")
@@ -530,12 +543,17 @@ def history(home, *, since_s: float = HISTORY_SINCE_S, now=None) -> dict:
         del entry["holds"], entry["waits"]
         entries.append(entry)
     entries.sort(key=lambda entry: (-entry["hold_ms"], entry["label"]))
+    reclaimed_bytes = sum(entry["reclaimed_bytes"] for entry in entries)
+    window_s = max(0.0, float(now if now is not None else time.time()) - since)
     totals = {"runs": sum(entry["runs"] for entry in entries),
               "timeouts": sum(entry["timeouts"] for entry in entries),
               "reaped": sum(entry["reaped"] for entry in entries),
               "reruns": sum(entry["reruns"] for entry in entries),
               "cache_hits": sum(entry["cache_hits"] for entry in entries),
               "cache_misses": sum(entry["cache_misses"] for entry in entries),
+              "reclaims": sum(entry["reclaims"] for entry in entries),
+              "reclaimed_bytes": reclaimed_bytes,
+              "reclaimed_per_hour": (reclaimed_bytes / (window_s / 3600.0)) if window_s > 0 else 0.0,
               "hold_ms": sum(entry["hold_ms"] for entry in entries),
               "wait_ms": sum(entry["wait_ms"] for entry in entries),
               "hold_p50_ms": percentile(all_holds, 50),
@@ -552,12 +570,17 @@ def format_history(report: dict) -> str:
         lines.append("no slot events in the window")
         return "\n".join(lines)
     lines.append(f"{'label':<28} {'runs':>4} {'hold':>8} {'wait':>8} {'p50':>7} {'p95':>7} "
-                 f"{'reruns':>6} {'hit':>4} {'miss':>4}")
+                 f"{'reruns':>6} {'hit':>4} {'miss':>4} {'reclaim':>9}")
     for entry in [*report["labels"], dict(report["totals"], label="total")]:
         lines.append(f"{entry['label'][:28]:<28} {entry['runs']:>4} {format_ms(entry['hold_ms']):>8} "
                      f"{format_ms(entry['wait_ms']):>8} {format_ms(entry['wait_p50_ms']):>7} "
                      f"{format_ms(entry['wait_p95_ms']):>7} {entry['reruns']:>6} "
-                     f"{entry['cache_hits']:>4} {entry['cache_misses']:>4}")
+                     f"{entry['cache_hits']:>4} {entry['cache_misses']:>4} "
+                     f"{format_bytes(entry.get('reclaimed_bytes')):>9}")
+    totals = report["totals"]
+    if totals.get("reclaims"):
+        lines.append(f"reclaimed {format_bytes(totals.get('reclaimed_bytes'))} "
+                     f"({format_bytes(totals.get('reclaimed_per_hour'))}/h) in {totals['reclaims']} reap(s)")
     return "\n".join(lines)
 
 
@@ -622,6 +645,18 @@ def format_ms(ms) -> str:
     if seconds < 3600:
         return f"{seconds / 60:.0f}m"
     return f"{seconds / 3600:.1f}h"
+
+
+def format_bytes(size) -> str:
+    """A byte count as a short size, or ``-`` when there is none."""
+    if not isinstance(size, (int, float)):
+        return "-"
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return ("%d %s" % (value, unit)) if unit == "B" else ("%.1f %s" % (value, unit))
+        value /= 1024.0
+    return "%.1f TB" % value  # pragma: no cover - the loop always returns
 
 
 def _window(seconds: float) -> str:

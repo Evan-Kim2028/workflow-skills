@@ -830,7 +830,8 @@ class BrokerWiringTest(unittest.TestCase):
     def broker(self):
         gauges = mock.Mock(read=lambda: H.Headroom(90.0, 0.1, 0.1, None))
         broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: self.status,
-                          gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler, work_synchronous=True)
+                          gauges=gauges, launch_pool=NeverPool(), labeler=self.labeler, work_synchronous=True,
+                          disk_free=lambda: 1000.0)
         return broker
 
     def tick(self, broker):
