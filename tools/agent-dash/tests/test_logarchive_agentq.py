@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -394,6 +395,34 @@ class ScheduledTest(unittest.TestCase):
 
         self.assertEqual(agent_dash.cmd_logs_scheduled(["--nope"]), 2)
         self.assertEqual(agent_dash.cmd_logs_scheduled(["--url"]), 2)
+
+    def test_the_hourly_pass_runs_sessions_then_agentq(self):
+        """One process, two passes: the plist's taskpolicy and memcap cover both."""
+        import agent_dash
+        from dash import sessionarchive
+
+        calls = []
+
+        def fake_sessions(opts):
+            calls.append(("sessions", dict(opts)))
+            return 0
+
+        def fake_archive(opts):
+            calls.append(("archive", dict(opts)))
+            return 5
+
+        with mock.patch.object(sessionarchive, "run", fake_sessions), mock.patch.object(
+            la, "run", fake_archive
+        ):
+            rc = agent_dash.cmd_logs_scheduled(["--apply"])
+
+        self.assertEqual([name for name, _ in calls], ["sessions", "archive"])
+        self.assertEqual(calls[0][1], {"apply": True, "scheduled": True, "url": None})
+        self.assertEqual(calls[1][1]["agentq"], True)
+        self.assertEqual(calls[1][1]["apply"], True)
+        self.assertEqual(calls[1][1]["scheduled"], True)
+        # The worse of the two, so a store outage is not hidden by a clean session pass.
+        self.assertEqual(rc, 5)
 
 
 if __name__ == "__main__":
