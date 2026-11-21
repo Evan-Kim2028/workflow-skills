@@ -70,7 +70,10 @@ worker, name it in your report; the lead submits it.
   stay in the run folder. Never write a venv, a database directory or a large cache into the run
   folder; the doctor warns on it and the hub grows without bound. If `AGENT_SCRATCH` is unset
   (you were not started by the launcher), use `~/.cache/agent-dash/scratch/<WS or hub>/<label>/`
-  and name that path in your report.
+  and name that path in your report. Start a local Postgres with
+  `python3 ~/.claude/scripts/pg_scratch.py start` (data dir `$AGENT_SCRATCH/pg17`, warnings-only
+  log truncated hourly and rotated at 50 MB); do not hand-roll `initdb`/`pg_ctl`, which logs every
+  rejected statement and leaves multi-GB `pg17.log` files behind.
 - Public writes (GitHub issues, PR comments, ADRs): draft to a file and
   return it; the parent posts. State any compute or prod-load change a
   recommendation implies.

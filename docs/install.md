@@ -14,7 +14,7 @@ sh install.sh --dry-run   # print what would change; touch nothing
 | `~/.claude/skills/<name>` | `skills/<name>/` (each directory with a `SKILL.md`) |
 | `~/.claude/tools/<name>` | `tools/<name>/` |
 | `~/.claude/templates/worker-common.md` | `tools/agent-dash/templates/worker-common.md` |
-| `~/.claude/scripts/worker-watch.sh`, `muse-usage.py`, `hub-usage.sh`, `memcap.sh` | `tools/agent-dash/scripts/<name>` |
+| `~/.claude/scripts/worker-watch.sh`, `muse-usage.py`, `hub-usage.sh`, `memcap.sh`, `pg_scratch.py` | `tools/agent-dash/scripts/<name>` |
 
 Global instructions name those `~/.claude` paths, so they must keep resolving. A
 link path that already holds a real file or directory is moved to

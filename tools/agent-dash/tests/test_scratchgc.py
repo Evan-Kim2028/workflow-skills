@@ -1,7 +1,10 @@
 """``scratch gc`` safety: what it removes, what it keeps, and that dry run removes nothing."""
 
 import io
+import json
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -350,6 +353,144 @@ class UnmarkedWorkerTests(GcBase):
         report = scratchgc.gc(self.root, 5 / 24, apply=True, now=NOW)
         self.assertEqual(report["removed_count"], 0)
         self.assertTrue(folder.is_dir())
+
+
+class LogCompactionTests(GcBase):
+    """Big idle logs are zstd-compressed in place; the content is never lost."""
+
+    def big_log(self, folder, name="pg17.log", *, age_when=OLD, size=4096):
+        path = folder / name
+        path.write_bytes(b"2026-11-21 12:32:22 EST [1] LOG:  " + b"x" * size)
+        os.utime(path, (age_when, age_when))
+        return path
+
+    def compress(self, **kwargs):
+        kwargs.setdefault("min_bytes", 1024)
+        kwargs.setdefault("idle_hours", 6)
+        return scratchgc.compress_logs(self.root, now=NOW, **kwargs)
+
+    def test_dry_run_lists_a_big_idle_log_and_touches_nothing(self):
+        folder = self.make("ws4-plan-logs")
+        log = self.big_log(folder)
+        report = self.compress()
+        self.assertEqual(report["compressible_count"], 1, report)
+        self.assertEqual(report["compressed_count"], 0)
+        self.assertEqual(report["before"], log.stat().st_size)
+        self.assertTrue(log.is_file())
+        self.assertFalse((folder / "pg17.log.zst").exists())
+
+    def test_apply_compresses_and_keeps_the_content(self):
+        if not shutil.which("zstd"):
+            self.skipTest("no zstd on PATH")
+        folder = self.make("ws4-plan-logs-apply")
+        log = self.big_log(folder)
+        original = log.read_bytes()
+        report = self.compress(apply=True)
+        self.assertEqual(report["compressed_count"], 1, report)
+        zst = folder / "pg17.log.zst"
+        self.assertTrue(zst.is_file())
+        self.assertFalse(log.exists())
+        self.assertLess(report["after"], report["before"])
+        self.assertEqual(report["saved"], report["before"] - report["after"])
+        back = subprocess.run([shutil.which("zstd"), "-d", "-q", "-c", str(zst)],
+                              capture_output=True, timeout=120)
+        self.assertEqual(back.returncode, 0)
+        self.assertEqual(back.stdout, original)
+
+    def test_a_recent_log_is_kept(self):
+        folder = self.make("ws4-plan-logs-recent")
+        log = self.big_log(folder, age_when=NOW - 3600)
+        report = self.compress(apply=True)
+        self.assertEqual(report["compressible_count"], 0, report)
+        self.assertTrue(log.is_file())
+
+    def test_a_small_log_is_kept(self):
+        folder = self.make("ws4-plan-logs-small")
+        log = self.big_log(folder, size=10)
+        report = self.compress(apply=True)
+        self.assertEqual(report["compressible_count"], 0, report)
+        self.assertTrue(log.is_file())
+
+    def test_a_log_held_open_is_kept(self):
+        if scratchgc._lsof() is None:
+            self.skipTest("no lsof on this host")
+        folder = self.make("ws4-plan-logs-open")
+        log = self.big_log(folder)
+        held = open(log, "rb")
+        self.addCleanup(held.close)
+        report = self.compress(apply=True)
+        self.assertEqual(report["compressible_count"], 0, report)
+        self.assertEqual(report["rows"][0]["reason"], "in use")
+        self.assertTrue(log.is_file())
+
+    def test_an_already_compressed_log_is_kept(self):
+        folder = self.make("ws4-plan-logs-done")
+        log = self.big_log(folder)
+        zst = folder / "pg17.log.zst"
+        zst.write_bytes(b"z")
+        os.utime(zst, (log.stat().st_mtime + 10, log.stat().st_mtime + 10))
+        report = self.compress(apply=True)
+        self.assertEqual(report["compressible_count"], 0, report)
+        self.assertEqual(report["rows"][0]["reason"], "already compressed")
+
+    def test_a_symlinked_log_is_not_followed(self):
+        folder = self.make("ws4-plan-logs-link")
+        target = self.base / "outside.log"
+        target.write_bytes(b"y" * 4096)
+        os.utime(target, (OLD, OLD))
+        (folder / "linked.log").symlink_to(target)
+        report = self.compress(apply=True)
+        self.assertEqual(report["compressible_count"], 0, report)
+        self.assertTrue(target.is_file())
+        self.assertFalse((self.base / "outside.log.zst").exists())
+
+    def test_a_log_in_a_folder_gc_keeps_is_still_compressed(self):
+        if not shutil.which("zstd"):
+            self.skipTest("no zstd on PATH")
+        folder = self.make("ws4-plan-logs-young", age_when=NOW - 3600)
+        log = self.big_log(folder)
+        report = scratchgc.gc(self.root, 7, apply=True, now=NOW,
+                              log_min_bytes=1024, log_idle_hours=6)
+        self.assertEqual(report["removed_count"], 0)
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(report["logs"]["compressed_count"], 1, report["logs"])
+        self.assertFalse(log.exists())
+        self.assertTrue((folder / "pg17.log.zst").is_file())
+
+    def test_gc_can_skip_log_compaction(self):
+        folder = self.make("ws4-plan-logs-off")
+        log = self.big_log(folder)
+        report = scratchgc.gc(self.root, 7, apply=True, now=NOW, compact_logs=False)
+        self.assertIsNone(report["logs"])
+        self.assertTrue(log.is_file())
+
+    def test_gc_prints_the_log_summary(self):
+        folder = self.make("ws4-plan-logs-print")
+        self.big_log(folder)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = scratchgc.cmd_scratch(["gc", "--log-min-mb", "0.001", "--log-idle-hours", "6"])
+        self.assertEqual(code, 0)
+        self.assertIn("logs: 1 file(s)", buf.getvalue())
+        self.assertIn("would be compressed", buf.getvalue())
+
+    def test_log_flags_reject_bad_values(self):
+        for flag in ("--log-min-mb", "--log-idle-hours"):
+            for value in ("soon", "nan", "-1"):
+                with self.subTest(flag=flag, value=value):
+                    with redirect_stderr(io.StringIO()):
+                        self.assertEqual(scratchgc.cmd_scratch(["gc", flag, value]), 2)
+
+    def test_json_output_carries_the_log_summary_without_rows(self):
+        folder = self.make("ws4-plan-logs-json")
+        self.big_log(folder)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = scratchgc.cmd_scratch(["gc", "--log-min-mb", "0.001", "--json"])
+        self.assertEqual(code, 0)
+        report = json.loads(buf.getvalue())
+        self.assertEqual(report["logs"]["compressible_count"], 1)
+        self.assertNotIn("rows", report["logs"])
 
 
 class CliFlagTests(GcBase):

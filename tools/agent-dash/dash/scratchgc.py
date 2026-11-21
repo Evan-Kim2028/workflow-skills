@@ -29,6 +29,14 @@ Two rules relax the age cutoff, and only the age cutoff:
 second time just before removal, so a run that started in between is
 kept. Removal is ``shutil.rmtree`` on one folder under the scratch root;
 symlinks are never followed.
+
+``gc`` also compacts big logs, in every scratch folder and regardless of the
+folder's age: a regular ``*.log`` over ``--log-min-mb`` (100 MB) that has not
+been written for ``--log-idle-hours`` (6 h) and that no process holds open
+(``lsof``) is compressed with ``zstd`` to ``<name>.log.zst`` next to it. The
+``.zst`` is verified with ``zstd -t`` before the plain ``.log`` is removed, so
+the log content is kept, never deleted. A log that is still open (a running
+Postgres, a live tail) is kept as is. ``--no-compact-logs`` skips this step.
 """
 
 from __future__ import annotations
@@ -48,6 +56,11 @@ from dash import scratchdir
 
 DEFAULT_OLDER_DAYS = 7.0
 LSOF_TIMEOUT_S = 60
+LOG_MIN_BYTES = 100 * 1024 * 1024
+LOG_IDLE_HOURS = 6.0
+ZSTD_LEVEL = "-3"
+ZSTD_TIMEOUT_S = 1800
+LSOF_FILE_TIMEOUT_S = 30
 LIVE_REASONS = ("live launcher", "run still running", "in use")
 WORKER_LABEL_RE = re.compile(r"^(hub|ws\d+|WS\d+)-(exec|review|plan|coord)-[A-Za-z0-9._-]+$")
 PROTECTED_PATH_RE = re.compile(r"pgdata|postgres|\.db$", re.IGNORECASE)
@@ -124,6 +137,15 @@ def _run_state(run_dir: str, label: str) -> str | None:
     return "finished"
 
 
+SBIN_DIRS = ("/usr/sbin", "/usr/bin", "/sbin")
+
+
+def _lsof() -> str | None:
+    """``lsof`` from PATH, else the system folders (a worker shell may lack /usr/sbin)."""
+    search = os.pathsep.join([os.environ.get("PATH", ""), *SBIN_DIRS])
+    return shutil.which("lsof", path=search)
+
+
 def _proc_open_in(folder: str) -> bool | None:
     """True when a process has the folder open or as cwd, False when none, None unknown."""
     if os.path.isdir("/proc/self"):
@@ -151,9 +173,12 @@ def _proc_open_in(folder: str) -> bool | None:
                 if target.startswith(prefix):
                     return True
         return False
+    lsof = _lsof()
+    if lsof is None:
+        return None
     try:
         out = subprocess.run(
-            ["lsof", "-Fn", "+D", folder],
+            [lsof, "-Fn", "+D", folder],
             capture_output=True, text=True, timeout=LSOF_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
@@ -280,7 +305,8 @@ def _remove(folder: Path) -> bool:
 
 
 def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, now: float | None = None,
-       finished_after_hours: float | None = None) -> dict:
+       finished_after_hours: float | None = None, compact_logs: bool = True,
+       log_min_bytes: int = LOG_MIN_BYTES, log_idle_hours: float = LOG_IDLE_HOURS) -> dict:
     """Dry run by default. With ``apply``, removes each reclaimable folder."""
     moment = time.time() if now is None else float(now)
     rows = scan(root, moment, older_than_days, finished_after_hours)
@@ -298,6 +324,10 @@ def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, n
                 continue
             (removed if _remove(folder) else failed).append(row)
     freed = sum(r["bytes"] for r in removed)
+    logs = None
+    if compact_logs:
+        logs = compress_logs(root, apply=apply, now=moment,
+                             min_bytes=log_min_bytes, idle_hours=log_idle_hours)
     return {
         "root": str(root),
         "apply": bool(apply),
@@ -310,6 +340,7 @@ def gc(root, older_than_days: float = DEFAULT_OLDER_DAYS, apply: bool = False, n
         "freed": freed,
         "failed": [r["path"] for r in failed],
         "kept_count": sum(1 for r in rows if r["action"] == "keep"),
+        "logs": logs,
     }
 
 
@@ -412,10 +443,209 @@ def remove_workstream(ws: str, root=None, now: float | None = None) -> dict:
     return out
 
 
+# --- big-log compaction ---------------------------------------------------
+
+
+def _log_files(root: Path):
+    """Every regular ``*.log`` under the scratch root, with its ``lstat``.
+
+    Symlinked folders and files are skipped, so compaction never writes
+    through a link into a checkout or a home directory.
+    """
+    for folder in _folders(root):
+        for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+            for name in filenames:
+                if not name.endswith(".log"):
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    st = path.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                yield path, st
+
+
+def _file_open(path: Path) -> bool | None:
+    """True when a process holds ``path`` open, False when none, None unknown."""
+    target = str(path)
+    if os.path.isdir("/proc/self"):
+        try:
+            pids = [p for p in os.listdir("/proc") if p.isdigit()]
+        except OSError:
+            return None
+        for pid in pids:
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    held = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if held == target:
+                    return True
+        return False
+    lsof = _lsof()
+    if lsof is None:
+        return None
+    try:
+        out = subprocess.run(
+            [lsof, "-Fn", "--", target],
+            capture_output=True, text=True, timeout=LSOF_FILE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.stdout.strip():
+        return True
+    if out.returncode == 1 and not out.stderr.strip():
+        return False
+    if out.returncode == 0:
+        return False
+    return None
+
+
+def _zstd_compress(path: Path) -> tuple[bool, str]:
+    """Compress ``path`` to ``<path>.zst`` and verify the copy. ``(ok, reason)``."""
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        return False, "zstd not found on PATH"
+    out = path.with_name(path.name + ".zst")
+    try:
+        done = subprocess.run(
+            [zstd, "-q", "-f", ZSTD_LEVEL, "-o", str(out), str(path)],
+            capture_output=True, text=True, timeout=ZSTD_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"zstd could not run: {exc}"
+    if done.returncode != 0:
+        return False, f"zstd exited {done.returncode}: {(done.stderr or '').strip()[-200:]}"
+    try:
+        check = subprocess.run(
+            [zstd, "-q", "-t", str(out)],
+            capture_output=True, text=True, timeout=ZSTD_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"zstd -t could not run: {exc}"
+    if check.returncode != 0:
+        return False, "zstd copy does not verify"
+    return True, ""
+
+
+def _log_verdict(path: Path, st, now: float, min_bytes: int, idle_hours: float) -> dict:
+    """One log's row: ``action`` is ``compress`` or ``keep``."""
+    row = {
+        "path": str(path),
+        "bytes": int(st.st_size),
+        "mtime": float(st.st_mtime),
+        "action": "keep",
+        "reason": "",
+        "after": int(st.st_size),
+    }
+    if st.st_size < int(min_bytes):
+        row["reason"] = f"under {human(min_bytes)}"
+        return row
+    if st.st_mtime > now - float(idle_hours) * 3600:
+        row["reason"] = f"written in the last {float(idle_hours):g} h"
+        return row
+    zst = path.with_name(path.name + ".zst")
+    try:
+        zst_st = zst.lstat()
+    except OSError:
+        zst_st = None
+    if zst_st is not None and zst_st.st_mtime >= st.st_mtime:
+        row["reason"] = "already compressed"
+        return row
+    opened = _file_open(path)
+    if opened is None:
+        row["reason"] = "open-handle check did not run"
+        return row
+    if opened:
+        row["reason"] = "in use"
+        return row
+    row["action"] = "compress"
+    row["reason"] = f"idle over {float(idle_hours):g} h"
+    return row
+
+
+def compress_logs(root, apply: bool = False, now: float | None = None,
+                  min_bytes: int = LOG_MIN_BYTES, idle_hours: float = LOG_IDLE_HOURS) -> dict:
+    """Compress idle big logs in place (dry run unless ``apply``).
+
+    Every scratch folder is scanned, whatever its age: a folder that is kept
+    by ``gc`` can still hold a multi-GB log. The plain ``.log`` is removed
+    only after the ``.zst`` verifies, so the log content is never lost.
+    """
+    moment = time.time() if now is None else float(now)
+    rows = [_log_verdict(path, st, moment, min_bytes, idle_hours) for path, st in _log_files(Path(root))]
+    todo = [r for r in rows if r["action"] == "compress"]
+    compressed = []
+    failed = []
+    if apply:
+        for row in todo:
+            path = Path(row["path"])
+            try:
+                st = path.lstat()
+            except OSError:
+                row["action"] = "keep"
+                row["reason"] = "gone"
+                continue
+            again = _log_verdict(path, st, moment, min_bytes, idle_hours)
+            if again["action"] != "compress":
+                row["action"] = "keep"
+                row["reason"] = again["reason"]
+                continue
+            ok, why = _zstd_compress(path)
+            if not ok:
+                row["action"] = "keep"
+                row["reason"] = why
+                failed.append(row["path"])
+                continue
+            zst = path.with_name(path.name + ".zst")
+            try:
+                row["after"] = int(zst.stat().st_size)
+            except OSError:
+                row["after"] = 0
+            try:
+                path.unlink()
+            except OSError:
+                row["action"] = "keep"
+                row["reason"] = "compressed, but the plain log could not be removed"
+                failed.append(row["path"])
+                continue
+            compressed.append(row)
+    compressible = sum(r["bytes"] for r in todo)
+    if apply:
+        before = sum(r["bytes"] for r in compressed)
+        after = sum(r["after"] for r in compressed)
+    else:
+        before = compressible
+        after = before
+    return {
+        "root": str(root),
+        "apply": bool(apply),
+        "min_bytes": int(min_bytes),
+        "idle_hours": float(idle_hours),
+        "rows": rows,
+        "compressible_count": len(todo),
+        "compressible": compressible,
+        "compressed_count": len(compressed),
+        "before": before,
+        "after": after,
+        "saved": before - after,
+        "failed": failed,
+    }
+
+
 # --- CLI ------------------------------------------------------------------
 
 SCRATCH_USAGE = """usage:
-  python3 agent_dash.py scratch gc [--older-than-days N] [--finished-after-hours H] [--apply] [--json]
+  python3 agent_dash.py scratch gc [--older-than-days N] [--finished-after-hours H]
+                                   [--log-min-mb N] [--log-idle-hours H] [--no-compact-logs]
+                                   [--apply] [--json]
   python3 agent_dash.py scratch status [--top N] [--json]
 """
 
@@ -447,8 +677,9 @@ def cmd_scratch(argv: list[str]) -> int:
     verb, rest = argv[0], argv[1:]
     root = scratchdir.scratch_root()
     if verb == "gc":
-        flags = _parse_flags(rest, {"--apply": True, "--json": True,
-                                    "--older-than-days": False, "--finished-after-hours": False})
+        flags = _parse_flags(rest, {"--apply": True, "--json": True, "--no-compact-logs": True,
+                                    "--older-than-days": False, "--finished-after-hours": False,
+                                    "--log-min-mb": False, "--log-idle-hours": False})
         if flags is None:
             print(SCRATCH_USAGE, end="", file=sys.stderr)
             return 2
@@ -478,10 +709,38 @@ def cmd_scratch(argv: list[str]) -> int:
             if finished < 0:
                 print("--finished-after-hours must be 0 or more", file=sys.stderr)
                 return 2
+        log_min_mb = flags.get("--log-min-mb")
+        if log_min_mb is not None:
+            try:
+                log_min_mb = float(log_min_mb)
+            except ValueError:
+                print(f"--log-min-mb needs a number, got {log_min_mb!r}", file=sys.stderr)
+                return 2
+            if not math.isfinite(log_min_mb) or log_min_mb < 0:
+                print(f"--log-min-mb must be a finite number of 0 or more, got {log_min_mb!r}",
+                      file=sys.stderr)
+                return 2
+        log_idle = flags.get("--log-idle-hours")
+        if log_idle is not None:
+            try:
+                log_idle = float(log_idle)
+            except ValueError:
+                print(f"--log-idle-hours needs a number, got {log_idle!r}", file=sys.stderr)
+                return 2
+            if not math.isfinite(log_idle) or log_idle < 0:
+                print(f"--log-idle-hours must be a finite number of 0 or more, got {log_idle!r}",
+                      file=sys.stderr)
+                return 2
         report = gc(root, older_than_days=days, apply=bool(flags.get("--apply")),
-                    finished_after_hours=finished)
+                    finished_after_hours=finished,
+                    compact_logs=not flags.get("--no-compact-logs"),
+                    log_min_bytes=int(LOG_MIN_BYTES if log_min_mb is None else log_min_mb * 1024 * 1024),
+                    log_idle_hours=LOG_IDLE_HOURS if log_idle is None else log_idle)
         if flags.get("--json"):
-            print(json.dumps({k: v for k, v in report.items() if k != "rows"}, sort_keys=True))
+            out = {k: v for k, v in report.items() if k != "rows"}
+            if out.get("logs"):
+                out["logs"] = {k: v for k, v in out["logs"].items() if k != "rows"}
+            print(json.dumps(out, sort_keys=True))
             return 0
         _print_gc(report)
         return 0
@@ -521,6 +780,20 @@ def _print_gc(report: dict) -> None:
         print(f"reclaimable: {report['reclaimable_count']} folder(s), {human(report['reclaimable'])}. "
               "Re-run with --apply to remove them.")
     print(f"kept: {report['kept_count']} folder(s)")
+    logs = report.get("logs")
+    if logs:
+        floor = f"over {human(logs['min_bytes'])} idle {logs['idle_hours']:g} h"
+        if logs["apply"]:
+            print(f"logs: compressed {logs['compressed_count']} file(s) {floor}, "
+                  f"{human(logs['before'])} -> {human(logs['after'])} (saved {human(logs['saved'])})")
+        else:
+            print(f"logs: {logs['compressible_count']} file(s) {floor}, {human(logs['compressible'])} "
+                  "would be compressed (dry run)")
+        for row in logs["rows"]:
+            if row["action"] == "compress":
+                print(f"  compress {row['path']}  {human(row['bytes'])}")
+        for path in logs["failed"]:
+            print(f"  could not compress {path}")
 
 
 def _print_status(report: dict) -> None:
