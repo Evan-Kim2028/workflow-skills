@@ -460,9 +460,10 @@ high, xhigh or max). Unset means pi's own default, which real work keeps unless 
     `hold tests: cpu 84% busy >= 80%`. The dashboard's Laptop verdict appears only when the broker
     holds a ready DeepSeek job on one of these bars; raw pressure without a hold is shown in the
     secondary line.
-  - The `tests` ceiling is `slots.tests` for a harness without the shims. A pi job runs its
-    pytest under the shims, so its `tests` jobs are admitted on live pytest slot pressure
-    instead: `slots.tests` is the floor (always admit below it), `slots.tests_ceiling`
+  - The `tests` ceiling is `slots.tests` for a tier whose worker runs without the shims. The
+    tier's worker kind in the workers registry decides, not the session that submitted the job:
+    pi and codex workers run their pytest under the shims (`agentq/worker_env.py`), so their
+    `tests` jobs are admitted on live pytest slot pressure instead: `slots.tests` is the floor (always admit below it), `slots.tests_ceiling`
     (default `slots.light`) is the hard stop, and between them a job launches while the
     pytest slots have room, that is while held plus waiting stays below the pytest cap.
     A hold reads `hold tests: pytest slots busy (16 held, 3 waiting)` or
@@ -596,7 +597,8 @@ Install the LaunchAgent (not done by the repo): fill `__PYTHON__` and `__HOME__`
 ## Runtime ssh and pytest slots (PATH shims)
 
 The queue limits whole jobs by their `--res` label. What a worker runs inside a job
-was unguarded, so `launch_pi.py` puts `agentq/shims/` first on PATH for the pi child.
+was unguarded, so `launch_pi.py` and `launch_codex.py` put `agentq/shims/` first on PATH for the
+worker child (`agentq/worker_env.py`).
 Five shell wrappers (`ssh`, `pytest`, `python`, `python3`, `uv`) in `agentq/shims/`
 decide in sh, with no Python start-up on the common path (`python3 -c pass` through the
 shim is about 31 ms, against 25 ms bare, measured interleaved). Only a pytest argv, or an ssh argv naming a gated
@@ -659,7 +661,7 @@ Not enforced:
 - Commands started outside a pi worker, and the broker's own launches.
 - A run that overruns the 30-minute wait goes ahead unslotted by design.
 
-Disable: launch with `AGENTQ_SHIMS=0` (launch_pi then leaves PATH alone), or drop the
+Disable: launch with `AGENTQ_SHIMS=0` (the launchers then leave PATH alone), or drop the
 shims folder from PATH. Tests: `tests/test_agentq_shims.py`.
 
 ## Pytest slot plugin (absolute-path interpreters)

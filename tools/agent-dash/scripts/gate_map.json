@@ -11,6 +11,7 @@
   "map": {
     "agentq/gc.py": ["test_agentq_gc"],
     "agentq/proxy.py": ["test_agentq_proxy"],
+    "agentq/worker_env.py": ["test_agentq_pytest_plugin", "test_launch_codex"],
     "agentq/slots.py": ["test_agentq_shims"],
     "agentq/repetition_guard.py": ["test_pi"],
     "agentq/pyplugin/**": ["test_agentq_pytest_plugin", "test_agentq_pytest_cache"],

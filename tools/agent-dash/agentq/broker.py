@@ -98,8 +98,8 @@ PROBE_RETRIES = 3
 PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
 RUN_WORKER = Path(__file__).resolve().parents[1] / "scripts" / "run_worker.py"
 DEFAULT_SLOTS = {"light": 40, "tests": 6, "ssh": 8}
-#: Harnesses whose workers run under the agentq PATH shims, so their pytest runs take a pytest slot.
-SHIMMED_HARNESSES = ("pi",)
+#: Worker kinds whose launchers apply ``agentq.worker_env``, so each pytest run takes a pytest slot.
+SHIMMED_WORKER_KINDS = ("pi", "codex")
 DEFAULT_TIERS = {"pi-kimi": 2, "pi-deepseek-flash": 48}
 DEFAULT_ADAPTIVE = {
     "enabled": True,
@@ -395,9 +395,30 @@ def laptop_hold(res: str, reading: headroom_lib.Headroom, running_tests: int, la
     return headroom_lib.pressure(reading, **bars)
 
 
-def shimmed(job: dict) -> bool:
-    """True when the job's harness runs its workers under the agentq PATH shims (pi)."""
-    return (job.get("harness") or "").strip() in SHIMMED_HARNESSES
+def tier_worker_kinds() -> dict[str, str]:
+    """Tier name to worker kind (``pi``, ``codex``, ``muse``, ...) from the workers registry.
+
+    Empty when the registry cannot be read, so every tier keeps the fixed tests cap.
+    """
+    from dash.locate import layered_path
+
+    path = layered_path("workers", "AGENT_DASH_WORKERS")
+    try:
+        workers = json.loads(path.read_text(encoding="utf-8"))["workers"] if path else {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    if not isinstance(workers, dict):
+        return {}
+    return {name: str(worker.get("kind") or "") for name, worker in workers.items() if isinstance(worker, dict)}
+
+
+def shimmed(job: dict, worker_kinds: dict[str, str]) -> bool:
+    """True when the job's tier runs a worker kind whose launcher applies the agentq shims.
+
+    The tier picks the worker, not the session that submitted the job: a Claude session's
+    ``pi-deepseek-flash`` job runs a pi worker under the shims like a pi session's does.
+    """
+    return worker_kinds.get(job.get("tier") or "") in SHIMMED_WORKER_KINDS
 
 
 def disk_gated(job: dict) -> bool:
@@ -1587,6 +1608,7 @@ class Broker:
                 slot_reading.append(self.slot_state(self.home))
             return slot_reading[0]
 
+        worker_kinds = tier_worker_kinds()
         worktree_settings = cfg["auto_worktree"]
         disk_held, disk_state = self._disk_gate(conn, cfg["janitor"])
         disk_hold = plain_hold(
@@ -1640,7 +1662,7 @@ class Broker:
                     continue
             if reason is None and plan is None and job["kind"] == "write" and job["workspace"] in busy_workspaces:
                 reason, local_gate = plain_hold("workspace busy"), True
-            if reason is None and job["res"] == "tests" and on and shimmed(job):
+            if reason is None and job["res"] == "tests" and on and shimmed(job, worker_kinds):
                 reason = tests_hold(res_used.get("tests", 0), cfg, pytest_state())
                 local_gate = reason is not None
             elif reason is None and slots_free.get(job["res"], 0) <= 0:

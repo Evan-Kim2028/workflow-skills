@@ -1408,9 +1408,9 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(5)]
         self.assertEqual(self.broker(gauges=FakeGauges(free=90.0, cpu=0.3, load=9.0)).tick(), jobs[:5])
 
-    def test_tests_ceiling_is_the_fixed_slot_count(self):
+    def test_tests_ceiling_is_the_fixed_slot_count_on_an_unshimmed_tier(self):
         write_config(self.home, slots={"light": 40, "tests": 2, "ssh": 8})
-        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(3)]
+        jobs = [submit(self.env, self.prompt, "--res", "tests", "--tier", "muse", label=f"t{i}") for i in range(3)]
         self.assertEqual(self.broker(gauges=FakeGauges(free=90.0, load=0.2)).tick(), jobs[:2])
 
     def test_light_jobs_wait_on_memory_below_twenty_percent_or_cpu_at_ninety_two(self):
@@ -1422,9 +1422,9 @@ class AdaptiveAdmissionTests(ProcessCleanup):
         self.assertEqual(row(self.home, light)["detail"], "hold light: cpu 95% busy >= 92%")
         self.assertEqual(self.broker(gauges=FakeGauges(free=25.0, cpu=0.5)).tick(), [light])
 
-    def test_unreadable_gauges_fall_back_to_the_fixed_caps(self):
+    def test_unreadable_gauges_fall_back_to_the_fixed_caps_on_an_unshimmed_tier(self):
         write_config(self.home, slots={"light": 40, "tests": 3, "ssh": 8})
-        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(4)]
+        jobs = [submit(self.env, self.prompt, "--res", "tests", "--tier", "muse", label=f"t{i}") for i in range(4)]
         self.assertEqual(self.broker(gauges=FakeGauges(free=None, cpu=None, swap=None)).tick(), jobs[:3])
 
     def test_disabled_adaptive_restores_fixed_caps(self):
@@ -1583,12 +1583,20 @@ class AdaptiveAdmissionTests(ProcessCleanup):
 
 
 class AdaptiveTestsAdmissionTests(ProcessCleanup):
-    """A pi ``tests`` job is admitted on live pytest slot pressure, not on the fixed job cap.
+    """A ``tests`` job on a shimmed worker tier is admitted on live pytest slot pressure.
 
     ``slots.tests`` is the floor, ``slots.tests_ceiling`` (default ``slots.light``) the hard stop,
-    and between them the job launches while the pytest slots have room for it. A harness without
-    the shims keeps the fixed cap.
+    and between them the job launches while the pytest slots have room for it. The tier's worker
+    kind decides (pi and codex run under the shims), not the session that submitted the job; a
+    tier whose worker has no shims keeps the fixed cap. The shipped example registry names the kinds.
     """
+
+    def setUp(self):
+        super().setUp()
+        registry = Path(B.__file__).resolve().parents[1] / "workers.example.json"
+        patcher = mock.patch.dict(os.environ, {"AGENT_DASH_WORKERS": str(registry)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def broker(self, slot_state, gauges=None):
         return make_broker(self.home, self.fake(live_s=30), gauges=gauges, slot_state=lambda home: slot_state)
@@ -1646,11 +1654,23 @@ class AdaptiveTestsAdmissionTests(ProcessCleanup):
         self.assertEqual(launched, jobs[:4])
         self.assertEqual(row(self.home, jobs[4])["detail"], "hold tests: memory free 31% < 35%")
 
-    def test_a_harness_without_shims_keeps_the_fixed_cap(self):
+    def test_a_tier_whose_worker_has_no_shims_keeps_the_fixed_cap(self):
         self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
-        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(3)]
+        jobs = [submit(self.env, self.prompt, "--res", "tests", "--tier", "muse", label=f"t{i}")
+                for i in range(3)]  # fmt: skip
         self.assertEqual(self.broker(S.SlotState("pytest", 16, 0, 0)).tick(), jobs[:2])
         self.assertEqual(row(self.home, jobs[2])["detail"], "hold tests: slots full")
+
+    def test_a_claude_session_job_on_a_pi_tier_is_admitted_like_a_pi_session_job(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", label=f"t{i}") for i in range(3)]
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 2, 0)).tick(), jobs)
+
+    def test_a_codex_tier_job_is_admitted_on_pytest_slot_pressure(self):
+        self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8}})
+        jobs = [submit(self.env, self.prompt, "--res", "tests", "--tier", "codex-luna", label=f"t{i}")
+                for i in range(3)]  # fmt: skip
+        self.assertEqual(self.broker(S.SlotState("pytest", 16, 2, 0)).tick(), jobs)
 
     def test_adaptive_off_keeps_the_fixed_cap_for_pi(self):
         self.write_broker_json({"slots": {"light": 40, "tests": 2, "ssh": 8},
