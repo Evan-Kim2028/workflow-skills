@@ -344,7 +344,7 @@ class BrokerFindingsTest(Temp):
     def broker(self):
         return B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: None,
                         gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)), launch_pool=mock.Mock(),
-                        labeler=lambda kind, slug: f"hub-exec-{slug}")
+                        labeler=lambda kind, slug: f"hub-exec-{slug}", disk_free=lambda: 1000.0)
 
     def test_a_finished_job_is_indexed_when_the_live_settings_are_not_loaded(self):
         self.home.mkdir()

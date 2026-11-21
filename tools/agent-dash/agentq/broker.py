@@ -67,6 +67,7 @@ from agentq import db
 from agentq import fill as fill_lib
 from agentq import filler as filler_lib
 from agentq import headroom as headroom_lib
+from agentq import janitor as janitor_lib
 
 TICK_S = 2.0
 BACKLOG_RETRY_S = 300.0
@@ -166,9 +167,11 @@ def load_config(home) -> dict:
         data = {}
     if not isinstance(data, dict):
         data = {}
-    slots = _caps(DEFAULT_SLOTS, data.get("slots"))
-    ceiling = _tests_ceiling(data.get("slots"), slots)
+    raw_slots = data.get("slots")
+    slots = _caps(DEFAULT_SLOTS, raw_slots)
+    ceiling = _tests_ceiling(raw_slots, slots)
     slots.pop("tests_ceiling", None)
+    slots.pop("disk_floor_gb", None)
     return {
         "slots": slots,
         "tests_ceiling": ceiling,
@@ -180,6 +183,7 @@ def load_config(home) -> dict:
         "fill": fill_lib.section(data.get("fill"), fill_lib.DEFAULT_FILL),
         "pacing": fill_lib.section(data.get("pacing"), fill_lib.DEFAULT_PACING),
         "proxy_heal": _proxy_heal(data.get("proxy_heal")),
+        "janitor": janitor_lib.settings(data.get("janitor"), raw_slots),
     }
 
 
@@ -341,6 +345,16 @@ def laptop_hold(res: str, reading: headroom_lib.Headroom, running_tests: int, la
 def shimmed(job: dict) -> bool:
     """True when the job's harness runs its workers under the agentq PATH shims (pi)."""
     return (job.get("harness") or "").strip() in SHIMMED_HARNESSES
+
+
+def disk_gated(job: dict) -> bool:
+    """True for the job shapes the disk gate holds: a write job, or anything on a tests slot.
+
+    A write job is the one that fills the disk (worktrees, builds, downloads), and a
+    tests job is the one that fills it with caches and coverage data. Read and review
+    jobs keep launching, so the queue still drains while the volume is full.
+    """
+    return job.get("kind") in janitor_lib.DISK_GATED_KINDS or job.get("res") in janitor_lib.DISK_GATED_RES
 
 
 def pytest_slot_state(home):
@@ -1193,7 +1207,8 @@ class Broker:
     """One broker over one agentq home. ``launcher``, ``now`` and ``proxy`` are injectable."""
 
     def __init__(self, home, *, launcher=None, now=time.time, proxy=None, gauges=None, launch_pool=None,
-                 labeler=None, work_synchronous=False, healer: ProxyHealer | None = None, slot_state=None):
+                 labeler=None, work_synchronous=False, healer: ProxyHealer | None = None, slot_state=None,
+                 disk_free=None):
         self.home = Path(home)
         self.healer = healer
         self.launcher = launcher or run_worker_launcher
@@ -1201,6 +1216,7 @@ class Broker:
         self.now = now
         self.proxy = proxy or proxy_status
         self.slot_state = slot_state or pytest_slot_state
+        self.disk_free = disk_free or janitor_lib.free_gb
         self.gauges = gauges or headroom_lib.Gauges(home, settings=headroom_lib.settings(load_config(home)),
                                                     clock=now)
         self.launch_pool = launch_pool or concurrent.futures.ThreadPoolExecutor(
@@ -1221,18 +1237,28 @@ class Broker:
         self._filler_retry = 0.0
         self._index_retry_at = 0.0
         self._bad_label_logged: set[str] = set()
+        self._janitor_at = 0.0
+        self._disk_held = False
+        self._disk_state: dict | None = None
 
     def log(self, message: str) -> None:
         log_line(self.home, message)
 
     def tick(self) -> list[str]:
-        """One pass: reconcile, launch, then submit due backlog jobs. Returns the ids launched this tick."""
+        """One pass: reconcile, run the janitor, launch, then submit due backlog jobs.
+
+        The janitor runs before the launches so a disk-pressure hold applies to the
+        same tick that measured it, and so a reap frees space before a job is held.
+        Returns the ids launched this tick.
+        """
         conn = db.connect(self.home)
         try:
             now = self.now()
+            self._disk_state = None  # one disk reading per tick, shared by the gate and the launches
             self._collect_launches(conn, now)
             self.reconcile(conn, now)
             status = self._proxy_status()
+            self.janitor_tick(conn, now)
             launched = self.launch_ready(conn, now, status=status)
             self.submit_backlog(conn, now, status)
             self.submit_filler(conn, now, status)
@@ -1241,6 +1267,45 @@ class Broker:
             conn.close()
         write_heartbeat(self.home)
         return launched
+
+    def janitor_tick(self, conn, now: float) -> dict:
+        """Reap finished scratch and shrink old job folders; close the disk gate under pressure.
+
+        The reapers run at most every ``JANITOR_INTERVAL_S``, and at once whenever the
+        disk gate is closed, so a full volume is worked on every tick until it clears.
+        """
+        settings = load_config(self.home)["janitor"]
+        held, state = self._disk_gate(conn, settings)
+        if not (held or now >= self._janitor_at):
+            return {"scratch": {"removed": [], "kept": [], "bytes": 0},
+                    "retention": {"jobs": [], "bytes": 0, "files": 0}}
+        self._janitor_at = now + janitor_lib.JANITOR_INTERVAL_S
+        report = janitor_lib.run(self.home, conn, now=now, settings=settings)
+        if janitor_lib.reclaimed(report):
+            self.log(janitor_lib.format_pass(report))
+        return report
+
+    def _disk_gate(self, conn, settings: dict) -> tuple[bool, dict]:
+        """Whether the disk gate holds new write and tests admissions, and the reading behind it.
+
+        Below ``slots.disk_floor_gb`` the gate closes; it reopens only at or above the
+        floor plus ``RESUME_MARGIN_GB``, so a reap that frees a few hundred MB does not
+        flap it. An unreadable volume never holds work. The state is in memory, so a
+        broker restart re-reads the disk and starts from that reading. The reading is
+        taken once per tick: ``janitor_tick`` and ``launch_ready`` share it.
+        """
+        if self._disk_state is None:
+            self._disk_state = janitor_lib.disk_state(
+                conn, self.home, floor_gb=settings["disk_floor_gb"], free=self.disk_free())
+        state = self._disk_state
+        free = state["free_gb"]
+        if free is None:
+            self._disk_held = False
+        elif free < settings["disk_floor_gb"]:
+            self._disk_held = True
+        elif free >= settings["resume_gb"]:
+            self._disk_held = False
+        return bool(self._disk_held), state
 
     def run_forever(self, tick_s: float = TICK_S) -> None:
         handle = acquire_lock(self.home)
@@ -1315,6 +1380,11 @@ class Broker:
             return slot_reading[0]
 
         worktree_settings = cfg["auto_worktree"]
+        disk_held, disk_state = self._disk_gate(conn, cfg["janitor"])
+        disk_hold = plain_hold(
+            "disk pressure: %.1f GB free, floor %.0f GB" % (
+                disk_state["free_gb"] or 0.0, disk_state["floor_gb"])
+        ) if disk_held else None
         ready_ids = {job["id"] for job in ready}
         self._plans = {job_id: plan for job_id, plan in self._plans.items() if job_id in ready_ids}
         fetched: set[Path] = set()
@@ -1345,6 +1415,9 @@ class Broker:
                 >= urgent_share * (tier_used.get(job["tier"], 0) + normal_waiting[job["tier"]])
             ):
                 reason = plain_hold(f"urgent share full ({urgent_share:.0%} of {job['tier']} while normal jobs wait)")
+            if reason is None and disk_hold is not None and disk_gated(job):
+                name, reason = "disk", disk_hold
+                local_gate = True
             plan = None
             if reason is None and job["kind"] == "write":
                 try:

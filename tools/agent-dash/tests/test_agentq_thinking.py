@@ -114,7 +114,7 @@ class BrokerThinkingTests(unittest.TestCase):
     def launch(self, job):
         broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: NOW, proxy=lambda: None,
                           gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)), launch_pool=self.pool,
-                          labeler=lambda kind, slug: "x")
+                          labeler=lambda kind, slug: "x", disk_free=lambda: 1000.0)
         broker._launch(self.conn, job, NOW)
         _, _, env = self.pool.calls[-1]
         return env

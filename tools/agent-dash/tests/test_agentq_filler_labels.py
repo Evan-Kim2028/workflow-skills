@@ -132,7 +132,7 @@ class GeneratorGuardTests(unittest.TestCase):
     def broker(self, labels):
         broker = B.Broker(self.home, launcher=mock.Mock(), now=lambda: 1000.0, proxy=lambda: None,
                           gauges=mock.Mock(read=lambda ttl: (90.0, 0.1)), launch_pool=mock.Mock(),
-                          labeler=lambda kind, slug: next(labels))
+                          labeler=lambda kind, slug: next(labels), disk_free=lambda: 1000.0)
         broker._work = StubWork(self.settings)
         return broker
 

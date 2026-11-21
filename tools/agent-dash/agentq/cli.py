@@ -25,6 +25,7 @@ from agentq import filler as filler_lib
 from agentq import broker as broker_lib
 from agentq import db
 from agentq import gc as gc_lib
+from agentq import janitor as janitor_lib
 from agentq import slots as slots_lib
 from agentq import thinking_report as thinking_lib
 
@@ -329,6 +330,8 @@ def cmd_status(args, ctx: Context) -> int:
     proxy = broker_lib.proxy_status()
     ctx.print(f"proxy: {'reachable' if proxy is not None else 'unreachable (static slots)'}")
     ctx.print(slots_lib.status_hint(ctx.home, now=ctx.now()))
+    ctx.print(janitor_lib.format_disk(janitor_lib.disk_state(
+        conn, ctx.home, floor_gb=broker_lib.load_config(ctx.home)["janitor"]["disk_floor_gb"])))
     daemon = "not running" if pid is None else f"running (pid {pid or '?'})"
     total_running = sum(count for _, _, count in running)
     summary = f"daemon {daemon}; queued {sum(depth.values())}; running {total_running}"
@@ -349,6 +352,12 @@ def cmd_slots(args, ctx: Context) -> int:
             ctx.print(f"  slot {item['slot']}  pid {item['pid']}  held {item['held_s']}s  "
                       f"label {item['label'] or '-'}  {item['command']}")
         parts.append(f"{kind} {len(held)}/{limit}")
+    conn = db.connect(ctx.home)
+    try:
+        ctx.print(janitor_lib.format_disk(janitor_lib.disk_state(
+            conn, ctx.home, floor_gb=broker_lib.load_config(ctx.home)["janitor"]["disk_floor_gb"])))
+    finally:
+        conn.close()
     return answer(ctx, "slots held: " + "; ".join(parts), 0)
 
 
@@ -368,7 +377,9 @@ def _slots_history(args, ctx: Context) -> int:
                        f"{totals['reruns']} identical re-run(s) with no release in between; "
                        f"pytest cache {totals['cache_hits']} hit(s), {totals['cache_misses']} miss(es); "
                        f"hold {slots_lib.format_ms(totals['hold_ms'])}, "
-                       f"wait {slots_lib.format_ms(totals['wait_ms'])}", 0)
+                       f"wait {slots_lib.format_ms(totals['wait_ms'])}; "
+                       f"reclaimed {slots_lib.format_bytes(totals['reclaimed_bytes'])} "
+                       f"({slots_lib.format_bytes(totals['reclaimed_per_hour'])}/h)", 0)
 
 
 def cmd_inflight_report(args, ctx: Context) -> int:

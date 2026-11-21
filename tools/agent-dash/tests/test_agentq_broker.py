@@ -172,10 +172,17 @@ class InlinePool:
         return future
 
 
-def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None, slot_state=None):
+def make_broker(home, launcher=None, clock=None, proxy=None, gauges=None, launch_pool=None, slot_state=None,
+                disk_free=None):
+    """A broker over ``home`` with every outside reading stubbed.
+
+    ``disk_free`` defaults to a volume with plenty of room, so the disk gate never
+    holds a job here: a test must not depend on how full the laptop is.
+    """
     return B.Broker(home, launcher=launcher or FakeLauncher(), now=clock or time.time,
                     proxy=proxy or (lambda: None), gauges=gauges or FakeGauges(),
-                    launch_pool=launch_pool or InlinePool(), slot_state=slot_state)
+                    launch_pool=launch_pool or InlinePool(), slot_state=slot_state,
+                    disk_free=disk_free or (lambda: 1000.0))
 
 
 def write_config(home, slots=None, tiers=None):

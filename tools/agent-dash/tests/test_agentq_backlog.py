@@ -102,7 +102,8 @@ class BacklogTestCase(unittest.TestCase):
     def broker(self, labeler=None, pool=None, proxy=None):
         return B.Broker(self.home, launcher=mock.Mock(), now=self.clock, proxy=proxy or (lambda: None),
                         gauges=mock.Mock(read=lambda: H.Headroom(90.0, 0.1, 0.1, None)),
-                        launch_pool=pool or NeverPool(), labeler=labeler or FakeLabeler())
+                        launch_pool=pool or NeverPool(), labeler=labeler or FakeLabeler(),
+                        disk_free=lambda: 1000.0)
 
     def conn(self):
         conn = db.connect(self.home)
