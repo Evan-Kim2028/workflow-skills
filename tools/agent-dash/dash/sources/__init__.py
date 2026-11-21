@@ -467,13 +467,13 @@ def _describe_roots_memo(cfg, now, processes) -> dict:
     return {k: (list(v) if isinstance(v, list) else v) for k, v in value.items()}
 
 
-def _perf_poll(source, duration: float) -> None:
+def _perf_poll(source, duration: float, cpu_s: float) -> None:
     """One finished poll into the process monitor (never raises)."""
     try:
         from dash import perfmon as _perfmon
 
         _perfmon.get().record_poll(
-            source.NAME, duration, getattr(source, "INTERVAL_S", None)
+            source.NAME, duration, getattr(source, "INTERVAL_S", None), cpu_s
         )
     except Exception:
         pass
@@ -482,6 +482,7 @@ def _perf_poll(source, duration: float) -> None:
 def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float, mult: float = 1.0) -> None:
     """Poll one source and record the outcome. Always runs in a worker thread."""
     start = time.monotonic()
+    cpu_start = time.thread_time()
     counter = getattr(store, "write_count", None)
     writes0 = counter() if callable(counter) else None
     try:
@@ -500,7 +501,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float,
                 state["timed_out"] = False
         log.warning("source %s: %s", source.NAME, state["last_error"])
         _note_outcome(registry, source, None, failed=True)
-        _perf_poll(source, duration)
+        _perf_poll(source, duration, time.thread_time() - cpu_start)
     else:
         duration = time.monotonic() - start
         with registry._lock:
@@ -521,7 +522,7 @@ def _run_poll(registry: Registry, source, store, cfg, now: float, budget: float,
         if writes0 is not None and callable(counter):
             new_rows = counter() - writes0
         _note_outcome(registry, source, new_rows, failed=timed_out)
-        _perf_poll(source, duration)
+        _perf_poll(source, duration, time.thread_time() - cpu_start)
 
 
 def declares_signals(source) -> bool:

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 
 from dash import perfmon
+from dash import sources as sources_pkg
 from dash.doctor import collect_problems
 from dash.server import _health_body, _record_http
 from dash.singleflight import SingleFlight
@@ -93,6 +94,33 @@ class PerfMonitorTest(unittest.TestCase):
         summary = self.mon.snapshot()["sources"]["muse"]
         self.assertEqual(summary["polls"], 3)
         self.assertEqual(summary["lag_breaches"], 2)
+
+    def test_poll_cpu_adds_up_per_source(self):
+        self.mon.record_poll("pi", 0.5, 2.0, cpu_s=0.25)
+        self.mon.record_poll("pi", 0.5, 2.0, cpu_s=0.5)
+        self.mon.record_poll("muse", 0.2, 2.0)
+        sources = self.mon.snapshot()["sources"]
+        self.assertAlmostEqual(sources["pi"]["cpu_s_total"], 0.75)
+        self.assertIsNone(sources["muse"]["cpu_s_total"])
+
+    def test_a_poll_is_charged_its_own_thread_cpu_not_its_wall_time(self):
+        def busy(store, cfg, now):
+            end = time.thread_time() + 0.05
+            while time.thread_time() < end:
+                pass
+
+        def idle(store, cfg, now):
+            time.sleep(0.1)
+
+        registry = sources_pkg.Registry(sources=[])
+        with mock.patch.object(perfmon, "_MONITOR", self.mon):
+            for name, poll in (("busy", busy), ("idle", idle)):
+                source = SimpleNamespace(NAME=name, INTERVAL_S=2, poll=poll)
+                sources_pkg._run_poll(registry, source, object(), {}, time.time(), 30.0)
+        summary = self.mon.snapshot()["sources"]
+        self.assertGreaterEqual(summary["busy"]["cpu_s_total"], 0.05)
+        self.assertLess(summary["idle"]["cpu_s_total"], 0.05)
+        self.assertGreaterEqual(summary["idle"]["last_s"], 0.1)
 
     def test_singleflight_stats(self):
         flight = SingleFlight()

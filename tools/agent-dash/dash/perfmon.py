@@ -83,6 +83,7 @@ class PerfMonitor:
         self._lock_wait = _Ring()
         self._lock_hold = _Ring()
         self._polls: dict[str, list] = {}
+        self._poll_cpu_s: dict[str, float] = {}
         self._flight_calls = 0
         self._flight_shared = 0
         self._caches: dict[str, dict[str, int]] = {}
@@ -107,12 +108,23 @@ class PerfMonitor:
             pass
 
     def record_poll(
-        self, source: str, duration_s: float, interval_s: float | None = None
+        self,
+        source: str,
+        duration_s: float,
+        interval_s: float | None = None,
+        cpu_s: float | None = None,
     ) -> None:
-        """One finished source poll with its configured interval."""
+        """One finished source poll with its configured interval.
+
+        ``cpu_s`` is the polling thread's own CPU time, so lock waits and sleeps do not
+        count; it adds to the source's running total since the process started.
+        """
         try:
             now = time.time()
             with self._lock:
+                if cpu_s is not None:
+                    name = str(source)
+                    self._poll_cpu_s[name] = self._poll_cpu_s.get(name, 0.0) + float(cpu_s)
                 history = self._polls.setdefault(str(source), [])
                 prev = history[-1][0] if history else None
                 lag = None if prev is None else max(0.0, now - prev)
@@ -150,6 +162,7 @@ class PerfMonitor:
             "max_s": durations[-1] if durations else None,
             "lag_s": lag_now,
             "lag_breaches": 0,
+            "cpu_s_total": self._poll_cpu_s.get(name),
         }
         breaches = 0
         for _, _, lag, interval in reversed(history):
@@ -228,6 +241,7 @@ class PerfMonitor:
             self._lock_wait = _Ring()
             self._lock_hold = _Ring()
             self._polls = {}
+            self._poll_cpu_s = {}
             self._flight_calls = 0
             self._flight_shared = 0
             self._caches = {}
@@ -277,9 +291,9 @@ def record_lock(wait_s: float, hold_s: float) -> None:
     _MONITOR.record_lock(wait_s, hold_s)
 
 
-def record_poll(source: str, duration_s: float, interval_s=None) -> None:
+def record_poll(source: str, duration_s: float, interval_s=None, cpu_s=None) -> None:
     """Module shorthand: one finished source poll into the monitor."""
-    _MONITOR.record_poll(source, duration_s, interval_s)
+    _MONITOR.record_poll(source, duration_s, interval_s, cpu_s)
 
 
 def record_flight(shared: bool) -> None:
