@@ -137,7 +137,7 @@ class Base(unittest.TestCase):
         # A pytest run that is itself under the shims (or the plugin) exports these; the child must
         # start clean, or the shim skips the gate and the end-to-end tests see no slot.
         for key in ("AGENTQ_SLOT_HELD", "AGENTQ_PYTEST_SLOT_HELD", "AGENTQ_MEMCAPPED", "AGENTQ_RUN",
-                    "AGENTQ_JOB", "AGENTQ_SHIM_DEPTH"):
+                    "AGENTQ_JOB", "AGENTQ_SHIM_DEPTH", "PYTEST_PLUGINS", "PYTEST_ADDOPTS", "PYTHONPATH"):
             env.pop(key, None)
         (self.home / "broker.json").write_text(json.dumps({"shims": {"ssh_gated_hosts": ["prod-box"]}}),
                                                encoding="utf-8")
@@ -420,6 +420,25 @@ class ShimEndToEndTests(Base):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("busy 1", result.stdout)
         self.assertEqual(slots.holders(self.home, "pytest", 16), [])
+
+    def test_pytest_that_loads_the_slot_plugin_takes_no_shim_slot(self):
+        child = (
+            f"exec {sys.executable} -c \"import os, sys; sys.path.insert(0, '{ROOT}');"
+            "from agentq import slots; print('busy', len(slots.holders('%s', 'pytest', 16)),"
+            " os.environ.get('AGENTQ_PYTEST_SLOT_HELD'))\""
+        ) % self.home
+        self.fake_binary("pytest", child + "\n")
+        env = self.shim_env({"AGENTQ_MEMCAPPED": "1", "PYTEST_PLUGINS": "agentq_pytest_slot,agentq_pytest_cache",
+                             "PYTHONPATH": str(ROOT / "agentq" / "pyplugin")})
+        result = subprocess.run([str(SHIMS / "pytest"), "-q", "tests/x.py"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("busy 0 None", result.stdout)
+
+    def test_the_plugin_must_be_on_pythonpath_for_the_shim_to_skip_its_slot(self):
+        self.assertFalse(dispatch.plugin_takes_slot({"PYTEST_PLUGINS": "agentq_pytest_slot"}))
+        self.assertTrue(dispatch.plugin_takes_slot({"PYTEST_ADDOPTS": "-q -p agentq_pytest_slot",
+                                                    "PYTHONPATH": str(ROOT / "agentq" / "pyplugin")}))
 
     def test_nested_pytest_inside_a_held_pytest_does_not_wait_for_a_slot(self):
         self.fake_binary("pytest", "echo nested-ok\n")

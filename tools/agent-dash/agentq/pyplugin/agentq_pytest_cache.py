@@ -44,11 +44,29 @@ whole tree has no such blind spot and costs one ``git ls-files`` plus one ``git 
 - **argv**, the whole environment minus ``ENV_SKIP`` (the volatile variables that cannot
   change what a test does: ``AGENTQ_*`` run ids, ``TERM``, ``SHLVL``, ``PWD``,
   ``OLDPWD``, ``_``, the terminal and session ids, ``COLUMNS``/``LINES``,
-  ``PYTEST_CURRENT_TEST``, ``PYTEST_XDIST_*`` and ``LOR_PYTEST_CACHE`` itself), the
-  interpreter realpath and its ``sys.version``, and the cwd.
-- Every ``conftest.py`` from each target's directory up to the filesystem root, keyed by
-  absolute path: pytest loads a conftest above the git toplevel too, and that file is not
-  in the tree sha. The content of a ``-c``/``--config-file`` file is keyed the same way.
+  ``PYTEST_CURRENT_TEST``, ``PYTEST_XDIST_*``, the per-worker ``AGENT_SCRATCH`` and
+  ``PI_SESSION_*``, and ``LOR_PYTEST_CACHE`` itself), the interpreter realpath and its
+  ``sys.version``, a digest of the installed ``*.dist-info`` names (two venvs that drifted
+  apart never share a key), and the cwd relative to the checkout.
+- Every ``conftest.py`` from each target's directory up to the filesystem root:
+  pytest loads a conftest above the git toplevel too, and that file is not in the tree
+  sha. The content of a ``-c``/``--config-file`` file is keyed the same way.
+
+**Shared across checkouts (v3).** Paths inside the checkout are keyed relative to it, the
+checkout path inside an argv or environment value is written ``<root>``, and a
+``--basetemp`` value is dropped. Two worktrees with the same content (two jobs fresh from
+``origin/main``, or a clean baseline checkout) share one recorded pass. A conftest or config
+file outside the checkout keeps its absolute path.
+
+**One run per key.** A keyed miss claims ``pytest-cache/inflight/<key>.pid``. A second run
+with the same key while that pid is alive waits (no slot held: the slot plugin takes its slot
+later, in ``pytest_configure``) and becomes a hit when the first records its pass; if the first
+fails or dies, the waiter runs. The claim goes in ``pytest_unconfigure``.
+
+**Why it missed.** A keyed miss row carries ``changed``: the inputs that moved since the same
+label last ran the same argv in the same folder (``tree``, ``ignored``, ``installed``,
+``env:<NAME>``, ...), ``first`` for a first run, or ``same`` when the key repeated but the
+earlier run did not pass.
 
 A run that cannot be keyed is not cached and runs normally; the reason goes in the
 ``why`` field of the event row. That covers no target, a missing or directory target, a
@@ -75,6 +93,7 @@ appended here with the same shape ``slots.record_event`` writes.
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -90,6 +109,8 @@ GUARD_ENV = "AGENTQ_GUARD"
 DEFAULT_HOME = "~/.local/state/agentq"
 CACHE_DIR = "pytest-cache"
 ENTRIES_DIR = "entries"
+INFLIGHT_DIR = "inflight"
+LAST_DIR = "last"
 PRUNE_STAMP = "last-prune"
 EVENTS_FILE = "events.jsonl"
 EVENTS_MAX_BYTES = 8 * 1024 * 1024
@@ -99,6 +120,10 @@ MAX_ENTRIES = 20000
 MAX_AGE_S = 30 * 86400.0
 PRUNE_EVERY_S = 3600.0
 PYTEST_FILE_LIMIT = 25
+SHARED_WAIT_MAX_S = 900.0
+SHARED_POLL_S = 1.0
+CHANGED_MAX = 8
+BASETEMP_RE = re.compile(r"--basetemp(?:=|\s+)\S+")
 PYTEST_HINT = "Run only the test files for the code you changed: pytest <file.py> [...]"
 PYTEST_VALUE_OPTS = frozenset({
     "-k", "-m", "-p", "-n", "-c", "-o", "-W", "-r", "--maxfail", "--rootdir", "--junitxml", "--durations",
@@ -113,6 +138,7 @@ ENV_SKIP = frozenset({
     "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "ITERM_SESSION_ID",
     "TMUX", "TMUX_PANE", "STY", "WINDOW", "SSH_TTY", "SSH_CLIENT", "SSH_CONNECTION",
     "PYTEST_CURRENT_TEST", "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT",
+    "AGENT_SCRATCH", "PI_SESSION_FILE", "PI_SESSION_ID",
 })
 ENV_SKIP_PREFIXES = ("AGENTQ_",)
 # A selector whose target set comes from ``.pytest_cache`` state rather than from the argv.
@@ -256,13 +282,14 @@ def _rotate_events(path):
         pass
 
 
-def _record_event(environ, cache, argv, why=""):
+def _record_event(environ, cache, argv, why="", **extra):
     """Append one ``cache=hit|miss`` row to ``slots/events.jsonl``. Best effort."""
     row = {"ts": round(time.time(), 3), "kind": "pytest", "label": _label(environ),
            "pid": os.getpid(), "wait_ms": 0, "hold_ms": 0,
            "outcome": f"cache-{cache}", "argv": _argv_paths(argv), "cache": cache}
     if why:
         row["why"] = why
+    row.update({name: value for name, value in extra.items() if value not in (None, "", [])})
     path = _home(environ) / "slots" / EVENTS_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,14 +540,72 @@ def _random_order(config, argv):
         return False
 
 
-def _env_material(environ):
+def _portable(text, roots=()):
+    """``text`` with the checkout path written as ``<root>`` and any ``--basetemp`` value dropped.
+
+    Two worktrees of one repo with the same content must key the same, so a path that only
+    names where the checkout lives (``VIRTUAL_ENV``, a ``PATH`` entry, a ``--basetemp`` under a
+    per-job folder) is not an input. ``roots`` holds the checkout path as git resolves it and
+    as the cwd spells it (they differ under a symlinked folder such as macOS ``/var``).
+    """
+    text = BASETEMP_RE.sub("--basetemp=<tmp>", str(text))
+    for root in roots:
+        text = text.replace(root, "<root>")
+    return text
+
+
+def _root_spellings(root, cwd):
+    """The checkout path as resolved and as the cwd spells it, longest first.
+
+    macOS resolves ``/var`` and ``/tmp`` to ``/private/...``, while an environment value keeps
+    the short form, so both are listed.
+    """
+    spellings = {str(root)}
+    rel = _relative(cwd, root)
+    if not os.path.isabs(rel):
+        alias = os.path.abspath(str(cwd))
+        for _ in ([] if rel == "." else rel.split("/")):
+            alias = os.path.dirname(alias)
+        spellings.add(alias)
+    for spelling in list(spellings):
+        if spelling.startswith("/private/"):
+            spellings.add(spelling[len("/private"):])
+    return sorted(spellings, key=len, reverse=True)
+
+
+def _env_material(environ, roots=()):
     """The whole environment, minus the volatile variables that cannot change a test."""
     picked = {}
     for key in sorted(environ):
         if key in ENV_SKIP or key.startswith(ENV_SKIP_PREFIXES):
             continue
-        picked[key] = environ[key]
+        picked[key] = _portable(environ[key], roots)
     return picked
+
+
+def _relative(path, root):
+    """``path`` relative to ``root`` when it sits inside, else the absolute path."""
+    try:
+        return Path(path).resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return str(path)
+
+
+def _installed():
+    """A digest of the interpreter's installed distributions (``name-version.dist-info``).
+
+    The interpreter path resolves to the shared base Python, so without this two worktrees
+    whose venvs drifted apart (one synced to a newer ``uv.lock``) would share a key.
+    """
+    names = []
+    for folder in sys.path:
+        if not folder or not folder.endswith("site-packages"):
+            continue
+        try:
+            names.extend(entry for entry in os.listdir(folder) if entry.endswith(".dist-info"))
+        except OSError:
+            continue
+    return _sha("\n".join(sorted(names)).encode("utf-8"))
 
 
 def _interpreter():
@@ -532,6 +617,23 @@ def _interpreter():
 
 def _key_material(config, environ):
     """``(key, why)``: the cache key for this run, or ``(None, reason)`` when it cannot be keyed."""
+    parts, why = _key_parts(config, environ)
+    if parts is None:
+        return None, why
+    return _digest(parts), ""
+
+
+def _digest(parts):
+    return _sha(json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _key_parts(config, environ):
+    """``(parts, why)``: the keyed inputs of this run, or ``(None, reason)``.
+
+    Paths inside the checkout are written relative to it, so a second worktree with the same
+    content keys the same and reuses the pass. A ``conftest.py`` or ``-c`` file outside the
+    checkout keeps its absolute path.
+    """
     cwd = _cwd(config)
     argv = _pytest_args(config)
     targets = _positionals(argv, PYTEST_VALUE_OPTS)
@@ -573,20 +675,21 @@ def _key_material(config, environ):
     ignored = _ignored_inputs(root, ignored_entries, _home(environ) / CACHE_DIR)
     if ignored is None:
         return None, "ignored inputs too large to key"
+    roots = _root_spellings(root, cwd)
     material = {
-        "v": 2,
-        "root": str(root),
-        "cwd": str(cwd),
+        "v": 3,
+        "cwd": _relative(cwd, root),
         "interpreter": _interpreter(),
         "python": sys.version,
-        "argv": argv,
-        "env": _env_material(environ),
+        "installed": _installed(),
+        "argv": [_portable(arg, roots) for arg in argv],
+        "env": _env_material(environ, roots),
         "tree": tree,
         "ignored": ignored,
-        "conftest": _conftest_chain(files),
-        "config": _config_arg(argv, cwd),
+        "conftest": {_relative(path, root): blob for path, blob in _conftest_chain(files).items()},
+        "config": {_relative(path, root): blob for path, blob in _config_arg(argv, cwd).items()},
     }
-    return _sha(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")), ""
+    return material, ""
 
 
 def _hit_message(argv):
@@ -596,7 +699,7 @@ def _hit_message(argv):
         name = target.split("::", 1)[0]
         if name not in files:
             files.append(name)
-    return (f"{len(files)} file(s) unchanged since a recorded pass on this tree, skipped "
+    return (f"{len(files)} file(s) unchanged since a recorded pass on this content, skipped "
             f"({', '.join(files)}); re-run with {CACHE_ENV}=0, or change a file in the tree")
 
 
@@ -682,18 +785,25 @@ def pytest_cmdline_main(config):
             if reason is not None:
                 _refuse(reason, argv, environ)
                 return 2
-        key, why = _key_material(config, environ)
-        if key is None:
+        parts, why = _key_parts(config, environ)
+        if parts is None:
             _record_event(environ, "miss", argv, why)
             return None
+        key = _digest(parts)
         entry = _entry_path(environ, key)
         if entry.is_file():
             _touch(entry)
             _record_event(environ, "hit", argv)
             _note(_hit_message(argv))
             return 0
+        waited = _wait_for_twin(environ, key, entry)
+        if waited is not None:
+            _record_event(environ, "hit", argv, shared="twin", wait_ms=waited)
+            _note(_hit_message(argv) + " (an identical run finished while this one waited)")
+            return 0
         config._agentq_pytest_cache_key = key
-        _record_event(environ, "miss", argv)
+        config._agentq_pytest_cache_lock = _claim(environ, key)
+        _record_event(environ, "miss", argv, changed=_changed(environ, parts))
         return None
     except Exception as exc:
         _note(f"cache skipped ({exc})")
@@ -714,3 +824,107 @@ def pytest_sessionfinish(session, exitstatus):
         _write_entry(os.environ, key, config)
     except Exception as exc:
         _note(f"cache not recorded ({exc})")
+
+
+def pytest_unconfigure(config):
+    """Drop this run's in-flight claim, so a waiting twin stops waiting."""
+    lock = getattr(config, "_agentq_pytest_cache_lock", None)
+    if lock is not None:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def _inflight_path(environ, key):
+    return _home(environ) / CACHE_DIR / INFLIGHT_DIR / f"{key}.pid"
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _claim_owner(path):
+    """The live pid holding an in-flight claim, or None (no claim, unreadable, or dead owner)."""
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 and pid != os.getpid() and _pid_alive(pid) else None
+
+
+def _claim(environ, key):
+    """Mark this run as the one computing ``key``. Returns the claim path, or None. Best effort."""
+    path = _inflight_path(environ, key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and _claim_owner(path) is None:
+            path.unlink()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError:
+        return None
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    finally:
+        os.close(fd)
+    return path
+
+
+def _wait_for_twin(environ, key, entry, clock=time.monotonic, sleep=time.sleep):
+    """Wait while a live run with the same key computes it. Returns ms waited on a hit, else None.
+
+    A twin that fails, is killed or records nothing ends the wait without a hit, and this run
+    goes ahead. The wait happens before ``pytest_configure``, so it holds no pytest slot.
+    """
+    path = _inflight_path(environ, key)
+    if _claim_owner(path) is None:
+        return None
+    started = clock()
+    _note("an identical run is in flight; waiting for its result instead of running twice")
+    while clock() - started < SHARED_WAIT_MAX_S:
+        if entry.is_file():
+            _touch(entry)
+            return int((clock() - started) * 1000)
+        if _claim_owner(path) is None:
+            return int((clock() - started) * 1000) if entry.is_file() else None
+        sleep(SHARED_POLL_S)
+    return None
+
+
+def _changed(environ, parts):
+    """Which keyed inputs moved since this label last ran this argv in this folder.
+
+    Written to the miss event as ``changed`` (``tree``, ``ignored``, ``env:<NAME>``, ...), or
+    ``["first"]`` for a first run, so the hit rate can be explained from the event log alone.
+    Keeps one small digest file per (label, argv, cwd). Best effort: an error returns None.
+    """
+    try:
+        slot = _sha(json.dumps([_label(environ), parts["argv"], parts["cwd"]]).encode("utf-8"))
+        path = _home(environ) / CACHE_DIR / LAST_DIR / slot[:2] / f"{slot}.json"
+        now = {name: _digest(value) for name, value in parts.items() if name != "env"}
+        now["env"] = {name: _sha(value.encode("utf-8")) for name, value in parts["env"].items()}
+        try:
+            before = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            before = None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(now, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+        if not isinstance(before, dict):
+            return ["first"]
+        moved = [name for name in sorted(now) if name != "env" and before.get(name) != now[name]]
+        old_env = before.get("env") if isinstance(before.get("env"), dict) else {}
+        moved += [f"env:{name}" for name in sorted(set(old_env) | set(now["env"]))
+                  if old_env.get(name) != now["env"].get(name)]
+        return (moved or ["same"])[:CHANGED_MAX]
+    except Exception:
+        return None

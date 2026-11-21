@@ -63,7 +63,10 @@ plugins instead. ``shim_environ`` sets, on the pi child:
 
 - ``PYTHONPATH``: the plugin folder prepended to any existing value.
 - ``PYTEST_ADDOPTS``: ``-p agentq_pytest_slot -p agentq_pytest_cache`` appended to any
-  existing value. The cache plugin is inert unless ``AGENTQ_JOB`` or ``AGENTQ_RUN`` is
+  existing value.
+- ``PYTEST_PLUGINS``: the same two plugins. A worker that overrides ``PYTEST_ADDOPTS``
+  (``PYTEST_ADDOPTS="--basetemp=..." pytest ...``) drops the ``-p`` options; this variable
+  keeps the slot and the cache loaded. pytest loads a plugin named twice once. The cache plugin is inert unless ``AGENTQ_JOB`` or ``AGENTQ_RUN`` is
   set, and ``LOR_PYTEST_CACHE=0`` turns it off.
 - ``PYTEST_XDIST_AUTO_NUM_WORKERS=2`` and ``LOR_CI_XDIST=2``, each only when unset.
   ``LOR_CI_XDIST`` is the worker cap the plugin enforces on xdist's parsed count
@@ -577,6 +580,8 @@ def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable, plugin_dir
         if f"-p {name}" not in addopts:
             addopts = " ".join(part for part in (addopts, f"-p {name}") if part)
     environ["PYTEST_ADDOPTS"] = addopts
+    named = [part for part in (environ.get("PYTEST_PLUGINS") or "").split(",") if part.strip()]
+    environ["PYTEST_PLUGINS"] = ",".join([*named, *(name for name in PYTEST_PLUGINS if name not in named)])
     for key, value in XDIST_DEFAULTS:
         if not (environ.get(key) or "").strip():
             environ[key] = value
