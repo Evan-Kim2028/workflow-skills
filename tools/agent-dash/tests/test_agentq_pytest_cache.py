@@ -216,7 +216,19 @@ class KeyTests(CacheBase):
         after = self.key(("-q", "--basetemp=/tmp/pt/job-b", "tests/test_a.py"))[0]
         os.environ.pop("PYTEST_ADDOPTS")
         self.assertEqual(self.key(("-q", "--basetemp=/tmp/pt/job-c", "tests/test_a.py"))[0], before)
-        self.assertNotEqual(after, before)
+        self.assertEqual(after, before)
+
+    def test_an_addopts_that_only_adds_basetemp_or_the_agentq_plugins_keys_like_none(self):
+        before = self.key()[0]
+        for value in ("--basetemp=/tmp/pt/canary", "-p agentq_pytest_slot -p agentq_pytest_cache",
+                      "-p agentq_pytest_slot --basetemp /tmp/x"):
+            os.environ["PYTEST_ADDOPTS"] = value
+            self.assertEqual(self.key()[0], before, value)
+        os.environ["PYTEST_PLUGINS"] = "agentq_pytest_slot,agentq_pytest_cache"
+        self.assertEqual(self.key()[0], before)
+        os.environ["PYTEST_ADDOPTS"] = "-x --basetemp=/tmp/y"
+        self.assertNotEqual(self.key()[0], before)
+        os.environ.pop("PYTEST_PLUGINS")
 
     def test_per_worker_scratch_and_session_variables_are_not_part_of_the_key(self):
         before = self.key()[0]
