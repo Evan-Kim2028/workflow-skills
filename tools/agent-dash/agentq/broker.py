@@ -44,6 +44,7 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import fcntl
+import fnmatch
 import json
 import math
 import os
@@ -78,6 +79,21 @@ RATE_BACKOFF_S = 60.0
 CAPACITY_RETRY_S = 20.0
 HOLD_REFRESH_S = 300.0
 STALL_S = 45 * 60
+#: Spin detection: a live job whose pi stream keeps growing while nothing outside it changes is spending
+#: tokens in a loop. The window is the same 45 min as the stall check, and the sample interval keeps the
+#: check to one cheap fingerprint a minute per job instead of a walk every tick.
+#:
+#: ``min_stream_mb`` is a burn rate, not a size: 1 MB over 45 min is 22 KB a minute, which every active
+#: worker clears, so the first setting tripped 33 of 502 good long jobs in a 48 h replay. 8 MB over the
+#: window is 180 KB a minute, which only a worker generating tokens without pause reaches.
+DEFAULT_SPIN = {"enabled": True, "window_s": float(STALL_S), "sample_s": 60.0, "min_stream_mb": 8.0}
+#: Files under the run folder that are the stream itself, not progress: the pi event stream and its session log.
+STREAM_GLOBS = ("stream-*.ndjson",)
+STREAM_DIRS = ("sessions",)
+#: Depth and entry cap for the scratch fingerprint. A scratch folder can hold a virtualenv with tens of
+#: thousands of files, and the broker samples every running job once a minute.
+SCRATCH_DEPTH = 2
+SCRATCH_MAX_ENTRIES = 500
 PROBE_RETRIES = 3
 PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
 RUN_WORKER = Path(__file__).resolve().parents[1] / "scripts" / "run_worker.py"
@@ -180,6 +196,8 @@ def load_config(home) -> dict:
         "adaptive": _adaptive(data.get("adaptive")),
         "laptop": _laptop(data.get("laptop")),
         "auto_worktree": _auto_worktree(data.get("auto_worktree")),
+        "max_runtime": _max_runtime(data.get("max_runtime")),
+        "spin": _spin(data.get("spin")),
         "tiers_thinking": _tiers_thinking(data.get("tiers_thinking")),
         "fill": fill_lib.section(data.get("fill"), fill_lib.DEFAULT_FILL),
         "pacing": fill_lib.section(data.get("pacing"), fill_lib.DEFAULT_PACING),
@@ -254,6 +272,40 @@ def _proxy_heal(override) -> dict:
                 settings[name] = float(override[name])
             except (KeyError, TypeError, ValueError):
                 continue
+    return settings
+
+
+def _max_runtime(override) -> dict:
+    """Per-kind wall-clock caps from ``broker.json`` ``max_runtime``, the defaults filled in.
+
+    A kind the file does not name keeps its default, and a value that is not a positive number is
+    ignored, so a typo never removes a cap.
+    """
+    caps = {kind: float(seconds) for kind, seconds in db.DEFAULT_MAX_RUNTIME_S.items()}
+    if isinstance(override, dict):
+        for kind, value in override.items():
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            if seconds > 0:
+                caps[str(kind)] = seconds
+    return caps
+
+
+def _spin(override) -> dict:
+    """Spin-detection settings. Absent means on with the defaults; ``enabled: false`` turns it off."""
+    settings = dict(DEFAULT_SPIN)
+    if isinstance(override, dict):
+        if "enabled" in override:
+            settings["enabled"] = bool(override["enabled"])
+        for name in ("window_s", "sample_s", "min_stream_mb"):
+            try:
+                value = float(override[name])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value > 0:
+                settings[name] = value
     return settings
 
 
@@ -927,6 +979,160 @@ def last_activity(run_dir, fallback: float) -> float:
     return newest
 
 
+def stream_bytes(run_dir, label: str) -> int:
+    """Size of the job's pi event stream in bytes, 0 when it is not there yet."""
+    if not run_dir:
+        return 0
+    try:
+        return pi_stream_path(run_dir, label).stat().st_size
+    except OSError:
+        return 0
+
+
+def run_progress(run_dir, label: str) -> tuple:
+    """A fingerprint of the run folder's report and out files: ``(path, size, mtime)`` per file.
+
+    The pi event stream and its session log are left out: they are the thing that keeps growing
+    while a worker spins, so counting them as progress is what hid the loop from the stall check.
+    """
+    if not run_dir:
+        return ()
+    found = []
+    for root, dirs, files in os.walk(run_dir):
+        dirs[:] = [name for name in dirs if name not in STREAM_DIRS]
+        for name in files:
+            if any(fnmatch.fnmatch(name, pattern) for pattern in STREAM_GLOBS):
+                continue
+            path = os.path.join(root, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            found.append((os.path.relpath(path, run_dir), stat.st_size, stat.st_mtime_ns))
+    return tuple(sorted(found))
+
+
+def git_progress(workspace) -> str | None:
+    """HEAD and the porcelain status of ``workspace`` as one string, or None when git cannot read it.
+
+    ``git status`` uses the index's stat cache, so it is one cheap read of the worktree rather than a
+    content walk, and it covers a commit, a staged edit, an unstaged edit and a new file alike. A repo
+    with no commit yet has no HEAD, and its status still counts.
+    """
+    try:
+        head = _git(workspace, "rev-parse", "--verify", "HEAD")
+        status = _git(workspace, "status", "--porcelain=v1", "--untracked-files=normal")
+    except WorktreeError:
+        return None
+    if status.returncode != 0:
+        return None
+    return (head.stdout.strip() if head.returncode == 0 else "") + "\n" + status.stdout
+
+
+def scratch_progress(label: str) -> tuple:
+    """A fingerprint of the run's ``$AGENT_SCRATCH`` folder, two levels deep.
+
+    A worker that starts a long test or training run and then polls its log is making progress: the
+    background job keeps writing under scratch, and the worker's stream grows only because it reads
+    that output. Counting those writes is what tells that worker apart from one that grows its stream
+    and changes nothing. The walk is bounded because a scratch folder can hold a virtualenv with tens
+    of thousands of files, and the broker samples every running job once a minute.
+    """
+    try:
+        from dash import scratchdir
+
+        root = str(scratchdir.scratch_path(label))
+    except (ImportError, OSError, ValueError):
+        return ()
+    found = []
+    stack = [(root, 0)]
+    while stack and len(found) < SCRATCH_MAX_ENTRIES:
+        path, depth = stack.pop()
+        try:
+            with os.scandir(path) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if len(found) >= SCRATCH_MAX_ENTRIES:
+                break
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            found.append((os.path.relpath(entry.path, root), stat.st_size, stat.st_mtime_ns))
+            if depth + 1 < SCRATCH_DEPTH and entry.is_dir(follow_symlinks=False):
+                stack.append((entry.path, depth + 1))
+    return tuple(sorted(found))
+
+
+def progress_key(job: dict) -> str | None:
+    """Everything outside the stream that a working job changes, as one cheap fingerprint.
+
+    The run folder's report and out files, the run's scratch folder (a background test or training
+    run writes there while the worker polls it), plus for a write job the git state of the worktree
+    it writes in (``workspace``, which the auto-worktree step already moved to the job's own tree).
+    None when the git state cannot be read: an unknown fingerprint never trips the spin rule.
+    """
+    parts = [repr(run_progress(job["run_dir"], job["label"]))]
+    parts.append(repr(scratch_progress(job["label"])))
+    if job["kind"] == "write":
+        git = git_progress(job["workspace"])
+        if git is None:
+            return None
+        parts.append(git)
+    return "\n".join(parts)
+
+
+class SpinWatch:
+    """Trip a live job whose stream keeps growing while nothing outside it changes.
+
+    One sample per job per ``sample_s``: the stream's size and a fingerprint of the run folder's
+    report/out files, the run's scratch folder, plus for a write job its worktree's git state. The
+    window restarts on any change of that fingerprint, so a job that commits, edits a tracked file,
+    writes its report or whose background test run writes a log is never tripped. A job that spends
+    the whole window growing its stream and nothing else is spending tokens in a loop, and the broker
+    stops it like a stall: requeued once, then failed.
+    """
+
+    def __init__(self, settings: dict | None = None) -> None:
+        self.settings = dict(settings or DEFAULT_SPIN)
+        self._samples: dict[str, tuple[float, int, str | None]] = {}
+
+    def keep(self, job_ids) -> None:
+        """Forget every job that is no longer running."""
+        live = set(job_ids)
+        for job_id in [job_id for job_id in self._samples if job_id not in live]:
+            self._samples.pop(job_id, None)
+
+    def forget(self, job_id: str) -> None:
+        self._samples.pop(job_id, None)
+
+    def observe(self, job: dict, now: float) -> str | None:
+        """Sample this job at most once per ``sample_s``; return the trip detail when it is spinning."""
+        if not self.settings["enabled"]:
+            return None
+        job_id = job["id"]
+        sample = self._samples.get(job_id)
+        if sample is not None and now - sample[0] < self.settings["sample_s"]:
+            return None
+        stream = stream_bytes(job["run_dir"], job["label"])
+        progress = progress_key(job)
+        if sample is None or progress is None or progress != sample[2] or stream < sample[1]:
+            self._samples[job_id] = (now, stream, progress)
+            return None
+        spent = now - sample[0]
+        if spent < self.settings["window_s"]:
+            return None
+        grew = stream - sample[1]
+        if grew < self.settings["min_stream_mb"] * 1024 * 1024:
+            return None
+        return (
+            f"spinning: stream grew {grew / (1024 * 1024):.1f} MB in {int(spent / 60)} min "
+            "with no file or git progress"
+        )
+
+
 def _read_pid(path) -> int | None:
     try:
         return int(Path(path).read_text(encoding="utf-8").strip())
@@ -1218,6 +1424,7 @@ class Broker:
         self.disk_free = disk_free or janitor_lib.free_gb
         self.gauges = gauges or headroom_lib.Gauges(home, settings=headroom_lib.settings(load_config(home)),
                                                     clock=now)
+        self._spin = SpinWatch(load_config(self.home)["spin"])
         self.launch_pool = launch_pool or concurrent.futures.ThreadPoolExecutor(
             max_workers=MAX_CONCURRENT_LAUNCHES, thread_name_prefix="agentq-launch")
         self._inflight: dict[str, concurrent.futures.Future] = {}
@@ -1334,6 +1541,7 @@ class Broker:
             if job["id"] in self._inflight:
                 continue
             self._reconcile_one(conn, job, now)
+        self._spin.keep(job["id"] for job in db.select_jobs(conn, "state = 'running'"))
 
     def launch_ready(self, conn, now: float, status: dict | None = None) -> list[str]:
         """Launch every ready job that passes its gates. ``status`` is the proxy status, or None."""
@@ -1566,7 +1774,8 @@ class Broker:
             "session": backlog_lib.SESSION, "harness": backlog_lib.SESSION, "prompt_path": str(prompt),
         }  # fmt: skip
         if template["max_runtime_s"]:
-            job["max_runtime_s"] = template["max_runtime_s"]
+            job["max_runtime_s"] = min(template["max_runtime_s"],
+                                       db.default_max_runtime(template["kind"], load_config(self.home)["max_runtime"]))
         with db.tx(conn):
             db.insert_job(conn, job, now)
             backlog_lib.mark_submitted(conn, name, now)
@@ -1831,9 +2040,12 @@ class Broker:
         self._death(conn, job, now, "died without a report")
 
     def _watch(self, conn, job: dict, now: float) -> None:
-        """A live worker past its runtime cap or silent for the stall window is stopped."""
+        """A live worker past its runtime cap, spinning, or silent for the stall window is stopped."""
         if job["started_at"] is not None and now - job["started_at"] > job["max_runtime_s"]:
             return self._trip(conn, job, now, f"max runtime {int(job['max_runtime_s'])}s exceeded", requeue_once=False)
+        spin = self._spin.observe(job, now)
+        if spin:
+            return self._trip(conn, job, now, spin, requeue_once=True)
         if now - last_activity(job["run_dir"], job["started_at"] or now) > STALL_S:
             return self._trip(conn, job, now, "stalled: no change to the run folder for 45 min", requeue_once=True)
 
@@ -1908,6 +2120,7 @@ class Broker:
         }  # fmt: skip
         if watchdog_trips is not None:
             fields["watchdog_trips"] = watchdog_trips
+        self._spin.forget(job["id"])
         self._move(conn, job["id"], ("running",), now, "requeue",
                    f"{reason}; attempt {fields['attempt']}", **fields)  # fmt: skip
 
