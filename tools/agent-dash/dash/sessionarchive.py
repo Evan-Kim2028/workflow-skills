@@ -2411,6 +2411,11 @@ class Manifest:
         self.dest = self.state_dir.parent
         self.path = self.state_dir / "manifest.jsonl"
         self.latest: dict[str, dict] = {}
+        # The last record per (unit, rev). A unit that grew after it was
+        # archived is packed again with a new rev, and the store keeps both
+        # revisions (``rev`` is part of its dedupe key), so a rebuild needs
+        # every revision, not just the newest.
+        self.records: dict[tuple[str, str], dict] = {}
         self.lines = 0
         for segment in manifest_segments(self.state_dir):
             for line in _iter_segment_lines(segment):
@@ -2430,6 +2435,7 @@ class Manifest:
             return
         if isinstance(rec, dict) and rec.get("unit"):
             self.latest[rec["unit"]] = rec
+            self.records[(rec["unit"], str(rec.get("rev") or "0"))] = rec
             self.lines += 1
 
     def write(self, rec: dict) -> None:
@@ -2440,6 +2446,7 @@ class Manifest:
             fh.flush()
             os.fsync(fh.fileno())
         self.latest[rec["unit"]] = rec
+        self.records[(rec["unit"], str(rec.get("rev") or "0"))] = rec
 
 
 def archive_path(state_dir: Path, unit: Unit, seq: int = 0) -> Path:

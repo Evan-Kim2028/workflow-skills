@@ -38,16 +38,53 @@ python3 agent_dash.py logs rebuild-store \
 - Starts a second VictoriaLogs with the **live plist's flags** (minus the
   listen address and data path), so the verification compares like with
   like. The binary is `~/.local/share/agent-dash/vlogs/bin/victoria-logs-prod`.
-- Re-ingests every archived session unit (stripped, deduped by
-  `(path, rev, member, line)`) and every log-archive `.zst`, including the
-  agentq job entries.
+- Re-ingests **every archived revision** of every session unit (a unit that
+  grew after it was packed is archived again with a higher `rev`, and the
+  store keeps both, because `rev` is part of its dedupe key), every
+  log-archive `.zst`, and the agentq job entries.
+- Decompresses a member whose file is packed (`.jsonl.zst`, `.log.gz`): the
+  tar holds the file's bytes losslessly, so reading the frame as text would
+  write a couple of garbage rows instead of the real ones.
+- Manifest records with `status: error`, or whose tar is gone, cannot be
+  rebuilt. The plan prints how many revisions and recorded rows that is.
 - Inserts with `--parallel N` streams (default 4), one client per thread.
 - Checkpoints per unit in `DIR.rebuild/checkpoint.jsonl`, so a re-run
   resumes. `--no-resume` refuses a non-empty data dir instead.
+- A unit is checkpointed only once the store accepted its rows, so a run
+  that **stopped cleanly** resumes exactly. A **killed** run leaves the
+  units it had in flight half written, and re-ingesting them adds
+  duplicates (the store cannot drop one unit's rows), so a resume from a
+  killed run prints a warning and that store is not exact: for an exact
+  store, re-run with a fresh `--data-dir` and `--no-resume`.
 - Runs under `scripts/memcap.sh 4096` and `nice 10` unless `--no-memcap`.
-- Verifies per `ws`: row counts must be equal and the assistant token sums
-  (`message.usage.input/output/cacheRead`) must be equal, the same fields
+- Verifies per `ws`: row counts and the assistant token sums
+  (`message.usage.input/output/cacheRead`) must match, the same fields
   `logarchive` checks. It prints the table and a cutover plan.
+
+### What "match" means, and the live-only allowance
+
+The archive is a snapshot, so the live store can hold rows the archive does
+not: a session ingested live but not yet archived (still active, or younger
+than the hourly pass). A rebuild cannot reproduce those rows, and failing on
+them would make every rebuild fail forever.
+
+The verification therefore compares per `path` (the unit id), not just per
+`ws`:
+
+- a path the **archive has** and the rebuilt store lacks is `MISSING`, and
+  the rebuild exits 1;
+- a path only the **live store** has is `live-only`: printed with its row
+  count, subtracted from the expected total, and not a failure. Its `ws`
+  shows `n/a` in the token column, because those rows carry usage the
+  archive does not hold;
+- a path the archive has and the live store never ingested is `new-only`:
+  it adds rows rather than missing them.
+
+The archive's path list is written to `DIR.rebuild/meta.json` as
+`expected_paths` at the end of a rebuild; the cutover extends it with the
+delta units it re-ingests. A cutover run before those live-only units are
+archived loses their rows: run `agent_dash.py logs sessions` (or the hourly
+job) first, then rebuild again.
 - Never touches the live store or the plist. The live store is read only,
   for the verification queries.
 

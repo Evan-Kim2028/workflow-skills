@@ -264,7 +264,10 @@ def session_jobs(dest, state_dir=None) -> list[Job]:
     state = Path(state_dir) if state_dir is not None else Path(_expand(dest)) / "state"
     manifest = sessionarchive.Manifest(state)
     jobs: list[Job] = []
-    for uid, rec in sorted(manifest.latest.items()):
+    # Every revision, not just the newest: a unit that grew after it was
+    # packed is archived again with a higher rev, and the store keeps both
+    # (``rev`` is part of its dedupe key), so a rebuild must too.
+    for (uid, rev), rec in sorted(manifest.records.items()):
         if rec.get("status") not in ("archived", "reclaimed", "restored"):
             continue
         archive = sessionarchive.resolve_stored_path(
@@ -274,7 +277,7 @@ def session_jobs(dest, state_dir=None) -> list[Job]:
             continue
         jobs.append(
             Job(
-                key="session:" + uid,
+                key="session:%s:%s" % (uid, rev),
                 kind="session",
                 ws="native/" + str(rec.get("tool") or ""),
                 rows=int(rec.get("lines") or 0),
@@ -284,6 +287,24 @@ def session_jobs(dest, state_dir=None) -> list[Job]:
             )
         )
     return jobs
+
+
+def skipped_session_records(dest) -> tuple[int, int]:
+    """``(revisions, recorded rows)`` the manifest has but no archive backs."""
+    state = Path(_expand(dest)) / "state"
+    manifest = sessionarchive.Manifest(state)
+    count = rows = 0
+    for rec in manifest.records.values():
+        if rec.get("status") not in ("archived", "reclaimed", "restored"):
+            count += 1
+            continue
+        archive = sessionarchive.resolve_stored_path(
+            dest, rec.get("archive_rel"), rec.get("archive")
+        )
+        if not archive or not os.path.exists(archive):
+            count += 1
+            rows += int(rec.get("lines") or 0)
+    return count, rows
 
 
 def _agentq_extras(home=None) -> dict:
@@ -432,12 +453,57 @@ def ingest_session_job(job: Job, client) -> int:
                 if rows_kind == "cursor-store":
                     sent += _ingest_cursor_member(job, mrec, src, client)
                 elif rows_kind in ("jsonl", "log"):
-                    rows = sessionarchive.iter_stream_rows(tool, rows_kind, src, fallback)
-                    sent += client.insert(_session_rows(job, mrec["rel"], rows))
+                    sent += client.insert(
+                        _session_rows(job, mrec["rel"], _member_rows(tool, mrec, src, fallback))
+                    )
     finally:
         proc.stdout.close()
         proc.wait()
     return sent
+
+
+def _member_rows(tool: str, mrec: dict, src, fallback_ms: int):
+    """Rows from one tar member, decompressed when the member file is packed.
+
+    Codex and claude keep some histories as ``.jsonl.zst`` / ``.log.zst``;
+    the tar stores the file's bytes as-is (losslessly), so the row reader has
+    to decompress it exactly as ``sessionarchive.iter_member_rows`` does for a
+    live file. Reading the compressed bytes as text yields garbage rows.
+    """
+    rel = str(mrec.get("rel") or "")
+    rows_kind = mrec.get("rows") or "none"
+    if rows_kind not in ("jsonl", "log"):
+        return
+    packer = None
+    if rel.endswith(".zst"):
+        packer = [sessionarchive._zstd_bin(), "-dc", sessionarchive.ZSTD_LONG]
+    elif rel.endswith(".gz"):
+        packer = ["gzip", "-dc"]
+    if packer is None:
+        for row in sessionarchive.iter_stream_rows(tool, rows_kind, src, fallback_ms):
+            yield row
+        return
+    # A tar member has no fileno(), so the packer is fed by a thread.
+    proc = subprocess.Popen(packer, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def feed():
+        try:
+            shutil.copyfileobj(src, proc.stdin, 1 << 20)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    try:
+        for row in sessionarchive.iter_stream_rows(tool, rows_kind, proc.stdout, fallback_ms):
+            yield row
+    finally:
+        proc.stdout.close()
+        proc.wait()
 
 
 def _log_rows(job: Job):
@@ -776,6 +842,14 @@ def rebuild(
     )
     print("  data dir %s  port %d  parallel %d" % (_expand(data_dir), port, parallel), file=out)
     print("  live store %s (read-only: verification only)" % live_url, file=out)
+    skipped_n, skipped_rows = skipped_session_records(dest)
+    if skipped_n:
+        print(
+            "  skipped %d manifest revisions with no archive on disk (%d recorded rows):"
+            " status error, or the tar is gone. The store cannot rebuild them."
+            % (skipped_n, skipped_rows),
+            file=out,
+        )
 
     if not apply:
         print("dry run: pass --apply to start the store and ingest", file=out)
@@ -822,6 +896,18 @@ def rebuild(
         % (len(jobs) - len(pending), len(pending)),
         file=out,
     )
+    if checkpoint.done and not meta.get("complete"):
+        # A unit is checkpointed only after its rows are accepted, so a run
+        # that stopped cleanly resumes exactly. A killed run leaves the units
+        # it had in flight half written, and re-ingesting them would add
+        # duplicates, because the store cannot drop one unit's rows.
+        print(
+            "  WARN the previous run did not finish. Units that were in flight were"
+            " partly written and will be ingested again, so this store may hold"
+            " duplicate rows for them. For an exact store, re-run with a fresh"
+            " --data-dir and --no-resume.",
+            file=out,
+        )
 
     store = store or Store(bin_path, data_dir, port, live_flags(plist), log_path=str(side / "vlogs.log"))
     store.start()
@@ -894,11 +980,12 @@ def rebuild(
         new_client.flush()
         old_client = old_client or client_factory(live_url)
         expected_paths = sorted({job_path(job) for job in jobs})
-        meta["expected_paths"] = expected_paths
-        write_meta(data_dir, meta)
         ok, _table = verify(
             old_client, new_client, out=out, expected_paths=expected_paths
         )
+        meta["expected_paths"] = expected_paths
+        meta["complete"] = bool(ok and not counters["errors"])
+        write_meta(data_dir, meta)
     finally:
         if not keep_running:
             store.stop()

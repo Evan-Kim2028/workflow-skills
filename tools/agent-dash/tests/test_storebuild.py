@@ -154,7 +154,7 @@ LOG_BODY = (
 )
 
 
-def make_session_unit(dest, tool="claude", key="proj/sess-1.jsonl", body=None, ts=None):
+def make_session_unit(dest, tool="claude", key="proj/sess-1.jsonl", body=None, ts=None, rev="1", seq=0):
     """Pack a synthetic unit into ``<dest>/archive`` and return its manifest record."""
     src = Path(dest) / "src" / tool / key
     src.parent.mkdir(parents=True, exist_ok=True)
@@ -173,7 +173,7 @@ def make_session_unit(dest, tool="claude", key="proj/sess-1.jsonl", body=None, t
         members=[member],
         newest_mtime=st.st_mtime,
     )
-    archive = Path(dest) / "archive" / tool / (key + ".0.tar.zst")
+    archive = Path(dest) / "archive" / tool / ("%s.%d.tar.zst" % (key, seq))
     archive.parent.mkdir(parents=True, exist_ok=True)
     records = sessionarchive.pack(unit, str(archive))
     return {
@@ -186,10 +186,10 @@ def make_session_unit(dest, tool="claude", key="proj/sess-1.jsonl", body=None, t
         "archive": str(archive),
         "archive_rel": os.path.relpath(archive, dest).replace(os.sep, "/"),
         "archive_bytes": archive.stat().st_size,
-        "seq": 0,
+        "seq": seq,
         "raw_bytes": st.st_size,
         "newest_mtime": st.st_mtime,
-        "rev": "1",
+        "rev": rev,
         "lines": len(body.splitlines()),
         "members": records,
         "status": "archived",
@@ -306,7 +306,7 @@ class RebuildTest(unittest.TestCase):
         self.assertIn("snapshot_ts", meta)
         lines = (side / "checkpoint.jsonl").read_text().splitlines()
         keys = {json.loads(line)["key"] for line in lines}
-        self.assertIn("session:" + rec["unit"], keys)
+        self.assertIn("session:%s:%s" % (rec["unit"], rec["rev"]), keys)
 
     def test_rebuild_resumes_and_skips_checkpointed_jobs(self):
         rec = make_session_unit(self.dest)
@@ -356,6 +356,67 @@ class RebuildTest(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertIn("NO", self.out.getvalue())
+
+    def test_every_revision_is_ingested_not_just_the_newest(self):
+        # A unit that grew after it was packed is archived again with a higher
+        # rev, and the store keeps both revisions. A rebuild that read only
+        # the manifest's newest record would halve that unit's rows.
+        rev0 = make_session_unit(self.dest, rev="0")
+        rev1 = make_session_unit(self.dest, rev="1", seq=1)
+        write_session_manifest(self.dest, [rev0, rev1])
+        jobs = storebuild.session_jobs(self.dest)
+        self.assertEqual(len(jobs), 2, [j.key for j in jobs])
+        self.assertEqual({j.unit.get("rev") for j in jobs}, {"0", "1"})
+        new = FakeClient()
+        code = storebuild.rebuild(
+            data_dir=str(self.data),
+            port=19429,
+            apply=True,
+            dest=str(self.dest),
+            state=self.state,
+            out=self.out,
+            store=FakeStore(),
+            client_factory=lambda url: new,
+            old_client=self._reference(),
+        )
+        self.assertEqual(code, 0, self.out.getvalue())
+        self.assertEqual(new.count(rev0["unit"]), 2 * rev0["lines"])
+        self.assertEqual({r.get("rev") for r in new.rows}, {"0", "1"})
+
+    def test_a_packed_member_is_decompressed(self):
+        # Codex keeps some histories as .jsonl.zst; the tar holds the packed
+        # bytes losslessly, so the row reader must decompress it. Reading the
+        # frame as text yields a couple of garbage rows instead of the real
+        # ones (a live-store defect this rebuild repairs).
+        plain = b"".join(b'{"type":"user","message":{"role":"user","content":"line %d"}}\n' % i for i in range(40))
+        packed = subprocess.run(
+            [sessionarchive._zstd_bin(), "-q", "-c"], input=plain, capture_output=True, check=True
+        ).stdout
+        rec = make_session_unit(
+            self.dest, tool="codex", key="sessions/s.jsonl.zst", body=packed
+        )
+        self.assertGreater(len(packed.splitlines()), 1)
+        # ``pack`` sniffs rows from the bytes, which are packed here, so say
+        # what the real ingest knows: this member is jsonl.
+        for mrec in rec["members"]:
+            mrec["rows"] = "jsonl"
+        write_session_manifest(self.dest, [rec])
+        new = FakeClient()
+        code = storebuild.rebuild(
+            data_dir=str(self.data),
+            port=19429,
+            apply=True,
+            dest=str(self.dest),
+            state=self.state,
+            out=self.out,
+            store=FakeStore(),
+            client_factory=lambda url: new,
+            old_client=new,
+        )
+        self.assertEqual(code, 0, self.out.getvalue())
+        rows = [r for r in new.rows if r.get("path") == rec["unit"]]
+        self.assertEqual(len(rows), 40, "the 40 real lines, not the packed frame's few newlines")
+        self.assertIn("line 39", " ".join(r["_msg"] for r in rows))
 
     def test_dry_run_starts_nothing(self):
         make_session_unit(self.dest)
