@@ -13,11 +13,14 @@
 # Test overrides (never needed in normal use):
 #   VLOGS_HOME       install dir            (default ~/.local/share/agent-dash/vlogs)
 #   VLOGS_DATA       store data dir         (default: kept from the plist)
-#   VLOGS_MAX_DISK   retention disk cap     (default: kept from the plist;
-#                    a fresh install uses 20GiB; `none` or an empty value
-#                    omits the cap entirely, so the store never evicts)
+#   VLOGS_MIN_FREE   free-disk floor        (default 20GiB; below it the store
+#                    goes read-only and logs loudly instead of failing inserts)
 #   VLOGS_PLIST_DIR  launch agents dir      (default ~/Library/LaunchAgents)
 #   VLOGS_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
+#
+# Retention is 100y and there is no disk-usage cap: logs are historical data
+# kept with maximum retention, so the store never drops an old partition. A
+# full disk makes it read-only (loudly) rather than evicting history.
 
 set -eu
 
@@ -31,32 +34,25 @@ PLIST_DIR="${VLOGS_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$PLIST_DIR/$LABEL.plist"
 BIN="$HOME_DIR/bin/victoria-logs-prod"
 DATA="${VLOGS_DATA-$HOME_DIR/data}"
-# Unset keeps the 20GiB default; an explicitly empty value means no cap.
-MAX_DISK="${VLOGS_MAX_DISK-20GiB}"
+# A free-disk floor, not a retention cap: below it the store refuses writes
+# and says so, instead of silently dropping old partitions.
+MIN_FREE="${VLOGS_MIN_FREE-20GiB}"
 
-# An update must not silently move the store or change its retention cap:
-# when VLOGS_DATA / VLOGS_MAX_DISK are unset, keep the values the currently
-# installed plist already runs with. A fresh install (no plist yet) keeps
-# today's defaults.
+# An update must not silently move the store: when VLOGS_DATA is unset, keep
+# the value the currently installed plist already runs with. A fresh install
+# (no plist yet) keeps today's default. Any -retention.maxDiskSpaceUsageBytes
+# line an older plist carries is dropped on the next install: it evicts old
+# partitions, and the owner rule is maximum retention.
 if [ -f "$PLIST" ]; then
     if [ -z "${VLOGS_DATA+set}" ]; then
-        old_data=$(sed -n 's|.*<string>-storageDataPath=\(.*\)</string>.*|\1|p' "$PLIST" | head -n 1)
+        old_data=$(sed -n 's|.*<string>-storageDataPath=\([^<]*\)</string>.*|\1|p' "$PLIST" | head -n 1)
         if [ -n "$old_data" ]; then DATA="$old_data"; fi
     fi
-    if [ -z "${VLOGS_MAX_DISK+set}" ]; then
-        if grep -q -- '-retention\.maxDiskSpaceUsageBytes=' "$PLIST"; then
-            # Keep whatever cap the plist carries, including an empty one.
-            MAX_DISK=$(sed -n 's|.*<string>-retention\.maxDiskSpaceUsageBytes=\(.*\)</string>.*|\1|p' "$PLIST" | head -n 1)
-        else
-            # An installed plist with no cap line runs uncapped; keep it so.
-            MAX_DISK=""
-        fi
+    if [ -z "${VLOGS_MIN_FREE+set}" ]; then
+        old_free=$(sed -n 's|.*<string>-storage\.minFreeDiskSpaceBytes=\([^<]*\)</string>.*|\1|p' "$PLIST" | head -n 1)
+        if [ -n "$old_free" ]; then MIN_FREE="$old_free"; fi
     fi
 fi
-case "$MAX_DISK" in
-    ""|none|NONE|None) MAX_DISK_LINE="" ;;
-    *) MAX_DISK_LINE="        <string>-retention.maxDiskSpaceUsageBytes=$MAX_DISK</string>" ;;
-esac
 LOG="$HOME_DIR/server.log"
 VERSION_FILE="$HOME_DIR/VERSION"
 
@@ -150,7 +146,7 @@ cat > "$PLIST.tmp" <<EOF
         <string>-httpListenAddr=127.0.0.1:$PORT</string>
         <string>-storageDataPath=$DATA</string>
         <string>-retentionPeriod=100y</string>
-$MAX_DISK_LINE
+        <string>-storage.minFreeDiskSpaceBytes=$MIN_FREE</string>
         <string>-memory.allowedBytes=1GiB</string>
         <string>-insert.maxLineSizeBytes=8MiB</string>
     </array>

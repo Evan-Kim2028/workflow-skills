@@ -148,6 +148,55 @@ class StreamFilter:
         return out
 
 
+def strip_text(text: str, min_run: int = MIN_RUN) -> tuple[str, int, int]:
+    """Strip base64 runs from one message string.
+
+    Returns ``(stripped, removed_bytes, replaced)``: the filtered text, the
+    number of base64 characters replaced (the bytes the store no longer
+    holds), and how many runs were replaced. A string with no run comes back
+    unchanged with ``(text, 0, 0)``, so a caller can skip the work cheaply.
+    The lossless copy (the session archive's tar) keeps the original bytes.
+    """
+    raw = text.encode("utf-8", "replace")
+    if len(raw) < min_run:
+        # A run cannot be longer than the line; most lines are shorter.
+        return text, 0, 0
+    pattern = _long_run_re(min_run)
+    if not pattern.search(raw):
+        return text, 0, 0
+    removed = 0
+    replaced = 0
+
+    def _marker(match):
+        nonlocal removed, replaced
+        run = match.group(0)
+        removed += len(run)
+        replaced += 1
+        digest = hashlib.sha256(run).hexdigest()[:16]
+        return ("<img sha256=%s bytes=%d>" % (digest, len(run))).encode("ascii")
+
+    out = pattern.sub(_marker, raw)
+    return out.decode("utf-8", "replace"), removed, replaced
+
+
+_RUN_RES: dict = {}
+
+
+def _long_run_re(min_run: int):
+    """A cached matcher for maximal base64 runs of ``min_run``+ characters.
+
+    The lookbehind anchors a match at a run start, so the engine scans each
+    run once instead of retrying at every position (a plain ``{2000,}`` is
+    quadratic on a line with a long run just under the threshold). The
+    marker it writes is byte-identical to ``StreamFilter``'s.
+    """
+    pattern = _RUN_RES.get(min_run)
+    if pattern is None:
+        pattern = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{%d,}" % int(min_run))
+        _RUN_RES[min_run] = pattern
+    return pattern
+
+
 def flush_interval(environ=None) -> float:
     """The group-flush interval for a new sink: ``AGENTQ_STREAM_FLUSH_S``, else 2 s."""
     env = os.environ if environ is None else environ

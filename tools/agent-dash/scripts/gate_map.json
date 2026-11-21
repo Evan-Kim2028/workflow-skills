@@ -238,6 +238,7 @@
       "perf/test_perf_budget",
       "test_rollup"
     ],
+    "dash/storebuild.py": ["test_storebuild"],
     "dash/taskmatch.py": [
       "test_page_rules",
       "perf/test_perf_budget"

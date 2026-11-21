@@ -1223,6 +1223,10 @@ def process(
                     "ws": e.ws,
                     "label": e.label,
                     "kind": e.kind,
+                    "tool": e.tool,
+                    # The job identity fields every row of an agentq file carries.
+                    # Kept here so a store rebuild can reproduce the rows.
+                    "extra": dict(e.extra or {}),
                     "size": e.size,
                     "mtime_ns": e.mtime_ns,
                     "status": "measured",

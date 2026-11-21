@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -29,7 +30,7 @@ from dash import sessionarchive as sa  # noqa: E402
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / "scripts"
 
-_UNIT_RE = re.compile(r'unit:="([^"]*)"')
+_UNIT_RE = re.compile(r'path:="([^"]*)"')
 _REV_RE = re.compile(r'rev:="([^"]*)"')
 
 
@@ -59,7 +60,7 @@ class FakeClient:
         if not match:
             return [{"n": "0"}]
         unit = match.group(1)
-        rows = [r for r in self.rows if r.get("unit") == unit]
+        rows = [r for r in self.rows if r.get("path") == unit]
         rev = _REV_RE.search(query)
         if rev:
             rows = [r for r in rows if r.get("rev") == rev.group(1)]
@@ -403,7 +404,10 @@ class IngestTest(Base):
         self.assertEqual(len(client.rows), 2)
         self.assertEqual(client.rows[0]["ws"], "native/pi")
         self.assertEqual(client.rows[0]["kind"], "native")
-        self.assertEqual(client.rows[0]["unit"], unit.uid)
+        self.assertEqual(client.rows[0]["path"], unit.uid)
+        self.assertEqual(client.rows[0]["label"], unit.session)
+        self.assertNotIn("unit", client.rows[0])
+        self.assertNotIn("session", client.rows[0])
         self.assertEqual(client.rows[0]["rev"], "0")
 
         with open(path, "a", encoding="utf-8") as fh:
@@ -440,7 +444,7 @@ class IngestTest(Base):
         client = FakeClient()
         records = self._records(unit, self.home / "a.tar.zst")
         # One row already stored but two lines expected, and no manifest record.
-        client.rows.append({"unit": unit.uid, "rev": "0"})
+        client.rows.append({"path": unit.uid, "rev": "0"})
         with self.assertRaises(sa.ArchiveError):
             sa.ingest_unit(unit, records, None, client)
 
@@ -1261,7 +1265,9 @@ class ReviewRegressionTest(Base):
     # -- finding 9: a long line is truncated and the buffer stays bounded
     def test_review_f9_long_line_is_bounded(self):
         root = self.home / "pi"
-        path = write(root / "proj" / "a.jsonl", b"x" * (4 << 20) + b"\n" + b'{"type":"a"}\n')
+        # ``!`` is outside the base64 alphabet, so the stripper leaves the run
+        # alone and the row is truncated as before.
+        path = write(root / "proj" / "a.jsonl", b"!" * (4 << 20) + b"\n" + b'{"type":"a"}\n')
         unit = self.unit("pi", root)
         with mock.patch.object(sa, "MAX_LINE_BYTES", 1 << 20):
             lines = list(sa._iter_lines(str(path)))
@@ -1274,6 +1280,39 @@ class ReviewRegressionTest(Base):
         self.assertEqual(client.rows[0]["truncated"], "1")
         self.assertLessEqual(len(client.rows[0]["_msg"].encode("utf-8")), sa.vlogs.MAX_MSG_BYTES)
         self.assertNotIn("truncated", client.rows[1])
+
+    def test_base64_is_stripped_before_ingest(self):
+        """A base64 image is a marker in the store row, and the count is recorded."""
+        root = self.home / "pi"
+        image = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk=" * 40
+        line = json.dumps({"type": "message", "data": image}, separators=(",", ":"))
+        write(root / "proj" / "a.jsonl", line + "\n" + '{"type":"message"}\n')
+        unit = self.unit("pi", root)
+        records = sa.pack(unit, str(self.home / "a.tar.zst"))
+        client = FakeClient()
+        stats = {}
+        sa.ingest_unit(unit, records, None, client, stats)
+        self.assertEqual(len(client.rows), 2)
+        self.assertNotIn(image, client.rows[0]["_msg"])
+        self.assertIn("<img sha256=", client.rows[0]["_msg"])
+        self.assertEqual(stats["stripped_rows"], 1)
+        self.assertGreaterEqual(stats["stripped_bytes"], len(image))
+        # The tar keeps the original bytes: the lossless copy is unchanged.
+        raw = subprocess.run(
+            [
+                "zstd",
+                "-d",
+                sa.ZSTD_LONG,
+                "-q",
+                "-c",
+                str(self.home / "a.tar.zst"),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            member = tf.getmembers()[0]
+            self.assertIn(image.encode(), tf.extractfile(member).read())
 
     @unittest.skipUnless(
         os.environ.get("SESSION_ARCHIVE_BIG") == "1",

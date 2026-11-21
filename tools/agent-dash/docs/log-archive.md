@@ -321,6 +321,11 @@ sh tools/agent-dash/scripts/vlogs_install.sh --uninstall --purge
 ```
 
 Manifest: `~/.local/share/agent-dash/log-archive/manifest.jsonl` (last record per
-path wins; statuses `measured`, `archived`, `reclaimed`, `error`). Lock:
+path wins; statuses `measured`, `archived`, `reclaimed`, `error`). A record
+carries `ws`, `label`, `kind`, `size`, `stripped_lines`, `stripped_bytes`
+and, for a rebuild to reproduce the row's extra fields exactly, `tool` and
+`extra` (records written before those two fields fall back to the job-folder
+lookup in `dash/storebuild.py`). Lock:
 `log-archive/archive.lock`. A file archived and reclaimed is skipped on every
-rerun.
+rerun. Re-ingesting the archive is `logs rebuild-store`
+([store rebuild](store-rebuild.md)).

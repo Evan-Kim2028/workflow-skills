@@ -214,9 +214,9 @@ class ClientTest(unittest.TestCase):
 
 
 class VlogsInstallerTest(unittest.TestCase):
-    """The plist's retention cap and data path across installs."""
+    """The plist's retention, free-disk floor and data path across installs."""
 
-    def _install(self, tmp, max_disk=None, data=None, unset=()):
+    def _install(self, tmp, min_free=None, data=None, unset=(), seed_plist=None):
         home = Path(tmp) / "vlogs"
         plist_dir = Path(tmp) / "LaunchAgents"
         (home / "bin").mkdir(parents=True, exist_ok=True)
@@ -224,6 +224,9 @@ class VlogsInstallerTest(unittest.TestCase):
         binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binary.chmod(0o755)
         (home / "VERSION").write_text("v1.53.0\n", encoding="utf-8")
+        if seed_plist is not None:
+            plist_dir.mkdir(parents=True, exist_ok=True)
+            (plist_dir / "com.agent-dash.vlogs.plist").write_text(seed_plist, encoding="utf-8")
         env = dict(
             os.environ,
             VLOGS_HOME=str(home),
@@ -231,8 +234,8 @@ class VlogsInstallerTest(unittest.TestCase):
             VLOGS_PLIST_DIR=str(plist_dir),
             VLOGS_NO_LOAD="1",
         )
-        if max_disk is not None:
-            env["VLOGS_MAX_DISK"] = max_disk
+        if min_free is not None:
+            env["VLOGS_MIN_FREE"] = min_free
         for key in unset:
             env.pop(key, None)
         res = subprocess.run(
@@ -244,44 +247,46 @@ class VlogsInstallerTest(unittest.TestCase):
         self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
         return plist.read_text(encoding="utf-8")
 
-    def test_max_disk_none_and_empty_omit_the_flag(self):
+    def test_fresh_install_keeps_history_and_floors_free_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for value in ("none", ""):
-                text = self._install(tmp, value)
-                self.assertNotIn("maxDiskSpaceUsageBytes", text)
-                self.assertIn("-retentionPeriod=100y", text)
+            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MIN_FREE"))
+            self.assertIn("<string>-retentionPeriod=100y</string>", text)
+            self.assertIn("<string>-storage.minFreeDiskSpaceBytes=20GiB</string>", text)
+            # No disk-usage cap: it would evict old partitions.
+            self.assertNotIn("maxDiskSpaceUsageBytes", text)
+            self.assertNotIn("maxDiskUsagePercent", text)
+            self.assertIn("<string>-storageDataPath=%s/data</string>" % (Path(tmp) / "vlogs"), text)
 
-    def test_max_disk_value_keeps_the_flag(self):
+    def test_min_free_override(self):
         with tempfile.TemporaryDirectory() as tmp:
-            text = self._install(tmp, "30GiB")
-            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=30GiB</string>", text)
+            text = self._install(tmp, min_free="5GiB")
+            self.assertIn("<string>-storage.minFreeDiskSpaceBytes=5GiB</string>", text)
 
-    def test_default_is_20gib(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            text = self._install(tmp, unset=("VLOGS_MAX_DISK",))
-            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=20GiB</string>", text)
-
-    def test_update_keeps_installed_data_path_and_cap(self):
-        """An update with both vars unset must not move or uncap the store."""
+    def test_update_keeps_installed_data_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             custom = str(Path(tmp) / "elsewhere" / "data")
-            self._install(tmp, max_disk="30GiB", data=custom)
-            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MAX_DISK"))
+            self._install(tmp, data=custom)
+            text = self._install(tmp, unset=("VLOGS_DATA",))
             self.assertIn("<string>-storageDataPath=%s</string>" % custom, text)
-            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=30GiB</string>", text)
             self.assertTrue(Path(custom).is_dir(), "the preserved data dir must still be used")
 
-    def test_update_keeps_an_omitted_cap_omitted(self):
+    def test_update_drops_an_old_disk_cap(self):
+        """An older plist's eviction cap must not survive an update."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._install(tmp, max_disk="")
-            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MAX_DISK"))
+            old = "\n".join(
+                [
+                    "<plist><dict><key>ProgramArguments</key><array>",
+                    "<string>/bin/victoria-logs-prod</string>",
+                    "<string>-storageDataPath=%s</string>" % (Path(tmp) / "vlogs" / "data"),
+                    "<string>-retentionPeriod=100y</string>",
+                    "<string>-retention.maxDiskSpaceUsageBytes=30GiB</string>",
+                    "</array></dict></plist>",
+                ]
+            )
+            text = self._install(tmp, seed_plist=old, unset=("VLOGS_DATA",))
             self.assertNotIn("maxDiskSpaceUsageBytes", text)
-
-    def test_fresh_install_with_no_plist_uses_defaults(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            text = self._install(tmp, unset=("VLOGS_DATA", "VLOGS_MAX_DISK"))
-            self.assertIn("<string>-storageDataPath=%s/data</string>" % (Path(tmp) / "vlogs"), text)
-            self.assertIn("<string>-retention.maxDiskSpaceUsageBytes=20GiB</string>", text)
+            self.assertIn("<string>-retentionPeriod=100y</string>", text)
+            self.assertIn("<string>-storage.minFreeDiskSpaceBytes=20GiB</string>", text)
 
 
 @unittest.skipUnless(os.environ.get("VLOGS_LIVE_TEST") == "1", "set VLOGS_LIVE_TEST=1 to query a running store")
