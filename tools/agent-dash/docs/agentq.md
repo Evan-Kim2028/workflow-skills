@@ -667,3 +667,7 @@ edit, `--lf`, a failing run, a skip-only run and the switches).
   launcher must honour the variable for the session to continue.
 - Cancel signals the process group. A pi child that moved to its own session
   survives a cancel.
+- The janitor's disk gate is in memory: a broker restart re-reads the volume and
+  starts from that reading, so a restart while the disk is full holds work at
+  once, and a restart after a reap releases it at once. The reapers themselves
+  are stateless and safe to run twice.
