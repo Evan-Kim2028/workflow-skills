@@ -538,48 +538,72 @@ one line and exit 0.
   files is a module-level import (a deselect after collection would save nothing). When every
   positional target is a recorded pass it prints one line to stderr and returns 0:
   `agentq pytest cache: 2 file(s) unchanged since a recorded pass on this tree, skipped
-  (a.py, b.py); re-run with LOR_PYTEST_CACHE=0, or change a file they import`.
-- **The key** covers the target files' content shas, every repo module in their transitive
-  import closure (a stdlib AST import walk, cached per file under the agentq home keyed by
-  that file's content sha), every `conftest.py` up to the repo root, `uv.lock` and every
-  `pyproject.toml` / `pytest.ini` / `setup.cfg` / `tox.ini`, the whole pytest argv, the
-  environment the suites read (`PYTHONPATH`, `LOR_DBT_MANIFEST`, `DATA_ROOT`, `LAKE_STORE`,
-  `PYTEST_ADDOPTS`, every `PG*` and `LOR_*`), the interpreter path, and for a test file that
-  reads the whole tree (`SCAN_ROOTS`, `git ls-files`, `rglob`, `os.walk`, `.glob(`) the whole
-  tree sha. A miss is cheap; a false hit is a lie, so anything that cannot be keyed (no
-  target, a missing target, an unresolved repo import, a tree test with no git tree sha) runs
-  normally and is not cached. A closure over `MAX_CLOSURE_FILES` (300) is not walked to the
-  end: the key falls back to the whole tree sha, which is the same answer for a test that
-  reaches everything and costs one `git ls-files` instead of a parse of the repo. The verdict
-  is cached per target blob, so a repeat does not walk to the cap again. In a monorepo where
-  one test's closure is a few thousand files (measured: 2359 for one orchestration test) that
-  is the normal path, and the key is then the tree sha plus argv, env and interpreter.
+  (a.py, b.py); re-run with LOR_PYTEST_CACHE=0, or change a file in the tree`.
+- **The key is the whole tree**, not an import closure. An import walk cannot see a data
+  file, a script a test runs through `subprocess`, a fixture directory, a directory listing
+  or a plugin named by a string, so it produced false hits on 52 % of one real suite. The
+  whole tree has no such blind spot and costs one `git ls-files` plus one `git status`
+  (measured: 0.2–0.5 s on a 10 000-file repo, ~1 s on a 14 000-file repo with 3 500
+  gitignored files):
+  - **Tree content.** `git ls-files -s` (index blob shas) plus the content sha of every path
+    `git status --porcelain=v1 -z --untracked-files=all` reports as modified, deleted or
+    untracked, so any edit anywhere in the repo, committed or not, changes the key. A
+    submodule is keyed by its own `HEAD` and `status`. A tracked file is always keyed; an
+    untracked path under a tool cache (`.pytest_cache/`, `__pycache__/`, `.venv/`,
+    `node_modules/`, `.mypy_cache/`, `.ruff_cache/`) is not, because pytest writes one on
+    every run and the key would never repeat.
+  - **Ignored inputs.** Size and mtime of every gitignored file under the repo, because a
+    generated input (a dbt `target/manifest.json`, a `.env`, a built parquet) is gitignored
+    and is still an input. The walk skips the tool caches above, `.git/`, the cache's own
+    dir, and a nested checkout (a directory with a `.git` entry: another checkout of this or
+    another repo, not an input of a run here, and walking the ones under a `.worktrees/`
+    folder cost 26 s on a 14 000-file repo). Over `IGNORED_MAX_FILES` (200 000) files or
+    `IGNORED_MAX_S` (3 s) the run is not cached.
+  - **argv**, the whole environment minus `ENV_SKIP` (the volatile variables that cannot
+    change what a test does: `AGENTQ_*` run ids, `TERM`, `SHLVL`, `PWD`, `OLDPWD`, `_`, the
+    terminal and session ids, `COLUMNS`/`LINES`, `PYTEST_CURRENT_TEST`, `PYTEST_XDIST_*` and
+    `LOR_PYTEST_CACHE` itself), the interpreter realpath and its `sys.version`, and the cwd.
+  - Every `conftest.py` from each target's directory up to the filesystem root, keyed by
+    absolute path (pytest loads a conftest above the git toplevel too, and that file is not
+    in the tree sha), and the content of a `-c`/`--config-file` file.
+
+  A miss is cheap; a false hit is a lie, so a run that cannot be keyed runs normally and is
+  not cached: no target, a missing or directory target, a state-dependent selector (`--lf`,
+  `--ff`, `--nf`, `--sw`: the target set comes from `.pytest_cache` state, not from the
+  argv, so a recorded pass could cover a subset of what the same key later means), a random
+  test order (`pytest-randomly` with no `--randomly-seed`), no git tree sha, and an
+  ignored-input walk over the bound. The reason goes in the `why` field of the event row.
+
+  Two inputs the tree sha cannot see, stated rather than claimed away: the content behind a
+  data path outside the repo (`DATA_ROOT=/elsewhere` is keyed by the path string, not by what
+  is under it), and the files inside a nested checkout under the repo (keyed as one skipped
+  directory). Both are a miss only if the path string or the checkout's own tree changes.
 - **Recorded only on exit 0** with at least one passed test, in the main process only. A
   failure, an error, a skip-only run and a `-x` early exit write nothing.
 - **The guard, folded in.** The shim's `pytest_reason` refusals (a bare pytest, a directory
   target, more than 25 files) are applied here too, with the shim's message and exit 2, so the
   absolute-path invocations the shim never sees get them. `AGENTQ_GUARD=0` turns that off.
 - **Off outside a worker.** It does nothing unless `AGENTQ_JOB` or `AGENTQ_RUN` is set, and
-  `LOR_PYTEST_CACHE=0` turns it off. The gate and CI must set that variable explicitly (an
-  attestation has to be a real run), not rely on `AGENTQ_JOB` being unset.
+  `LOR_PYTEST_CACHE=0` turns it off. A gate or CI run that has to be a real run must set that
+  variable explicitly rather than rely on `AGENTQ_JOB` being unset; this repo's own gate runs
+  `python3 -m unittest`, which never loads this plugin.
 - **Never fails a run.** Any error prints one `agentq pytest cache:` line to stderr and pytest
   runs normally. Stdlib only, Python 3.9+, and it imports nothing from agentq: the home is
   `$AGENTQ_HOME` or `~/.local/state/agentq`, and it appends the event row itself.
 - **Visibility.** One row per decision in `slots/events.jsonl` with `cache=hit|miss` (and
   `why` when a run could not be keyed), counted per label by `agentq slots --history`.
-- **Entries** live under `$AGENTQ_HOME/pytest-cache/`: `entries/<xx>/<key>.json` (a recorded
-  pass), `closures/<xx>.json` (a test file's import closure with every member's blob, so a
-  repeat re-hashes the members and walks only what changed) and `imports/store.json` (the
-  per-file import lists, keyed by content sha and shared across worktrees). Entries and
-  closures are pruned by age (30 days) and count (20 000) at most once an hour. The first
-  walk of a large closure parses every file in it once (a thousand files for a test that
-  imports a whole monorepo); after that the store answers from memory. A closure over the cap
-  is stored as a `too_large` marker instead, so the next run goes straight to the tree sha.
+- **Entries** live under `$AGENTQ_HOME/pytest-cache/entries/<xx>/<key>.json` (a recorded
+  pass; the file is a marker, its content is never read). Entries are pruned by age (30 days)
+  and count (20 000) at most once an hour.
 
-Tests: `tests/test_agentq_pytest_cache.py` (key material and each miss trigger, the import
-cache, the event rows, gating, the guard, the never-fails paths, and real
-`sys.executable -m pytest` runs for a hit, an edit, a failing run, a skip-only run and the
-switches).
+Tests: `tests/test_agentq_pytest_cache.py` (key material and each miss trigger, every
+false-hit repro from the review — a data file, a `subprocess` script, a directory listing, a
+fixture dir, an env var outside the old allowlist, a gitignored generated input, a computed
+import, a plugin named by a string, a new file that changes import resolution, a conftest
+above the git toplevel, a `-c` file outside the repo, a dirty submodule, a state-dependent
+selector — the key cost on a 10 000-file repo, the event rows, gating, the guard, the
+never-fails paths, and real `sys.executable -m pytest` runs for a hit, an edit, a data-file
+edit, `--lf`, a failing run, a skip-only run and the switches).
 
 ## Known limits
 

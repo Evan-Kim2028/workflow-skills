@@ -17,39 +17,50 @@ Hooks:
   applies the shim's ``pytest_reason`` refusals (a bare pytest, a directory target,
   more than ``PYTEST_FILE_LIMIT`` files) with the shim's message and exit 2, so the
   absolute-path invocations the shim never sees get the same guard. Then it builds the
-  key; when every target is a recorded pass it prints one line and returns 0.
+  key; when the key is a recorded pass it prints one line and returns 0.
 - ``pytest_sessionfinish``: record the key, but only on exit 0 with at least one passed
   test. A failure, an error, a skip-only run and a ``-x`` early exit write nothing.
 
-The key covers, all of it (a miss is cheap, a false hit is a lie):
+The key is the whole tree, not an import closure. An import walk cannot see a data file,
+a script a test runs through ``subprocess``, a fixture directory, a directory listing or
+a plugin named by a string, so it produced false hits on 52 % of one real suite. The
+whole tree has no such blind spot and costs one ``git ls-files`` plus one ``git status``:
 
-- each target test file's content sha;
-- every repo module in its transitive import closure (content sha), walked with a
-  stdlib AST import walk; the walk's per-file import lists and the resulting closure are
-  cached under the agentq home, keyed by content sha, so a repeat re-hashes the closure
-  and walks only what changed;
-- every ``conftest.py`` from each target's directory up to the repo root;
-- ``uv.lock``, every ``pyproject.toml``, ``pytest.ini``, ``setup.cfg`` and ``tox.ini``
-  (dependency and pytest-config changes);
-- the whole pytest argv (``-k``, ``-x``, ``--basetemp``, ``-p no:randomly``, ``--dist``);
-- the environment the suites read: ``PYTHONPATH``, ``LOR_DBT_MANIFEST``, ``DATA_ROOT``,
-  ``LAKE_STORE``, ``PYTEST_ADDOPTS`` and every ``PG*`` and ``LOR_*`` variable
-  (``LOR_PYTEST_CACHE`` itself is the control variable and stays out);
-- the interpreter path (``.venv`` vs ``uv run --package <name>``);
-- for a test file that reads the whole tree (``SCAN_ROOTS``, ``git ls-files``,
-  ``rglob``, ``os.walk``, ``.glob(``), the whole tree sha: index blobs from
-  ``git ls-files -s`` plus content shas for the dirty and untracked paths. A closure over
-  ``MAX_CLOSURE_FILES`` is not walked to the end and keys on the whole tree instead, which
-  is the same answer for a test that reaches everything and costs one ``git ls-files``
-  rather than a parse of the repo.
+- **Tree content.** ``git ls-files -s`` (index blob shas) plus the content sha of every
+  path ``git status --porcelain=v1 -z --untracked-files=all`` reports as modified,
+  deleted or untracked, so any edit anywhere in the repo, committed or not, changes the
+  key. A submodule is keyed by its own ``HEAD`` and ``status``. A tracked file is always
+  keyed; an untracked path under a tool cache (``.pytest_cache/``, ``__pycache__/``,
+  ``.venv/``, ``node_modules/``, ``.mypy_cache/``, ``.ruff_cache/``) is not, because
+  pytest writes one on every run and the key would never repeat.
+- **Ignored inputs.** Size and mtime of every gitignored file under the repo, because a
+  generated input (a dbt ``target/manifest.json``, a ``.env``, a built parquet) is
+  gitignored and is still an input. The walk skips ``.venv/``, ``__pycache__/``,
+  ``.pytest_cache/``, ``.mypy_cache/``, ``.ruff_cache/``, ``node_modules/``, ``.git/``,
+  the cache's own dir, and a nested checkout (a directory with a ``.git`` entry: another
+  checkout of this or another repo, not an input of a run here, and walking the ones
+  under a ``.worktrees/`` folder cost 26 s on a 14k-file repo). If the walk exceeds
+  ``IGNORED_MAX_FILES`` files or ``IGNORED_MAX_S`` seconds the run is not cached.
+- **argv**, the whole environment minus ``ENV_SKIP`` (the volatile variables that cannot
+  change what a test does: ``AGENTQ_*`` run ids, ``TERM``, ``SHLVL``, ``PWD``,
+  ``OLDPWD``, ``_``, the terminal and session ids, ``COLUMNS``/``LINES``,
+  ``PYTEST_CURRENT_TEST``, ``PYTEST_XDIST_*`` and ``LOR_PYTEST_CACHE`` itself), the
+  interpreter realpath and its ``sys.version``, and the cwd.
+- Every ``conftest.py`` from each target's directory up to the filesystem root, keyed by
+  absolute path: pytest loads a conftest above the git toplevel too, and that file is not
+  in the tree sha. The content of a ``-c``/``--config-file`` file is keyed the same way.
 
-A run that cannot be keyed (no target, a missing target, an import that names a repo
-module but does not resolve, a whole-tree test with no git tree sha) is not cached and
-runs normally; the reason goes in the ``why`` field of the event row.
+A run that cannot be keyed is not cached and runs normally; the reason goes in the
+``why`` field of the event row. That covers no target, a missing or directory target, a
+state-dependent selector (``--lf``, ``--ff``, ``--nf``, ``--sw``: the target set comes
+from ``.pytest_cache`` state, not from the argv, so a recorded pass could cover a subset
+of what the same key later means), a random test order (``pytest-randomly`` with no
+``--randomly-seed``), no git tree sha, and an ignored-input walk over the bound.
 
 Active only inside a worker: ``AGENTQ_JOB`` or ``AGENTQ_RUN`` must be set, and
-``LOR_PYTEST_CACHE=0`` turns it off. The gate and CI must set that variable explicitly
-(an attestation has to be a real run), not rely on ``AGENTQ_JOB`` being unset.
+``LOR_PYTEST_CACHE=0`` turns it off. A gate or CI run that has to be a real run must set
+that variable explicitly rather than rely on ``AGENTQ_JOB`` being unset; this repo's own
+gate runs ``python3 -m unittest``, which never loads this plugin.
 
 ``slots/events.jsonl`` gets one row per decision with ``cache=hit|miss`` (and ``why``
 on a miss that could not be keyed), so the hit rate is visible in
@@ -61,11 +72,11 @@ agentq: the home is ``$AGENTQ_HOME`` or ``~/.local/state/agentq``, and the event
 appended here with the same shape ``slots.record_event`` writes.
 """
 
-import ast
 import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -79,9 +90,6 @@ GUARD_ENV = "AGENTQ_GUARD"
 DEFAULT_HOME = "~/.local/state/agentq"
 CACHE_DIR = "pytest-cache"
 ENTRIES_DIR = "entries"
-IMPORTS_DIR = "imports"
-CLOSURES_DIR = "closures"
-IMPORTS_FILE = "store.json"
 PRUNE_STAMP = "last-prune"
 EVENTS_FILE = "events.jsonl"
 EVENTS_MAX_BYTES = 8 * 1024 * 1024
@@ -90,32 +98,35 @@ GUARD_COMMAND_CHARS = 300
 MAX_ENTRIES = 20000
 MAX_AGE_S = 30 * 86400.0
 PRUNE_EVERY_S = 3600.0
-# A closure over this many files is not walked to the end: the key falls back to the whole
-# tree sha, which is the same answer for a test that reaches everything and costs one
-# `git ls-files` instead of a parse of the repo. The verdict is cached per root blob, so a
-# repeat does not walk to the cap again.
-MAX_CLOSURE_FILES = 300
-MAX_IMPORT_ROWS = 20000
-SAVE_EVERY = 500
-MAX_CONFIG_FILES = 500
 PYTEST_FILE_LIMIT = 25
 PYTEST_HINT = "Run only the test files for the code you changed: pytest <file.py> [...]"
 PYTEST_VALUE_OPTS = frozenset({
     "-k", "-m", "-p", "-n", "-c", "-o", "-W", "-r", "--maxfail", "--rootdir", "--junitxml", "--durations",
     "--ignore", "--ignore-glob", "--deselect", "--confcutdir", "--basetemp", "--log-level", "--timeout",
-    "--tb", "--dist",
+    "--tb", "--dist", "--config-file", "--randomly-seed",
 })
-ENV_KEYS = ("PYTHONPATH", "LOR_DBT_MANIFEST", "DATA_ROOT", "LAKE_STORE", "PYTEST_ADDOPTS")
-ENV_PREFIXES = ("PG", "LOR_")
-ENV_SKIP = frozenset({CACHE_ENV})
-TREE_MARKERS = ("SCAN_ROOTS", "ls-files", "rglob", "os.walk", ".glob(")
-DYNAMIC_IMPORTS = frozenset({"import_module", "__import__", "importorskip"})
-CONFIG_NAMES = ("uv.lock", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini")
-CONFIG_GLOBS = ("*pyproject.toml", "*uv.lock", "*pytest.ini", "*setup.cfg", "*tox.ini")
-SKIP_DIRS = frozenset({
-    ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache",
-    ".pytest_cache", ".ruff_cache", ".tox", ".nox", "site-packages", "build", "dist",
+# The environment is keyed whole, minus these: they cannot change what a test does. Every
+# ``AGENTQ_*`` variable is a run id or a path the harness owns, and ``LOR_PYTEST_CACHE`` is
+# this plugin's own control variable.
+ENV_SKIP = frozenset({
+    CACHE_ENV, "TERM", "SHLVL", "PWD", "OLDPWD", "_", "COLUMNS", "LINES",
+    "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "ITERM_SESSION_ID",
+    "TMUX", "TMUX_PANE", "STY", "WINDOW", "SSH_TTY", "SSH_CLIENT", "SSH_CONNECTION",
+    "PYTEST_CURRENT_TEST", "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT",
 })
+ENV_SKIP_PREFIXES = ("AGENTQ_",)
+# A selector whose target set comes from ``.pytest_cache`` state rather than from the argv.
+STATE_SELECTORS = frozenset({
+    "--lf", "--last-failed", "--ff", "--failed-first", "--nf", "--new-first",
+    "--sw", "--stepwise", "--stepwise-skip",
+})
+# Directories the ignored-input walk does not descend into: tool caches that every run
+# rewrites, and the cache's own dir. A nested checkout is skipped too (see the docstring).
+IGNORED_SKIP_DIRS = frozenset({
+    ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".git",
+})
+IGNORED_MAX_FILES = 200_000
+IGNORED_MAX_S = 3.0
 
 
 def _note(message):
@@ -150,14 +161,6 @@ def _blob(path):
     try:
         return _sha(Path(path).read_bytes())
     except OSError:
-        return None
-
-
-def _rel(path, root):
-    """``path`` relative to ``root`` as a posix string, or None when it is outside."""
-    try:
-        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
-    except (OSError, ValueError):
         return None
 
 
@@ -215,7 +218,7 @@ def _pytest_reason(argv):
 
 def _argv_paths(argv, limit=3, chars=120):
     """The test file paths of an argv, for the event row. No option values, no environment."""
-    paths = [word for word in argv if not word.startswith("-") and ".py" in word]
+    paths = [word for word in _positionals(argv, PYTEST_VALUE_OPTS) if ".py" in word]
     return " ".join(paths[:limit])[:chars]
 
 
@@ -278,14 +281,6 @@ def _entry_path(environ, key):
     return _home(environ) / CACHE_DIR / ENTRIES_DIR / key[:2] / f"{key}.json"
 
 
-def _imports_store_path(environ):
-    return _home(environ) / CACHE_DIR / IMPORTS_DIR / IMPORTS_FILE
-
-
-def _closures_dir(environ):
-    return _home(environ) / CACHE_DIR / CLOSURES_DIR
-
-
 def _git(root, args, timeout=20):
     """``git -C root args`` stdout, or None when git is missing, slow or unhappy."""
     try:
@@ -311,27 +306,55 @@ def _repo_root(start):
         return None
 
 
-def _skipped_path(rel):
-    """True for a path under a folder the key ignores (``.git``, ``.venv``, ``__pycache__``...).
+def _submodule_sha(path):
+    """A submodule's own state: its ``HEAD`` and its ``status``, or None when unreadable.
 
-    pytest writes ``.pytest_cache`` and ``__pycache__`` into the tree on every run, so a
-    whole-tree sha that counted them would never repeat. Split on ``/`` rather than
-    ``Path.parts``: this runs once per tracked file, and pathlib costs 0.15 ms a call.
+    ``_blob`` on a submodule directory raises, which used to hash every dirty submodule as
+    ``"deleted"`` and so hid a change inside it.
     """
-    return any(part in SKIP_DIRS for part in rel.split("/"))
+    head = _git(path, ["rev-parse", "HEAD"], timeout=10)
+    status = _git(path, ["status", "--porcelain", "-z", "--untracked-files=all"], timeout=10)
+    if head is None or status is None:
+        return None
+    return "submodule:" + _sha(head.strip() + b"\0" + status)
 
 
-def _tree_sha(root):
-    """A content sha of the whole tree, or None when git cannot answer.
+def _content_sha(path):
+    """The content sha of a worktree path: a file's bytes, a submodule's state, or a marker."""
+    try:
+        info = Path(path).lstat()
+    except OSError:
+        return "deleted"
+    if stat.S_ISDIR(info.st_mode):
+        return _submodule_sha(path) or "unreadable-submodule"
+    return _blob(path) or "unreadable"
 
-    ``git ls-files -s`` reads the index, not the files, so this stays cheap on a large
-    repo; the dirty and untracked paths from ``git status --porcelain`` are hashed by
-    content, so a modified file always changes the sha.
+
+def _skipped_path(rel):
+    """True for a path under a tool cache the key ignores (``.pytest_cache``, ``__pycache__``...).
+
+    pytest writes ``.pytest_cache`` and ``__pycache__`` into the tree on every run, so an
+    untracked path under one of them would change the key on every run and no repeat would
+    ever hit. A *tracked* file is always keyed, whatever its path. Split on ``/`` rather than
+    ``Path.parts``: this runs once per path, and pathlib costs 0.15 ms a call.
+    """
+    return any(part in IGNORED_SKIP_DIRS for part in rel.split("/"))
+
+
+def _git_state(root):
+    """``(tree_sha, ignored_paths)`` for the whole tree, or None when git cannot answer.
+
+    ``git ls-files -s`` reads the index, not the files, so this stays cheap on a large repo;
+    every path ``git status`` reports as modified, deleted or untracked is hashed by content,
+    so an edit anywhere in the repo, committed or not, changes the sha. The ``!!`` paths are
+    returned for the ignored-input walk rather than hashed here.
     """
     listing = _git(root, ["ls-files", "-s", "-z"])
-    status = _git(root, ["status", "--porcelain", "-z", "--untracked-files=all"])
+    status = _git(root, ["status", "--porcelain", "-z", "--untracked-files=all",
+                         "--ignored=matching"])
     if listing is None or status is None:
         return None
+    digest = hashlib.sha256()
     tracked = []
     for part in listing.split(b"\0"):
         if not part:
@@ -340,11 +363,16 @@ def _tree_sha(root):
         fields = meta.split(b" ")
         if len(fields) < 2 or not path:
             continue
-        rel = path.decode("utf-8", "replace")
-        if _skipped_path(rel):
-            continue
-        tracked.append((rel, fields[1].decode("ascii", "replace")))
+        tracked.append((path.decode("utf-8", "surrogateescape"),
+                        fields[1].decode("ascii", "replace")))
+    tracked.sort()
+    for rel, blob in tracked:
+        digest.update(rel.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+        digest.update(blob.encode("ascii", "replace"))
+        digest.update(b"\n")
     dirty = []
+    ignored = []
     items = status.split(b"\0")
     index = 0
     while index < len(items):
@@ -353,431 +381,145 @@ def _tree_sha(root):
         if len(item) < 4:
             continue
         code = item[:2].decode("ascii", "replace")
-        path = item[3:].decode("utf-8", "replace")
+        path = item[3:].decode("utf-8", "surrogateescape")
         if "R" in code or "C" in code:
             index += 1
-        if _skipped_path(path):
-            continue
-        dirty.append((path, _blob(Path(root) / path) or "deleted"))
-    tracked.sort()
+        if code == "!!":
+            ignored.append(path)
+        elif not _skipped_path(path):
+            dirty.append((path, _content_sha(Path(root) / path)))
     dirty.sort()
-    return _sha(json.dumps({"tracked": tracked, "dirty": dirty}, sort_keys=True).encode("utf-8"))
+    for rel, blob in dirty:
+        digest.update(rel.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+        digest.update(blob.encode("utf-8", "surrogateescape"))
+        digest.update(b"\n")
+    return digest.hexdigest(), ignored
 
 
-def _import_targets(source):
-    """``(level, dotted, required)`` for every module a source file may import.
+def _ignored_inputs(root, entries, cache_dir):
+    """``[(rel, size, mtime_ns)]`` for every gitignored file, or None when the walk is too big.
 
-    ``level`` 0 is an absolute import. ``required`` is False for the ``from a.b import c``
-    alias candidates, since ``c`` is usually an attribute and not a module. The dynamic
-    forms a test file uses with a literal name (``importlib.import_module``, ``__import__``,
-    ``pytest.importorskip``) are followed too, since a missed import is a false hit.
+    ``entries`` are the ``!!`` paths ``git status`` reported. A directory is walked unless it
+    is one of ``IGNORED_SKIP_DIRS``, the cache's own dir, or a nested checkout (a directory
+    with a ``.git`` entry). Size and mtime rather than a content sha: a generated input can be
+    large, and a rewrite always moves the mtime.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return None
-    found = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                found.append((0, alias.name, True))
-        elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
-            if base:
-                found.append((node.level, base, True))
-            for alias in node.names:
-                if alias.name == "*":
-                    continue
-                found.append((node.level, f"{base}.{alias.name}" if base else alias.name, False))
-        elif isinstance(node, ast.Call):
-            name = _call_name(node.func)
-            if name in DYNAMIC_IMPORTS and node.args:
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    found.append((0, first.value, True))
-    return found
-
-
-def _call_name(func):
-    """The last name of a call target: ``importlib.import_module`` -> ``import_module``."""
-    if isinstance(func, ast.Attribute):
-        return func.attr
-    if isinstance(func, ast.Name):
-        return func.id
-    return ""
-
-
-def _module_file(base, parts):
-    """``base/parts.py`` or ``base/parts/__init__.py``, or None."""
-    if not parts:
-        return None
-    target = Path(base).joinpath(*parts)
-    for candidate in (target.with_suffix(".py"), target / "__init__.py"):
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    return None
-
-
-def _module_index(root):
-    """``dotted name -> [paths]`` for every ``.py`` in the repo, by path suffix.
-
-    A suffix map rather than a package walk, so a ``src`` layout, a
-    ``packages/<name>/<name>`` layout and a namespace package all resolve without
-    knowing where the import roots are. Two files with the same suffix both match,
-    which only ever adds files to the closure. Directory entries only: no file is read.
-
-    The last component is indexed too, so ``import helpers`` next to a test resolves
-    without a stat per import root: a test-local helper is the common case, and the
-    per-root fallback cost a stat and a ``resolve`` per import of every file walked.
-    """
-    index = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames
-                             if name not in SKIP_DIRS and not name.startswith("."))
-        rel_dir = os.path.relpath(dirpath, root)
-        for name in filenames:
-            if not name.endswith(".py"):
-                continue
-            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
-            parts = rel[:-3].split("/")
-            if parts[-1] == "__init__":
-                parts = parts[:-1]
-            if not parts:
-                continue
-            path = Path(dirpath) / name
-            index.setdefault(".".join(parts), []).append(path)
-            if len(parts) > 1:
-                index.setdefault(parts[-1], []).append(path)
-    return index
-
-
-def _import_roots(root, files):
-    """Where an absolute import may start: the repo root, its ``src`` folders, and each
-    target's own directory chain.
-
-    pytest puts a test file's rootdir-relative folder on ``sys.path``, so ``import
-    helpers`` next to the test resolves there; a ``<package>/src`` layout is where a
-    dotted package name starts.
-    """
-    roots = [Path(root)]
-    candidates = [Path(root) / "src"]
-    try:
-        for entry in sorted(Path(root).iterdir()):
-            if entry.is_dir() and entry.name not in SKIP_DIRS and not entry.name.startswith("."):
-                candidates.append(entry / "src")
-    except OSError:
-        pass
-    for candidate in candidates:
-        if candidate.is_dir():
-            roots.append(candidate)
-    for path in files:
-        parent = Path(path).parent
-        while True:
-            if parent not in roots:
-                roots.append(parent)
-            if parent == Path(root) or parent.parent == parent:
-                break
-            parent = parent.parent
-    return roots
-
-
-def _repo_names(roots):
-    """The top-level module names the repo provides, so an import of one must resolve."""
-    names = set()
-    for root in roots:
-        try:
-            for entry in Path(root).iterdir():
-                if entry.name in SKIP_DIRS or entry.name.startswith("."):
-                    continue
-                if entry.is_dir():
-                    names.add(entry.name)
-                elif entry.suffix == ".py":
-                    names.add(entry.name[:-3])
-        except OSError:
-            continue
-    return names
-
-
-def _resolve(path, level, dotted, index, roots, repo_names):
-    """The files a ``(level, dotted)`` import names: a list, empty when it is not in the repo.
-
-    The index answers first, so a stdlib or third-party import (``json``, ``typing``) costs
-    one dict lookup and no stat: the per-root fallback is only for a name the repo provides
-    and the index missed, which is rare and would otherwise be a stat storm per import.
-    """
-    parts = [part for part in dotted.split(".") if part]
-    if not parts:
-        return []
-    if level:
-        base = Path(path).parent
-        for _ in range(level - 1):
-            base = base.parent
-        found = _module_file(base, parts)
-        return [found] if found else []
-    found = list(index.get(".".join(parts), []))
-    if not found and len(parts) > 1:
-        found = list(index.get(parts[-1], []))
-    if found or parts[0] not in repo_names:
-        return found
-    for root in roots:
-        candidate = _module_file(root, parts)
-        if candidate is not None and candidate not in found:
-            found.append(candidate)
-    return found
-
-
-class _ImportStore:
-    """Per-file import lists, keyed by content sha, in one JSON file under the agentq home.
-
-    One file rather than one per source file: a closure of a thousand files would otherwise
-    cost a thousand small reads and writes on every cold walk. Content-keyed, so the same
-    file in another worktree reuses the entry, and a lost update is only a re-parse.
-    """
-
-    def __init__(self, path):
-        self.path = Path(path)
-        self.rows = {}
-        self.dirty = False
-        self.added = 0
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                self.rows = data
-        except (OSError, ValueError):
-            pass
-
-    def imports(self, rel, blob, data):
-        """The import list of one file, parsed once per content sha."""
-        row = self.rows.get(rel)
-        if isinstance(row, dict) and row.get("blob") == blob and isinstance(row.get("imports"), list):
-            try:
-                return [(int(item[0]), str(item[1]), bool(item[2])) for item in row["imports"]]
-            except (TypeError, ValueError, IndexError):
-                pass
-        targets = _import_targets(data)
-        if targets is None:
+    started = time.monotonic()
+    rows = []
+    count = 0
+    stack = [(rel, Path(root) / rel) for rel in entries]
+    while stack:
+        if time.monotonic() - started > IGNORED_MAX_S:
             return None
-        self.rows[rel] = {"blob": blob, "imports": [list(item) for item in targets]}
-        self.dirty = True
-        self.added += 1
-        if self.added >= SAVE_EVERY:
-            self.save()
-        return targets
-
-    def save(self):
-        if not self.dirty:
-            return
-        self.added = 0
-        if len(self.rows) > MAX_IMPORT_ROWS:
-            for key in list(self.rows)[:len(self.rows) - MAX_IMPORT_ROWS]:
-                del self.rows[key]
+        rel, path = stack.pop()
+        if _skipped_path(rel) or path == cache_dir:
+            continue
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(self.rows, sort_keys=True), encoding="utf-8")
-            os.replace(tmp, self.path)
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                children = list(os.scandir(path))
+            except OSError:
+                continue
+            if any(child.name == ".git" for child in children):
+                continue
+            for child in children:
+                stack.append((f"{rel}/{child.name}", Path(child.path)))
+            continue
+        count += 1
+        if count > IGNORED_MAX_FILES:
+            return None
+        try:
+            info = path.stat()
         except OSError:
             pass
+        rows.append((rel, info.st_size, info.st_mtime_ns))
+    rows.sort()
+    return rows
 
 
-def _walk(seeds, root, context, store, known, budget):
-    """Files reachable from ``seeds``, not descending into ``known`` (already in the closure).
+def _conftest_chain(files):
+    """Every ``conftest.py`` from each target's directory up to the filesystem root.
 
-    Returns ``(files, blobs, unresolved)``: the blobs are the shas of the bytes already read
-    here, so the caller does not read and hash every file a second time.
+    pytest loads a conftest above the git toplevel too (a ``pytest.ini`` in a parent folder
+    sets ``rootdir`` there), and that file is not in the tree sha, so the walk does not stop
+    at the repo root and the key is the absolute path.
     """
-    index, roots, repo_names = context()
-    files = set()
-    blobs = {}
-    unresolved = set()
-    queue = list(seeds)
-    while queue:
-        path = queue.pop()
-        if path in files:
-            continue
-        files.add(path)
-        if len(files) + len(known) > budget[0]:
-            unresolved.add("<closure too large>")
-            break
-        rel = _rel(path, root)
-        try:
-            data = Path(path).read_bytes()
-        except OSError:
-            unresolved.add(f"<unreadable {rel or path}>")
-            continue
-        blob = _sha(data)
-        blobs[rel or str(path)] = blob
-        targets = store.imports(rel or str(path), blob, data)
-        if targets is None:
-            unresolved.add(f"<unparsable {rel or path}>")
-            continue
-        for level, dotted, required in targets:
-            found = _resolve(path, level, dotted, index, roots, repo_names)
-            if not found:
-                if required and (level or dotted.split(".")[0] in repo_names):
-                    unresolved.add(dotted)
-                continue
-            for item in found:
-                item_rel = _rel(item, root)
-                if item_rel is not None and item_rel in known:
-                    continue
-                queue.append(item)
-    return files, blobs, unresolved
-
-
-def _read_closure(path, root_blob):
-    """The cached ``{rel: blob}`` closure for this root content, or None.
-
-    A closure that was too large to walk is cached as ``{"too_large": True}``, so the next
-    run goes straight to the whole-tree key instead of walking to the cap again.
-    """
-    try:
-        row = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(row, dict) or row.get("root_blob") != root_blob:
-        return None
-    if row.get("too_large"):
-        return {}
-    files = row.get("files")
-    if not isinstance(files, dict):
-        return None
-    return {str(key): str(value) for key, value in files.items()}
-
-
-def _write_closure(path, root_blob, blobs, too_large=False):
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        row = {"root_blob": root_blob, "too_large": True} if too_large else {
-            "root_blob": root_blob, "files": blobs}
-        tmp = Path(path).with_name(f"{Path(path).name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(row, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass
-
-
-def _closure(test_path, root, context, store, closures_dir, budget):
-    """``(blobs, unresolved, too_large)``: every repo file the test file imports, transitively.
-
-    A closure is cached per (root file, its content sha) with every member's blob, and
-    validated by re-hashing the members: a member whose blob still matches has the same
-    imports, so the cached closure is still the one a walk would produce. A changed member
-    is walked again, and the walk stops at members that are still unchanged.
-
-    A closure over ``MAX_CLOSURE_FILES`` is not walked to the end: the caller keys on the
-    whole tree instead, which is the same answer for a test that reaches everything, and
-    costs one ``git ls-files`` rather than a parse of the repo.
-    """
-    rel = _rel(test_path, root) or str(test_path)
-    root_blob = _blob(test_path)
-    if root_blob is None:
-        return None, {f"<unreadable {rel}>"}, False
-    cache_file = Path(closures_dir) / f"{_sha(f'{rel}\0{root_blob}'.encode('utf-8'))[:32]}.json"
-    blobs = {}
-    seeds = [Path(test_path)]
-    stored = _read_closure(cache_file, root_blob)
-    if stored is not None:
-        if not stored:
-            return None, set(), True
-        changed = []
-        for item_rel, item_blob in stored.items():
-            blob = _blob(Path(root) / item_rel)
-            if blob is None or blob != item_blob:
-                changed.append(Path(root) / item_rel)
-            else:
-                blobs[item_rel] = blob
-        if not changed:
-            return blobs, set(), False
-        seeds = changed
-    found, walked, unresolved = _walk(seeds, root, context, store, blobs, budget)
-    if "<closure too large>" in unresolved:
-        _write_closure(cache_file, root_blob, {}, too_large=True)
-        return None, set(), True
-    for path in found:
-        item_rel = _rel(path, root)
-        if item_rel is None:
-            unresolved.add(str(path))
-            continue
-        if item_rel in blobs:
-            continue
-        blob = walked.get(item_rel) or _blob(path)
-        if blob is None:
-            unresolved.add(f"<unreadable {item_rel}>")
-            continue
-        blobs[item_rel] = blob
-    if not unresolved:
-        _write_closure(cache_file, root_blob, blobs)
-    return blobs, unresolved, False
-
-
-def _conftest_chain(files, root):
-    """Every ``conftest.py`` from each target's directory up to the repo root."""
     found = {}
     for path in files:
         parent = Path(path).parent
         while True:
             candidate = parent / "conftest.py"
-            if candidate.is_file():
-                rel = _rel(candidate, root)
-                if rel:
-                    found[rel] = _blob(candidate)
-            if parent == Path(root) or parent.parent == parent:
+            try:
+                if candidate.is_file():
+                    found[str(candidate)] = _blob(candidate) or "unreadable"
+            except OSError:
+                pass
+            if parent.parent == parent:
                 break
             parent = parent.parent
     return found
 
 
-def _config_files(root):
-    """``uv.lock``, every ``pyproject.toml`` and the other pytest config files, or None."""
+def _config_arg(argv, cwd):
+    """The content sha of every ``-c``/``--config-file`` file, keyed by absolute path.
+
+    A config file inside the repo is already in the tree sha; one outside it is not, and its
+    content decides what pytest collects.
+    """
     found = {}
-    for name in CONFIG_NAMES:
-        candidate = Path(root) / name
-        if candidate.is_file():
-            found[name] = _blob(candidate)
-    listing = _git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
-                          *CONFIG_GLOBS])
-    if listing is not None:
-        rels = [part.decode("utf-8", "replace") for part in listing.split(b"\0") if part]
-    else:
-        rels = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(name for name in dirnames
-                                 if name not in SKIP_DIRS and not name.startswith("."))
-            for name in filenames:
-                if name in CONFIG_NAMES:
-                    rel = _rel(Path(dirpath) / name, root)
-                    if rel:
-                        rels.append(rel)
-    for rel in sorted(set(rels)):
-        if rel in found or _skipped_path(rel):
+    for index, arg in enumerate(argv):
+        value = None
+        if arg in ("-c", "--config-file"):
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+        elif arg.startswith("--config-file="):
+            value = arg.split("=", 1)[1]
+        elif arg.startswith("-c") and len(arg) > 2:
+            value = arg[2:]
+        if not value:
             continue
-        if len(found) > MAX_CONFIG_FILES:
-            return None
-        found[rel] = _blob(Path(root) / rel)
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        found[str(path)] = _blob(path) or "unreadable"
     return found
 
 
-def _has_tree_marker(path):
-    """True when a test file reads the whole tree, so every tracked file is an input."""
+def _state_selector(argv):
+    """The first selector in ``argv`` whose target set comes from ``.pytest_cache`` state."""
+    for arg in argv:
+        name = arg.split("=", 1)[0]
+        if name in STATE_SELECTORS:
+            return name
+    return None
+
+
+def _random_order(config, argv):
+    """True when ``pytest-randomly`` will pick a seed this run, so the order is not reproducible."""
+    for arg in argv:
+        if arg.split("=", 1)[0] == "--randomly-seed":
+            return False
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return True
-    return any(marker in text for marker in TREE_MARKERS)
+        return bool(config.pluginmanager.hasplugin("randomly"))
+    except Exception:
+        return False
 
 
 def _env_material(environ):
-    """The environment values the suites read, sorted, with the control variable left out."""
+    """The whole environment, minus the volatile variables that cannot change a test."""
     picked = {}
     for key in sorted(environ):
-        if key in ENV_SKIP:
+        if key in ENV_SKIP or key.startswith(ENV_SKIP_PREFIXES):
             continue
-        if key in ENV_KEYS or key.startswith(ENV_PREFIXES):
-            picked[key] = environ[key]
+        picked[key] = environ[key]
     return picked
 
 
@@ -816,66 +558,34 @@ def _key_material(config, environ):
         if not path.is_file():
             return None, f"missing target {name}"
         files.append(path)
+    selector = _state_selector(argv)
+    if selector is not None:
+        return None, f"state-dependent selector {selector}"
+    if _random_order(config, argv):
+        return None, "random test order"
     root = _repo_root(cwd)
     if root is None:
         return None, "no repo root"
-    rels = {}
-    for path in files:
-        rel = _rel(path, root)
-        if rel is None:
-            return None, f"target outside the repo ({path})"
-        rels[rel] = path
-    context_cache = {}
-
-    def context():
-        """The import index, built only when a closure has to be walked."""
-        if not context_cache:
-            roots = _import_roots(root, files)
-            context_cache["value"] = (_module_index(root), roots, _repo_names(roots))
-        return context_cache["value"]
-
-    store = _ImportStore(_imports_store_path(environ))
-    closures_dir = _closures_dir(environ)
-    budget = [MAX_CLOSURE_FILES]
-    closure = {}
-    unresolved = set()
-    too_large = False
-    for path in files:
-        found, missing, large = _closure(path, root, context, store, closures_dir, budget)
-        unresolved |= missing
-        too_large = too_large or large
-        if found:
-            closure.update(found)
-    store.save()
-    if unresolved:
-        return None, "unresolved import " + ", ".join(sorted(unresolved)[:3])
-    conftest = _conftest_chain(files, root)
-    configs = _config_files(root)
-    if configs is None:
-        return None, "too many config files"
-    tree = None
-    if too_large or any(_has_tree_marker(path) for path in files):
-        tree = _tree_sha(root)
-        if tree is None:
-            return None, "whole-tree test but no tree sha"
+    state = _git_state(root)
+    if state is None:
+        return None, "no tree sha"
+    tree, ignored_entries = state
+    ignored = _ignored_inputs(root, ignored_entries, _home(environ) / CACHE_DIR)
+    if ignored is None:
+        return None, "ignored inputs too large to key"
     material = {
-        "v": 1,
+        "v": 2,
         "root": str(root),
+        "cwd": str(cwd),
         "interpreter": _interpreter(),
+        "python": sys.version,
         "argv": argv,
         "env": _env_material(environ),
-        "targets": {rel: _blob(path) for rel, path in rels.items()},
-        "closure": {} if too_large else closure,
-        "conftest": conftest,
-        "config": configs,
         "tree": tree,
+        "ignored": ignored,
+        "conftest": _conftest_chain(files),
+        "config": _config_arg(argv, cwd),
     }
-    for rel, blob in material["targets"].items():
-        if blob is None:
-            return None, f"unreadable target {rel}"
-    for rel, blob in closure.items():
-        if blob is None:
-            return None, f"unreadable import {rel}"
     return _sha(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")), ""
 
 
@@ -887,7 +597,7 @@ def _hit_message(argv):
         if name not in files:
             files.append(name)
     return (f"{len(files)} file(s) unchanged since a recorded pass on this tree, skipped "
-            f"({', '.join(files)}); re-run with {CACHE_ENV}=0, or change a file they import")
+            f"({', '.join(files)}); re-run with {CACHE_ENV}=0, or change a file in the tree")
 
 
 def _touch(path):
@@ -898,7 +608,7 @@ def _touch(path):
 
 
 def _prune(home):
-    """Drop entries and closures older than ``MAX_AGE_S``, and the oldest above the cap."""
+    """Drop entries older than ``MAX_AGE_S``, and the oldest above the cap."""
     base = Path(home) / CACHE_DIR
     stamp = base / PRUNE_STAMP
     now = time.time()
@@ -912,29 +622,28 @@ def _prune(home):
         stamp.write_text(str(int(now)), encoding="utf-8")
     except OSError:
         return
-    for folder, cap in ((ENTRIES_DIR, MAX_ENTRIES), (CLOSURES_DIR, MAX_ENTRIES)):
-        rows = []
-        for shard in (base / folder).glob("*"):
+    rows = []
+    for shard in (base / ENTRIES_DIR).glob("*"):
+        try:
+            for entry in shard.glob("*.json"):
+                try:
+                    rows.append((entry.stat().st_mtime, entry))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    for mtime, entry in rows:
+        if now - mtime > MAX_AGE_S:
             try:
-                for entry in shard.glob("*.json"):
-                    try:
-                        rows.append((entry.stat().st_mtime, entry))
-                    except OSError:
-                        continue
+                entry.unlink()
             except OSError:
-                continue
-        for mtime, entry in rows:
-            if now - mtime > MAX_AGE_S:
-                try:
-                    entry.unlink()
-                except OSError:
-                    pass
-        if len(rows) > cap:
-            for _, entry in sorted(rows)[:len(rows) - cap]:
-                try:
-                    entry.unlink()
-                except OSError:
-                    pass
+                pass
+    if len(rows) > MAX_ENTRIES:
+        for _, entry in sorted(rows)[:len(rows) - MAX_ENTRIES]:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
 
 
 def _write_entry(environ, key, config):
@@ -962,7 +671,7 @@ def _passed_count(config):
 
 
 def pytest_cmdline_main(config):
-    """Refuse a whole-repo pytest, then skip the run when every target is a recorded pass."""
+    """Refuse a whole-repo pytest, then skip the run when the key is a recorded pass."""
     try:
         environ = os.environ
         if not _active(environ):

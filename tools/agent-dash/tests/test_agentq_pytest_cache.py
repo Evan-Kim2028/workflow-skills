@@ -3,6 +3,13 @@
 Offline. Every test uses a temp ``AGENTQ_HOME`` and a temp git repo, so no project
 suite runs. The end-to-end tests run ``sys.executable -m pytest`` on a trivial test
 file in that temp repo, the way a pi worker runs a venv interpreter by absolute path.
+
+The key is the whole tree, so the false-hit repros from the review are all here: a data
+file, a script a test runs through ``subprocess``, a directory listing, a fixture dir, an
+env var outside the old allowlist, a gitignored generated input, a computed import, a
+plugin named by a string, a new file that changes import resolution, a conftest above the
+git toplevel, a ``-c`` file outside the repo, a dirty submodule, and a state-dependent
+selector.
 """
 
 import importlib.util
@@ -64,6 +71,12 @@ def make_repo(root, files=None):
     return root
 
 
+def commit(root, message="more"):
+    git(root, "add", "-A")
+    git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-qm", message)
+
+
 def fake_config(args, cwd):
     return SimpleNamespace(invocation_params=SimpleNamespace(args=list(args), dir=str(cwd)))
 
@@ -78,7 +91,7 @@ class CacheBase(unittest.TestCase):
                                                 "AGENTQ_RUN": "ws9-exec-cache"})
         self.env.start()
         for key in ("AGENTQ_JOB", "LOR_PYTEST_CACHE", "AGENTQ_GUARD", "PYTHONPATH", "PYTEST_ADDOPTS",
-                    "PGHOST", "LOR_DBT_MANIFEST"):
+                    "PGHOST", "LOR_DBT_MANIFEST", "FOO"):
             os.environ.pop(key, None)
         self.repo = make_repo(self.tmp / "repo")
 
@@ -146,6 +159,21 @@ class KeyTests(CacheBase):
         os.environ["LOR_DBT_MANIFEST"] = "/tmp/manifest.json"
         self.assertNotEqual(self.key()[0], before)
 
+    def test_an_env_variable_outside_the_old_allowlist_misses(self):
+        """F3: the environment is keyed whole, so ``FOO`` counts like ``PGHOST`` did."""
+        before = self.key()[0]
+        os.environ["FOO"] = "2"
+        self.assertNotEqual(self.key()[0], before)
+        os.environ["TZ"] = "UTC"
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_volatile_variable_is_not_part_of_the_key(self):
+        before = self.key()[0]
+        for name in ("TERM", "SHLVL", "PWD", "OLDPWD", "_", "TERM_SESSION_ID", "COLUMNS",
+                     "AGENTQ_JOB", "AGENTQ_DEADLINE", "PYTEST_CURRENT_TEST"):
+            os.environ[name] = "changed"
+        self.assertEqual(self.key()[0], before)
+
     def test_the_control_variable_is_not_part_of_the_key(self):
         before = self.key()[0]
         os.environ["LOR_PYTEST_CACHE"] = "1"
@@ -155,6 +183,16 @@ class KeyTests(CacheBase):
         before = self.key()[0]
         with mock.patch.object(plugin, "_interpreter", return_value="/other/python"):
             self.assertNotEqual(self.key()[0], before)
+
+    def test_a_different_python_version_misses(self):
+        before = self.key()[0]
+        with mock.patch.object(plugin.sys, "version", "3.9.0 (other)"):
+            self.assertNotEqual(self.key()[0], before)
+
+    def test_a_different_cwd_misses(self):
+        before = self.key()[0]
+        (self.repo / "sub").mkdir()
+        self.assertNotEqual(self.key(cwd=self.repo / "sub")[0], before)
 
     def test_a_second_repo_at_another_path_keys_differently(self):
         other = make_repo(self.tmp / "other")
@@ -175,155 +213,248 @@ class KeyTests(CacheBase):
         self.assertIsNone(key)
         self.assertIn("no test target", why)
 
-    def test_an_unresolved_repo_import_is_not_cached(self):
-        (self.repo / "tests/test_a.py").write_text("import tests.missing_mod\n", encoding="utf-8")
-        key, why = self.key()
-        self.assertIsNone(key)
-        self.assertIn("unresolved import", why)
-
-    def test_an_external_import_is_not_unresolved(self):
-        (self.repo / "tests/test_a.py").write_text("import json\n\nimport pytest\n", encoding="utf-8")
-        key, why = self.key()
-        self.assertEqual(why, "")
-        self.assertIsNotNone(key)
-
-    def test_a_relative_import_is_followed(self):
-        (self.repo / "tests/pkg").mkdir()
-        (self.repo / "tests/pkg/__init__.py").write_text("", encoding="utf-8")
-        (self.repo / "tests/pkg/mod.py").write_text("VALUE = 1\n", encoding="utf-8")
-        (self.repo / "tests/test_a.py").write_text("from .pkg.mod import VALUE\n", encoding="utf-8")
-        before = self.key()[0]
-        (self.repo / "tests/pkg/mod.py").write_text("VALUE = 2\n", encoding="utf-8")
-        self.assertNotEqual(self.key()[0], before)
-
-    def test_a_dynamic_import_with_a_literal_name_is_followed(self):
-        (self.repo / "tests/dyn.py").write_text("VALUE = 1\n", encoding="utf-8")
-        (self.repo / "tests/test_a.py").write_text(
-            "import importlib\n\nmod = importlib.import_module('tests.dyn')\n", encoding="utf-8")
-        before = self.key()[0]
-        (self.repo / "tests/dyn.py").write_text("VALUE = 2\n", encoding="utf-8")
-        self.assertNotEqual(self.key()[0], before)
-
-    def test_a_src_layout_import_is_followed(self):
-        (self.repo / "pkg/src/deep").mkdir(parents=True)
-        (self.repo / "pkg/src/deep/__init__.py").write_text("", encoding="utf-8")
-        (self.repo / "pkg/src/deep/mod.py").write_text("VALUE = 1\n", encoding="utf-8")
-        (self.repo / "tests/test_a.py").write_text("from deep.mod import VALUE\n", encoding="utf-8")
-        before = self.key()[0]
-        (self.repo / "pkg/src/deep/mod.py").write_text("VALUE = 2\n", encoding="utf-8")
-        self.assertNotEqual(self.key()[0], before)
-
-    def test_a_whole_tree_test_keys_on_the_tree(self):
-        (self.repo / "tests/test_a.py").write_text(
-            "import subprocess\n\n\ndef test_a():\n    subprocess.run(['git', 'ls-files'])\n",
-            encoding="utf-8")
-        before = self.key()[0]
-        (self.repo / "docs").mkdir()
-        (self.repo / "docs/note.md").write_text("x\n", encoding="utf-8")
-        self.assertNotEqual(self.key()[0], before)
-
-    def test_a_whole_tree_test_ignores_pytest_cache_and_pycache(self):
-        (self.repo / "tests/test_a.py").write_text(
-            "import subprocess\n\n\ndef test_a():\n    subprocess.run(['git', 'ls-files'])\n",
-            encoding="utf-8")
-        before = self.key()[0]
-        (self.repo / ".pytest_cache").mkdir()
-        (self.repo / ".pytest_cache/README.md").write_text("x\n", encoding="utf-8")
-        (self.repo / "tests/__pycache__").mkdir()
-        (self.repo / "tests/__pycache__/helpers.cpython-311.pyc").write_bytes(b"x")
-        self.assertEqual(self.key()[0], before)
-
-    def test_a_whole_tree_test_without_git_is_not_cached(self):
+    def test_a_repo_without_git_is_not_cached(self):
         plain = self.tmp / "plain"
         (plain / "tests").mkdir(parents=True)
-        (plain / "tests/test_a.py").write_text("import subprocess\nsubprocess.run(['git', 'ls-files'])\n",
-                                               encoding="utf-8")
+        (plain / "tests/test_a.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
         key, why = self.key(cwd=plain)
         self.assertIsNone(key)
         self.assertIn("no tree sha", why)
 
 
-class ImportCacheTests(CacheBase):
-    def counting(self):
-        calls = []
-        real = plugin._import_targets
+class FalseHitTests(CacheBase):
+    """Every repro from the review: an input the old import-closure key could not see."""
 
-        def wrapper(source):
-            calls.append(1)
-            return real(source)
-
-        return calls, mock.patch.object(plugin, "_import_targets", wrapper)
-
-    def test_the_import_list_is_cached_by_blob_and_reused(self):
-        calls, patcher = self.counting()
-        with patcher:
-            self.key()
-            first = len(calls)
-            self.key()
-            self.assertEqual(len(calls), first)
-        self.assertGreater(first, 0)
-
-    def test_an_edited_file_is_parsed_again(self):
-        self.key()
-        (self.repo / "tests/helpers.py").write_text("def value():\n    return 3\n", encoding="utf-8")
-        calls, patcher = self.counting()
-        with patcher:
-            self.key()
-        self.assertGreater(len(calls), 0)
-
-    def test_the_import_cache_lives_under_the_agentq_home(self):
-        self.key()
-        self.assertTrue(list((self.home / "pytest-cache" / "imports").glob("*.json")))
-
-    def test_a_closure_over_the_cap_keys_on_the_whole_tree(self):
-        """A test that reaches more than the cap is keyed on the tree, so any edit misses."""
-        for index in range(plugin.MAX_CLOSURE_FILES + 5):
-            (self.repo / f"tests/m{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
-        imports = "".join(f"import m{index}\n" for index in range(plugin.MAX_CLOSURE_FILES + 5))
-        (self.repo / "tests/test_a.py").write_text(imports, encoding="utf-8")
-        git(self.repo, "add", "-A")
-        git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
-            "-c", "commit.gpgsign=false", "commit", "-qm", "wide")
-        before, why = self.key()
-        self.assertEqual(why, "")
-        self.assertIsNotNone(before)
-        (self.repo / "unrelated.txt").write_text("x\n", encoding="utf-8")
+    def test_a_data_file_the_test_reads_misses(self):
+        """F1: a JSON input is not an import and has no tree marker."""
+        (self.repo / "data").mkdir()
+        (self.repo / "data/spec.json").write_text('{"n": 1}\n', encoding="utf-8")
+        (self.repo / "tests/test_a.py").write_text(
+            "import json\nfrom pathlib import Path\n\n\ndef test_a():\n"
+            "    assert json.loads(Path('data/spec.json').read_text())['n'] == 1\n",
+            encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "data/spec.json").write_text('{"n": 2}\n', encoding="utf-8")
         self.assertNotEqual(self.key()[0], before)
 
-    def test_a_closure_over_the_cap_is_not_walked_again(self):
-        for index in range(plugin.MAX_CLOSURE_FILES + 5):
-            (self.repo / f"tests/m{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
-        imports = "".join(f"import m{index}\n" for index in range(plugin.MAX_CLOSURE_FILES + 5))
-        (self.repo / "tests/test_a.py").write_text(imports, encoding="utf-8")
-        self.key()
-        calls, patcher = self.counting()
-        with patcher:
-            self.key()
-        self.assertEqual(len(calls), 0)
+    def test_a_sql_file_the_test_reads_misses(self):
+        (self.repo / "transform").mkdir()
+        (self.repo / "transform/load.sql").write_text("select 1;\n", encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "transform/load.sql").write_text("select 2;\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
 
-    def test_the_closure_is_cached_and_a_repeat_does_not_walk(self):
-        walks = []
-        real = plugin._walk
+    def test_a_script_the_test_runs_through_subprocess_misses(self):
+        """F2: a repo script run by ``subprocess`` is not an import."""
+        (self.repo / "infra").mkdir()
+        (self.repo / "infra/gate.py").write_text("print('ok')\n", encoding="utf-8")
+        (self.repo / "tests/test_a.py").write_text(
+            "import subprocess\nimport sys\nfrom pathlib import Path\n\n\ndef test_a():\n"
+            "    gate = Path(__file__).parents[1] / 'infra/gate.py'\n"
+            "    subprocess.run([sys.executable, str(gate)], check=True)\n",
+            encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "infra/gate.py").write_text("print('changed')\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
 
-        def wrapper(*args, **kwargs):
-            walks.append(1)
-            return real(*args, **kwargs)
+    def test_a_directory_listing_misses_when_a_file_appears(self):
+        """F1: ``iterdir``/``listdir``/``scandir`` were not tree markers at all."""
+        (self.repo / "fixtures").mkdir()
+        (self.repo / "fixtures/one.txt").write_text("1\n", encoding="utf-8")
+        (self.repo / "tests/test_a.py").write_text(
+            "from pathlib import Path\n\n\ndef test_a():\n"
+            "    assert len(list(Path('fixtures').iterdir())) == 1\n",
+            encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "fixtures/two.txt").write_text("2\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
 
-        with mock.patch.object(plugin, "_walk", wrapper):
-            first = self.key()[0]
-            self.assertEqual(len(walks), 1)
+    def test_a_fixture_directory_file_misses(self):
+        (self.repo / "tests/fixtures").mkdir()
+        (self.repo / "tests/fixtures/case.yaml").write_text("a: 1\n", encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "tests/fixtures/case.yaml").write_text("a: 2\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_gitignored_generated_input_misses(self):
+        """F11: a generated ``target/manifest.json`` is gitignored and is still an input."""
+        (self.repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+        (self.repo / "target").mkdir()
+        (self.repo / "target/manifest.json").write_text('{"n": 1}\n', encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "target/manifest.json").write_text('{"n": 2}\n', encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_new_gitignored_file_misses(self):
+        (self.repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+        (self.repo / "target").mkdir()
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "target/new.json").write_text("{}\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_tool_cache_under_an_ignored_dir_is_not_part_of_the_key(self):
+        (self.repo / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n.venv/\n", encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        for rel in (".pytest_cache/v/cache/lastfailed", "tests/__pycache__/x.pyc", ".venv/lib/x.py"):
+            path = self.repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.key()[0], before)
+
+    def test_a_tool_cache_that_is_not_gitignored_is_not_part_of_the_key(self):
+        """pytest writes ``.pytest_cache`` on every run; without this no repeat would ever hit."""
+        before = self.key()[0]
+        for rel in (".pytest_cache/v/cache/lastfailed", "tests/__pycache__/x.pyc"):
+            path = self.repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.key()[0], before)
+
+    def test_a_tracked_file_under_a_tool_cache_dir_is_still_keyed(self):
+        (self.repo / "build").mkdir()
+        (self.repo / "build/generated.py").write_text("VALUE = 1\n", encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "build/generated.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_an_ignored_walk_over_the_bound_is_not_cached(self):
+        (self.repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+        (self.repo / "target").mkdir()
+        for index in range(5):
+            (self.repo / f"target/gen{index}.json").write_text("{}\n", encoding="utf-8")
+        commit(self.repo)
+        with mock.patch.object(plugin, "IGNORED_MAX_FILES", 2):
+            key, why = self.key()
+        self.assertIsNone(key)
+        self.assertIn("ignored inputs too large", why)
+
+    def test_a_computed_dynamic_import_misses(self):
+        """F5: ``import_module("mod" + "_x")`` was neither followed nor marked unresolved."""
+        (self.repo / "tests/mod_x.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.repo / "tests/test_a.py").write_text(
+            "import importlib\n\nmod = importlib.import_module('mod' + '_x')\n", encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "tests/mod_x.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_plugin_named_by_a_string_misses(self):
+        """F6: ``pytest_plugins = ["myplug"]`` names a module without importing it."""
+        (self.repo / "tests/myplug.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.repo / "tests/conftest.py").write_text('pytest_plugins = ["myplug"]\n', encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "tests/myplug.py").write_text("raise SystemExit('boom')\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_new_file_that_changes_import_resolution_misses(self):
+        """F7: a new ``tests/helpers.py`` shadows ``lib/helpers.py``; the closure cache missed it."""
+        (self.repo / "lib").mkdir()
+        (self.repo / "lib/helpers.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        (self.repo / "tests/helpers.py").unlink()
+        (self.repo / "tests/test_a.py").write_text("from helpers import value\n", encoding="utf-8")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "tests/helpers.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_conftest_above_the_git_toplevel_misses(self):
+        """F8: pytest loads a conftest above the toplevel; the walk used to stop at it."""
+        outer = self.tmp / "outer"
+        outer.mkdir()
+        (outer / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        (outer / "conftest.py").write_text("", encoding="utf-8")
+        repo = make_repo(outer / "repo")
+        before = self.key(cwd=repo)[0]
+        (outer / "conftest.py").write_text(
+            "import pytest\n\n\n@pytest.fixture(autouse=True)\ndef boom():\n    raise SystemExit(1)\n",
+            encoding="utf-8")
+        self.assertNotEqual(self.key(cwd=repo)[0], before)
+
+    def test_a_config_file_outside_the_repo_misses(self):
+        """F9: ``-c ../myconf.ini`` content was not keyed."""
+        conf = self.tmp / "myconf.ini"
+        conf.write_text("[pytest]\n", encoding="utf-8")
+        before = self.key(("-q", "-c", str(conf), "tests/test_a.py"))[0]
+        conf.write_text("[pytest]\naddopts = -x\n", encoding="utf-8")
+        self.assertNotEqual(self.key(("-q", "-c", str(conf), "tests/test_a.py"))[0], before)
+
+    def test_a_dirty_submodule_misses(self):
+        """F15: a submodule hashed as ``"deleted"`` whatever its content."""
+        sub = self.tmp / "sub"
+        sub.mkdir()
+        (sub / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+        git(sub, "init", "-q")
+        commit(sub)
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor/sub")
+        commit(self.repo)
+        before = self.key()[0]
+        (self.repo / "vendor/sub/mod.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.assertNotEqual(self.key()[0], before)
+
+    def test_a_state_dependent_selector_is_not_cached(self):
+        """F4: ``--lf`` picks its targets from ``.pytest_cache`` state, not from the argv."""
+        for flag in ("--lf", "--last-failed", "--ff", "--failed-first", "--nf", "--new-first",
+                     "--sw", "--stepwise", "--stepwise-skip"):
+            key, why = self.key(("-q", flag, "tests/test_a.py"))
+            self.assertIsNone(key, flag)
+            self.assertIn("state-dependent selector", why, flag)
+
+    def test_a_random_order_is_not_cached(self):
+        """F16: ``pytest-randomly`` picks a seed per run, so the order is not reproducible."""
+        config = fake_config(("-q", "tests/test_a.py"), self.repo)
+        config.pluginmanager = SimpleNamespace(hasplugin=lambda name: name == "randomly")
+        key, why = plugin._key_material(config, os.environ)
+        self.assertIsNone(key)
+        self.assertIn("random test order", why)
+        seeded = fake_config(("-q", "--randomly-seed=7", "tests/test_a.py"), self.repo)
+        seeded.pluginmanager = SimpleNamespace(hasplugin=lambda name: name == "randomly")
+        self.assertIsNotNone(plugin._key_material(seeded, os.environ)[0])
+
+    def test_an_exact_repeat_with_no_change_hits(self):
+        """The measured waste is mostly exact repeats; the whole-tree key still catches them."""
+        first = self.key()[0]
+        for _ in range(3):
             self.assertEqual(self.key()[0], first)
-            self.assertEqual(len(walks), 1)
-        self.assertTrue(list((self.home / "pytest-cache" / "closures").glob("*.json")))
+        self.key(("-q", "-k", "a", "tests/test_a.py"))
+        self.assertEqual(self.key()[0], first)
 
-    def test_a_changed_member_pulls_in_its_new_import(self):
-        self.key()
-        (self.repo / "tests/extra.py").write_text("VALUE = 1\n", encoding="utf-8")
-        (self.repo / "tests/helpers.py").write_text(
-            "import extra\n\n\ndef value():\n    return extra.VALUE\n", encoding="utf-8")
-        after_import = self.key()[0]
-        (self.repo / "tests/extra.py").write_text("VALUE = 2\n", encoding="utf-8")
-        self.assertNotEqual(self.key()[0], after_import)
+
+class KeyCostTests(CacheBase):
+    """The key must stay cheap: one ``git ls-files``, one ``git status``, one bounded walk."""
+
+    def test_the_key_stays_under_a_second_on_a_ten_thousand_file_repo(self):
+        repo = self.tmp / "big"
+        for folder in range(100):
+            directory = repo / f"pkg{folder}"
+            directory.mkdir(parents=True)
+            for index in range(100):
+                (directory / f"mod{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+        (repo / "tests").mkdir()
+        (repo / "tests/test_a.py").write_text("def test_a():\n    assert True\n", encoding="utf-8")
+        (repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+        (repo / "target").mkdir()
+        for index in range(50):
+            (repo / f"target/gen{index}.json").write_text("{}\n", encoding="utf-8")
+        git(repo, "init", "-q")
+        commit(repo)
+        self.assertGreaterEqual(len(git(repo, "ls-files").stdout.splitlines()), 10000)
+        self.key(cwd=repo)  # warm the git index and the page cache
+        started = time.monotonic()
+        key, why = self.key(cwd=repo)
+        elapsed = time.monotonic() - started
+        self.assertEqual(why, "")
+        self.assertIsNotNone(key)
+        self.assertLess(elapsed, 2.0, f"key cost {elapsed * 1000:.0f} ms on a 10k-file repo")
 
 
 class EventTests(CacheBase):
@@ -352,6 +483,13 @@ class EventTests(CacheBase):
         rows = slots.read_events(self.home)
         self.assertEqual(rows[0]["cache"], "miss")
         self.assertIn("missing target", rows[0]["why"])
+
+    def test_a_k_expression_does_not_reach_the_event_row(self):
+        """F17: ``-k "test_a.py or x"`` used to be taken for a path."""
+        plugin.pytest_cmdline_main(fake_config(("-q", "-k", "test_a.py or x", "tests/test_a.py"),
+                                               self.repo))
+        rows = slots.read_events(self.home)
+        self.assertEqual(rows[0]["argv"], "tests/test_a.py")
 
     def test_history_counts_cache_hits_and_misses(self):
         config = fake_config(("-q", "tests/test_a.py"), self.repo)
@@ -515,6 +653,26 @@ class NeverFailsTests(CacheBase):
         config.pluginmanager = SimpleNamespace(getplugin=lambda name: SimpleNamespace(stats={"passed": [1]}))
         plugin.pytest_sessionfinish(SimpleNamespace(config=config), 0)
 
+    def test_a_corrupt_entry_file_is_a_hit_not_a_crash(self):
+        """The entry is a marker, not data: its content is never read, so a torn write still hits."""
+        config = fake_config(("-q", "tests/test_a.py"), self.repo)
+        plugin.pytest_cmdline_main(config)
+        key = config._agentq_pytest_cache_key
+        path = plugin._entry_path(os.environ, key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00not json")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = plugin.pytest_cmdline_main(fake_config(("-q", "tests/test_a.py"), self.repo))
+        self.assertEqual(code, 0)
+        self.assertIn("unchanged", err.getvalue())
+
+    def test_a_corrupt_prune_stamp_does_not_crash(self):
+        stamp = self.home / "pytest-cache" / plugin.PRUNE_STAMP
+        stamp.parent.mkdir(parents=True)
+        stamp.write_bytes(b"\x00")
+        plugin._prune(self.home)
+
 
 class EndToEndTests(CacheBase):
     """Real ``sys.executable -m pytest`` runs in the temp repo, the way a worker runs a venv.
@@ -553,6 +711,33 @@ class EndToEndTests(CacheBase):
         self.assertNotIn("unchanged", third.stderr)
         rows = slots.read_events(self.home)
         self.assertEqual([row["cache"] for row in rows], ["miss", "hit", "miss"])
+
+    def test_a_data_file_edit_runs_the_test_again(self):
+        """F1 end to end: the test reads a JSON file, and editing it must not be a hit."""
+        (self.repo / "data").mkdir()
+        (self.repo / "data/spec.json").write_text('{"n": 1}\n', encoding="utf-8")
+        (self.repo / "tests/test_a.py").write_text(
+            "import json\nfrom pathlib import Path\n\n\ndef test_a():\n"
+            "    assert json.loads(Path('data/spec.json').read_text())['n'] == 1\n",
+            encoding="utf-8")
+        commit(self.repo)
+        first = self.run_pytest("-q", "tests/test_a.py")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("1 passed", first.stdout)
+        (self.repo / "data/spec.json").write_text('{"n": 2}\n', encoding="utf-8")
+        second = self.run_pytest("-q", "tests/test_a.py")
+        self.assertEqual(second.returncode, 1, second.stderr)
+        self.assertNotIn("unchanged", second.stderr)
+        self.assertIn("1 failed", second.stdout)
+
+    def test_a_state_dependent_selector_records_nothing(self):
+        """F4 end to end: ``--lf`` must never record a pass for a subset."""
+        first = self.run_pytest("-q", "--lf", "tests/test_a.py")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("1 passed", first.stdout)
+        self.assertEqual(self.entries(), [])
+        rows = slots.read_events(self.home)
+        self.assertIn("state-dependent selector", rows[0]["why"])
 
     def test_a_failing_run_and_a_skip_only_run_write_no_entry(self):
         (self.repo / "tests/test_a.py").write_text("def test_a():\n    assert False\n", encoding="utf-8")
