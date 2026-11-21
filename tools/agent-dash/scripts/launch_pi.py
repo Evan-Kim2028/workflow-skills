@@ -105,8 +105,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agentq import repetition_guard as repeat_guard  # noqa: E402
-from agentq import slots as agentq_slots  # noqa: E402
 from agentq import verdict as verdict_lib  # noqa: E402
+from agentq.worker_env import (  # noqa: E402,F401
+    PYTEST_PLUGIN_DIR,
+    PYTEST_PLUGINS,
+    SHIM_PYTHON_ENV,
+    SHIMS_DIR,
+    SHIMS_ENV,
+    XDIST_DEFAULTS,
+    agentq_home,
+    prepare_worker_environ,
+    shim_environ,
+)
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
 from dash.sources import pi as pi_source  # noqa: E402
@@ -493,14 +503,6 @@ def build_resume_argv(session_file, outdir, model, prompt_file, extension=None, 
     ]
 
 
-def agentq_home():
-    """``$AGENTQ_HOME``, else the broker's default state folder."""
-    env = (os.environ.get("AGENTQ_HOME") or "").strip()
-    if env:
-        return Path(env).expanduser()
-    return Path.home() / ".local" / "state" / "agentq"
-
-
 def pilot_config(home):
     """``(extension path, fraction)`` from ``<home>/pilot.json``, or None when absent or invalid."""
     try:
@@ -552,12 +554,6 @@ def record_pilot(label, arm, outdir, home, started):
 
 
 RUN_ENV = "AGENTQ_RUN"
-SHIMS_ENV = "AGENTQ_SHIMS"
-SHIM_PYTHON_ENV = "AGENTQ_SHIM_PYTHON"
-SHIMS_DIR = ROOT / "agentq" / "shims"
-PYTEST_PLUGIN_DIR = ROOT / "agentq" / "pyplugin"
-PYTEST_PLUGINS = ("agentq_pytest_slot", "agentq_pytest_cache")
-XDIST_DEFAULTS = (("PYTEST_XDIST_AUTO_NUM_WORKERS", "2"), ("LOR_CI_XDIST", "2"))
 
 
 def set_run_label(label, environ=os.environ):
@@ -566,36 +562,6 @@ def set_run_label(label, environ=os.environ):
     stays; AGENTQ_JOB is never touched, since run_worker.py reads it to detect broker launches."""
     if not (environ.get(RUN_ENV) or "").strip():
         environ[RUN_ENV] = label
-    return environ
-
-
-def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable, plugin_dir=PYTEST_PLUGIN_DIR):
-    """Put the agentq command shims first on PATH for the pi child; ``AGENTQ_SHIMS=0`` skips it.
-
-    The shims gate ssh to production hosts and pytest runs (see agentq/shims/dispatch.py).
-    ``AGENTQ_SHIM_PYTHON`` names the interpreter the shims run their dispatcher with.
-    The pytest slot plugin and its xdist caps are set in the same place (see the module
-    docstring), under the same ``AGENTQ_SHIMS=0`` switch.
-    """
-    if (environ.get(SHIMS_ENV) or "").strip() == "0":
-        return environ
-    shims = str(shims_dir)
-    rest = [part for part in (environ.get("PATH") or "").split(os.pathsep) if part and part != shims]
-    environ["PATH"] = os.pathsep.join([shims, *rest])
-    environ.setdefault(SHIM_PYTHON_ENV, python)
-    plugin = str(plugin_dir)
-    pythonpath = [part for part in (environ.get("PYTHONPATH") or "").split(os.pathsep) if part and part != plugin]
-    environ["PYTHONPATH"] = os.pathsep.join([plugin, *pythonpath])
-    addopts = (environ.get("PYTEST_ADDOPTS") or "").strip()
-    for name in PYTEST_PLUGINS:
-        if f"-p {name}" not in addopts:
-            addopts = " ".join(part for part in (addopts, f"-p {name}") if part)
-    environ["PYTEST_ADDOPTS"] = addopts
-    named = [part for part in (environ.get("PYTEST_PLUGINS") or "").split(",") if part.strip()]
-    environ["PYTEST_PLUGINS"] = ",".join([*named, *(name for name in PYTEST_PLUGINS if name not in named)])
-    for key, value in XDIST_DEFAULTS:
-        if not (environ.get(key) or "").strip():
-            environ[key] = value
     return environ
 
 
@@ -652,8 +618,7 @@ def main(argv=None):
         return 2
 
     set_run_label(label)
-    shim_environ(os.environ)
-    agentq_slots.write_ssh_hosts(agentq_home())
+    prepare_worker_environ(os.environ)
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "running").mkdir(parents=True, exist_ok=True)

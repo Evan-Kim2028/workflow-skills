@@ -335,6 +335,8 @@ class MainTests(unittest.TestCase):
                 def __init__(self, argv, kwargs):
                     self.argv = argv
                     self.kwargs = kwargs
+                    observed["child_path"] = os.environ.get("PATH", "")
+                    observed["child_addopts"] = os.environ.get("PYTEST_ADDOPTS", "")
                     self.stdin = _Sink()
                     self.stdout = io.BytesIO(b"".join((json.dumps(obj) + "\n").encode() for obj in stream_lines))
 
@@ -357,13 +359,16 @@ class MainTests(unittest.TestCase):
                     return real_popen(argv, **kwargs)
                 return FakeProc(argv, kwargs)
 
-            env = {"AGENT_DASH_STATE_DIR": os.path.join(tmp, "state")}
+            env = {"AGENT_DASH_STATE_DIR": os.path.join(tmp, "state"), "AGENTQ_HOME": os.path.join(tmp, "agentq")}
             with mock.patch.dict(os.environ, env, clear=False):
                 with mock.patch.object(launch, "codex_binary", return_value="/bin/true"):
                     with mock.patch.object(launch, "parent_session_of", return_value="01a16401-9955-70cd-bf8c-19944db4f20c"):
                         with mock.patch.object(launch.subprocess, "Popen", side_effect=fake_popen):
                             code = launch.main([label, tmp, prompt, outdir])
             self.assertEqual(code, 0)
+            shims = str(Path(launch.__file__).resolve().parents[1] / "agentq" / "shims")
+            self.assertEqual(observed["child_path"].split(os.pathsep)[0], shims)
+            self.assertIn("-p agentq_pytest_slot", observed["child_addopts"])
             self.assertFalse(os.path.exists(os.path.join(outdir, "QUOTA-" + label)))
             self.assertEqual(observed["prompt"], b"[label: " + label.encode() + b"]\ndo the task\n\n")
             self.assertEqual(len(observed["running_before_exit"]), 1)

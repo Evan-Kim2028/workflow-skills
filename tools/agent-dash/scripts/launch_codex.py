@@ -56,6 +56,7 @@ if str(ROOT) not in sys.path:
 
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
+from agentq.worker_env import prepare_worker_environ  # noqa: E402
 from dash.sources.manifests import parent_session_from_pad  # noqa: E402
 
 DEFAULT_MODEL = "gpt-6-luna"
@@ -446,6 +447,7 @@ def main(argv=None):
         print("codex binary not found on PATH", file=sys.stderr)
         return 2
 
+    prepare_worker_environ(os.environ)
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "running").mkdir(parents=True, exist_ok=True)
