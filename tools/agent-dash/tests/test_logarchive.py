@@ -566,5 +566,57 @@ class CliWiringTest(unittest.TestCase):
         self.assertIn("unknown logs archive argument", proc.stderr)
 
 
+# --------------------------------------------------------------- zstd level
+
+class ZstdLevelTest(unittest.TestCase):
+    """New copies are ``-19 --long=31``; every reader passes ``--long=31``."""
+
+    def test_the_module_uses_the_small_level(self):
+        self.assertEqual(la.ZSTD_LEVEL, "-19")
+        self.assertEqual(la.ZSTD_LONG, "--long=31")
+
+    def test_a_long_window_frame_round_trips_through_the_reader(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        body = (b'{"type":"assistant","message":"hello"}\n') * 5000
+        src = Path(tmp.name) / "body.jsonl"
+        src.write_bytes(body)
+        zst = Path(tmp.name) / "body.jsonl.zst"
+        proc = subprocess.run(
+            [shutil.which("zstd"), la.ZSTD_LEVEL, la.ZSTD_LONG, "-q", "-f", "-o", str(zst), str(src)],
+            capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(la.decompressed_sha256(str(zst)), hashlib.sha256(body).hexdigest())
+        lines = list(la._iter_stored_lines(str(zst)))
+        self.assertEqual(len(lines), 5000)
+
+    def test_every_reader_passes_the_long_window_flag(self):
+        """A reader that drops ``--long=31`` is the regression this guards."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src = Path(tmp.name) / "body.jsonl"
+        src.write_bytes(b'{"type":"assistant"}\n' * 100)
+        zst = Path(tmp.name) / "body.jsonl.zst"
+        subprocess.run(
+            [shutil.which("zstd"), la.ZSTD_LEVEL, la.ZSTD_LONG, "-q", "-f", "-o", str(zst), str(src)],
+            capture_output=True,
+            check=True,
+        )
+        real = la.subprocess.Popen
+        seen = []
+
+        def spy(argv, *a, **kw):
+            seen.append(list(argv))
+            return real(argv, *a, **kw)
+
+        with mock.patch.object(la.subprocess, "Popen", spy):
+            la.decompressed_sha256(str(zst))
+            list(la._iter_stored_lines(str(zst)))
+        self.assertTrue(seen)
+        for argv in seen:
+            self.assertIn(la.ZSTD_LONG, argv, argv)
+
+
 if __name__ == "__main__":
     unittest.main()

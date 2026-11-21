@@ -18,7 +18,7 @@ from `dash/logarchive.py`, but not the base64 filter.
 | Piece | Where | What |
 |---|---|---|
 | Archive pass | `dash/sessionarchive.py` | Unit discovery, `tar.zst` packing, ingestion, reclaim, restore, census. |
-| CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore` and `status`. |
+| CLI | `agent_dash.py logs sessions` | `--apply`, `--no-reclaim`, `--scheduled`, `--tool`, `--limit`, `--max-minutes`, `--url`, `--dest`; plus `restore`, `status`, `recompress` and `manifest compact`. |
 | Store client | `dash/vlogs.py` | `make_row(..., extra=...)` adds the native fields; redaction and truncation apply as before. |
 | Store service | `scripts/vlogs_install.sh` | `VLOGS_DATA` and `VLOGS_MAX_DISK` feed `-storageDataPath` and `-retention.maxDiskSpaceUsageBytes`; `VLOGS_MAX_DISK=none` (or empty) omits the cap. |
 | Schedule | `scripts/session_archive_install.sh` | launchd agent `com.agent-dash.session-archive`, hourly, `ProcessType=Background`, `Nice=10`, under `taskpolicy -b` and `memcap.sh 4096`, running the deployed release (`~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash`). The plist runs `agent_dash.py logs scheduled --apply`, which runs this pass and then the agentq log archive (`logs archive --agentq --apply`) in one process, so both get the same taskpolicy, memcap and LowPriorityIO. |
@@ -103,6 +103,7 @@ Nothing this job writes is ever deleted for age or space:
 <dest>/                          mode 0700, holds .metadata_never_index
   archive/<tool>/<unit>.<seq>.tar.zst
   state/manifest.jsonl           append-only; last record per unit wins
+  state/manifest-segments/*.jsonl.zst   rolled-off records (see below)
   state/archive.lock
   state/trash/<uid-safe>/<rel>   only during a reclaim (see the journal)
   state/last_success.json
@@ -130,6 +131,41 @@ every archive for the unit under `archives` (`seq`, `path`, `bytes`,
 `members`). Old versions are kept forever, like every other archive.
 
 `.metadata_never_index` stops Spotlight from indexing the archive.
+
+### Compression level
+
+New units are written with `zstd -19 --long=31 -T2`. A unit is written once
+and read rarely, so the CPU is spent once and the bytes are saved for the
+life of the archive. `--long=31` needs a 2 GiB window to decompress, so
+every reader passes it (`zstd -dc --long=31`); a frame written with a long
+window is not readable by a decoder that caps the window lower.
+
+Units written before this change are at `-12 --long=27`. `logs sessions
+recompress` upgrades them one at a time: it decompresses the old frame,
+recompresses the stream to `-19 --long=31` beside it, decompresses the new
+frame and compares the sha256 and length of the two decompressed streams,
+and only then replaces the old file (`os.replace`, atomic on the same
+filesystem) and appends a manifest record with the new `archive_bytes`,
+`zstd_level` and `zstd_long`. A unit already at the current level is
+skipped, so a second run is a no-op. Dry run unless `--apply`; a dry run
+does the same work and deletes the temp file, so the reported saving is
+measured, not estimated. The default sample is the 20 largest units.
+
+### Manifest compaction
+
+`state/manifest.jsonl` is append-only and grows with every pack, reclaim and
+restore. `logs sessions manifest compact` rolls the records older than
+`--older-than-days` (default 7) into
+`state/manifest-segments/seg-<newest-ts-ms>-<seq>.jsonl.zst` and rewrites
+the plain file with the live tail. It is lossless: every line is moved byte
+for byte, never re-serialized, and a line whose `ts` cannot be read stays in
+the plain file. The segment is verified (decompressed sha256 equals the
+sha256 of the moved lines) before the plain file is replaced, and the plain
+file is replaced atomically. `Manifest` reads the segments first, oldest
+first, then the plain file, so "last record wins" is unchanged and
+`status`, `restore` and `verify` read a compacted manifest exactly as they
+read a plain one. It takes `archive.lock`, so it never races a pack. Dry
+run unless `--apply`.
 
 ## Units per tool
 
@@ -355,6 +391,12 @@ python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions --apply --no-recl
 # status: per-tool counts (archived, reclaimed, restored, reclaiming, error),
 # archive bytes, reclaimed bytes, trash size, last success and last errors
 python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions status
+
+# upgrade the 20 largest units to -19 --long=31 (dry run; --apply to keep)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions recompress
+
+# roll manifest records older than 7 days into a zstd segment (dry run)
+python3 ~/.claude/tools/agent-dash/agent_dash.py logs sessions manifest compact
 
 # uninstall the schedule (keeps archives and state)
 sh tools/agent-dash/scripts/session_archive_install.sh --uninstall

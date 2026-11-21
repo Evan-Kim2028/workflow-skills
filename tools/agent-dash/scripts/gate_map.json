@@ -321,6 +321,19 @@
     "dash/sessionarchive.py": [
       "test_sessionarchive"
     ],
+    "dash/storagebudget.py": [
+      "test_storagebudget",
+      "test_doctor"
+    ],
+    "dash/agentqjanitor.py": [
+      "test_agentqjanitor"
+    ],
+    "static/cards/storage-budget.js": [
+      "test_page_rules"
+    ],
+    "static/cards/storage-budget.css": [
+      "test_page_rules"
+    ],
     "dash/scratchgc.py": [
       "test_scratchgc",
       "test_pgjanitor",

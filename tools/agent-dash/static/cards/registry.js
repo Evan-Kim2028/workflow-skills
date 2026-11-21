@@ -88,6 +88,11 @@
     {id: "logsearch", order: 96, scope: "project", spec: function (state, snap) {
       return typeof logSearchSpec === "function" ? logSearchSpec(state, snap) : null;
     }},
+    /* Storage budget: the daily footprint of the agent-log stack and the
+       days to 80% (static/cards/storage-budget.js). Read-only, one fetch. */
+    {id: "storagebudget", order: 97, scope: "project", spec: function (state, snap) {
+      return typeof storageBudgetSpec === "function" ? storageBudgetSpec(state, snap) : null;
+    }},
     {id: "decisions", order: 58, scope: "project", spec: function (state, snap) {
       return decisionsSpec(state, snap);
     }},

@@ -2334,5 +2334,186 @@ class PreflightTest(Base):
         self.assertFalse(path.exists())
 
 
+# --------------------------------------------------------------- recompress
+
+class RecompressTest(Base):
+    """``logs sessions recompress``: -12/--long=27 units to -19/--long=31."""
+
+    def legacy_archive(self, dest):
+        root = self.home / "pi"
+        write(root / "proj" / "a.jsonl", '{"type":"session"}\n{"type":"user"}\n' * 200)
+        unit = self.unit("pi", root)
+        archive = sa.archive_path(dest, unit, 0)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(sa, "ZSTD_LEVEL", sa.LEGACY_ZSTD_LEVEL), mock.patch.object(
+            sa, "ZSTD_LONG", sa.LEGACY_ZSTD_LONG
+        ):
+            records = sa.pack(unit, str(archive))
+        return unit, archive, records
+
+    def test_dry_run_measures_and_leaves_the_file(self):
+        dest = self.home / "dest"
+        _unit, archive, records = self.legacy_archive(dest)
+        before = archive.stat().st_size
+        res = sa.recompress_unit(archive, apply=False)
+        self.assertTrue(res["ok"], res["reason"])
+        self.assertEqual(res["before"], before)
+        self.assertLessEqual(res["after"], before)
+        self.assertEqual(archive.stat().st_size, before)
+        self.assertFalse(Path(str(archive) + ".recompress.tmp").exists())
+        sa.verify_archive(str(archive), records)
+
+    def test_apply_replaces_with_identical_content(self):
+        dest = self.home / "dest"
+        _unit, archive, records = self.legacy_archive(dest)
+        old_sha, old_len = sa._decompressed_sha(str(archive))
+        res = sa.recompress_unit(archive, apply=True)
+        self.assertTrue(res["ok"], res["reason"])
+        self.assertEqual(sa._decompressed_sha(str(archive)), (old_sha, old_len))
+        sa.verify_archive(str(archive), records)
+        self.assertFalse(Path(str(archive) + ".recompress.tmp").exists())
+
+    def test_driver_updates_the_manifest_and_skips_a_second_run(self):
+        dest = self.home / "dest"
+        unit, archive, records = self.legacy_archive(dest)
+        manifest = sa.Manifest(dest / "state")
+        manifest.write(
+            {
+                "unit": unit.uid,
+                "tool": unit.tool,
+                "key": unit.key,
+                "archive": str(archive),
+                "archive_bytes": archive.stat().st_size,
+                "members": records,
+                "status": "archived",
+                "zstd_level": sa.LEGACY_ZSTD_LEVEL,
+                "zstd_long": sa.LEGACY_ZSTD_LONG,
+            }
+        )
+        buf = io.StringIO()
+        self.assertEqual(sa.recompress(dest / "state", apply=False, out=buf), 0)
+        self.assertIn("would recompress", buf.getvalue())
+        self.assertEqual(archive.stat().st_size, manifest.latest[unit.uid]["archive_bytes"])
+
+        buf = io.StringIO()
+        self.assertEqual(sa.recompress(dest / "state", apply=True, out=buf), 0)
+        rec = sa.Manifest(dest / "state").latest[unit.uid]
+        self.assertEqual(rec["zstd_level"], sa.ZSTD_LEVEL)
+        self.assertEqual(rec["zstd_long"], sa.ZSTD_LONG)
+        self.assertEqual(rec["archive_bytes"], archive.stat().st_size)
+        self.assertIn("recompressed_ts", rec)
+
+        buf = io.StringIO()
+        self.assertEqual(sa.recompress(dest / "state", apply=True, out=buf), 0)
+        self.assertIn("1 already current", buf.getvalue())
+
+    def test_a_corrupt_frame_fails_without_replacing(self):
+        dest = self.home / "dest"
+        _unit, archive, _records = self.legacy_archive(dest)
+        before = archive.read_bytes()
+        with mock.patch.object(sa, "_recompress_stream", lambda src, dst: Path(dst).write_bytes(b"not zstd")):
+            res = sa.recompress_unit(archive, apply=True)
+        self.assertFalse(res["ok"])
+        self.assertEqual(archive.read_bytes(), before)
+
+
+# --------------------------------------------------------------- manifest
+
+class ManifestCompactTest(Base):
+    """``logs sessions manifest compact``: old lines roll into zstd segments."""
+
+    def build(self, dest, old=3, new=2, now=None):
+        now = time.time() if now is None else now
+        state = dest / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for i in range(old):
+            lines.append(
+                json.dumps({"unit": "pi/old%d" % i, "tool": "pi", "status": "archived", "ts": now - 30 * 86400})
+            )
+        for i in range(new):
+            lines.append(
+                json.dumps({"unit": "pi/new%d" % i, "tool": "pi", "status": "archived", "ts": now - 3600})
+            )
+        (state / "manifest.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return state, now
+
+    def test_dry_run_changes_nothing(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest)
+        before = (state / "manifest.jsonl").read_bytes()
+        buf = io.StringIO()
+        self.assertEqual(sa.compact_manifest(state, apply=False, out=buf, now=now), 0)
+        self.assertIn("would roll 3 line(s)", buf.getvalue())
+        self.assertEqual((state / "manifest.jsonl").read_bytes(), before)
+        self.assertEqual(sa.manifest_segments(state), [])
+
+    def test_apply_keeps_every_record_readable(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest)
+        want = dict(sa.Manifest(state).latest)
+        buf = io.StringIO()
+        self.assertEqual(sa.compact_manifest(state, apply=True, out=buf, now=now), 0)
+        segments = sa.manifest_segments(state)
+        self.assertEqual(len(segments), 1)
+        self.assertTrue(segments[0].name.endswith(".jsonl.zst"))
+        plain = (state / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(plain), 2)
+        got = sa.Manifest(state).latest
+        self.assertEqual(set(got), set(want))
+        for uid, rec in want.items():
+            self.assertEqual(got[uid]["status"], rec["status"])
+        self.assertGreater(segments[0].stat().st_size, 0)
+        self.assertLess(segments[0].stat().st_size, (state / "manifest.jsonl").stat().st_size + 1)
+
+    def test_status_and_restore_still_work_after_compaction(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest)
+        sa.compact_manifest(state, apply=True, out=io.StringIO(), now=now)
+        buf = io.StringIO()
+        self.assertEqual(sa.status(state, buf), 0)
+        self.assertIn("pi", buf.getvalue())
+        manifest = sa.Manifest(state)
+        self.assertIsNotNone(sa._find_record(manifest, "pi/old0"))
+        self.assertIsNotNone(sa._find_record(manifest, "pi/new1"))
+
+    def test_a_newer_plain_record_wins_over_a_segment(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest, old=1, new=0)
+        sa.compact_manifest(state, apply=True, out=io.StringIO(), now=now)
+        with open(state / "manifest.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"unit": "pi/old0", "tool": "pi", "status": "reclaimed", "ts": now}) + "\n")
+        self.assertEqual(sa.Manifest(state).latest["pi/old0"]["status"], "reclaimed")
+
+    def test_unparseable_and_untimed_lines_stay_plain(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest, old=1, new=0)
+        with open(state / "manifest.jsonl", "a", encoding="utf-8") as fh:
+            fh.write("not json\n")
+            fh.write(json.dumps({"unit": "pi/nots", "tool": "pi", "status": "archived"}) + "\n")
+        sa.compact_manifest(state, apply=True, out=io.StringIO(), now=now)
+        plain = (state / "manifest.jsonl").read_text(encoding="utf-8")
+        self.assertIn("not json", plain)
+        self.assertIn("pi/nots", plain)
+
+    def test_nothing_old_is_a_no_op(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest, old=0, new=2)
+        buf = io.StringIO()
+        self.assertEqual(sa.compact_manifest(state, apply=True, out=buf, now=now), 0)
+        self.assertIn("nothing older than", buf.getvalue())
+        self.assertEqual(sa.manifest_segments(state), [])
+
+    def test_a_held_lock_refuses(self):
+        dest = self.home / "dest"
+        state, now = self.build(dest)
+        lock = open(state / "archive.lock", "a+")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        buf = io.StringIO()
+        self.assertEqual(sa.compact_manifest(state, apply=True, out=buf, now=now), 3)
+        self.assertIn("holds the lock", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
