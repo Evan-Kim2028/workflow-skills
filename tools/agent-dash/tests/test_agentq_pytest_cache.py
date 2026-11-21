@@ -538,9 +538,11 @@ class RefusalTests(CacheBase):
         self.assertIn("ws9-exec-cache", rows[0])
 
     def test_a_directory_target_is_refused(self):
+        # An absolute path: the rule resolves a relative target against the process cwd, the
+        # same way the shim does, so a relative one would depend on where the suite runs.
         err = io.StringIO()
         with redirect_stderr(err):
-            code = plugin.pytest_cmdline_main(fake_config(("tests",), self.repo))
+            code = plugin.pytest_cmdline_main(fake_config((str(self.repo / "tests"),), self.repo))
         self.assertEqual(code, 2)
         self.assertIn("is a directory, not a test file", err.getvalue())
 
