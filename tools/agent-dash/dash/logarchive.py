@@ -1015,46 +1015,190 @@ def _as_int(value) -> int:
     return int(number)
 
 
+def _zero_tokens() -> dict:
+    return {"messages": 0, "input": 0, "output": 0, "cache_read": 0}
+
+
+def _path_list(rels) -> str:
+    """The quoted argument list of a LogsQL ``in(...)`` over paths."""
+    rels = list(rels)
+    for rel in rels:
+        if '"' in rel or "\\" in rel:
+            raise vlogs.VLogsError("path has a character LogsQL cannot quote: %r" % rel)
+    return ",".join('"%s"' % rel for rel in rels)
+
+
+def counts_by_path(client: vlogs.VLogsClient, rels) -> dict:
+    """Rows stored per path, in one grouped query. A path with no rows is 0.
+
+    One query for a whole batch of files instead of one per file. A store too
+    old for ``in(...)`` raises, and the per-path query answers instead.
+    """
+    rels = list(rels)
+    if not rels:
+        return {}
+    try:
+        rows = client.query("path:in(%s) | stats by (path) count() n" % _path_list(rels))
+    except vlogs.VLogsError:
+        return {rel: client.count(rel) for rel in rels}
+    got = {}
+    for row in rows:
+        rel = row.get("path")
+        if isinstance(rel, str):
+            got[rel] = _as_int(row.get("n"))
+    return {rel: got.get(rel, 0) for rel in rels}
+
+
+def token_sums_by_path(client: vlogs.VLogsClient, rels, tok: str) -> dict:
+    """Assistant token sums per path, in one grouped query (zeros when absent).
+
+    Same rule as ``_store_tokens``: only ``type:=<tok>`` rows whose
+    ``message.role`` is ``assistant`` count. The store leaves a path with no
+    such row out of the answer, which is every sum zero.
+    """
+    rels = list(rels)
+    if not rels:
+        return {}
+    q = (
+        'path:in(%s) type:=%s '
+        '| unpack_json from _msg fields ("message.role","message.usage.input","message.usage.output","message.usage.cacheRead") '
+        '| filter "message.role":=assistant '
+        '| stats by (path) count() n, sum("message.usage.input") i, sum("message.usage.output") o, sum("message.usage.cacheRead") c'
+    ) % (_path_list(rels), tok)
+    try:
+        rows = client.query(q)
+    except vlogs.VLogsError:
+        return {rel: _store_tokens(client, rel, tok) for rel in rels}
+    got = {}
+    for row in rows:
+        rel = row.get("path")
+        if not isinstance(rel, str):
+            continue
+        got[rel] = {
+            "messages": _as_int(row.get("n")),
+            "input": _as_int(row.get("i")),
+            "output": _as_int(row.get("o")),
+            "cache_read": _as_int(row.get("c")),
+        }
+    return {rel: got.get(rel, _zero_tokens()) for rel in rels}
+
+
+#: Files per store batch; one flush covers the whole batch.
+#: Each flush makes VictoriaLogs seal a part and then merge it, so a flush per
+#: file of a few rows ran at about one file per 15 s (2026-11-21: 470 files in
+#: 2 h with ~27,000 queued, the server at 250% CPU merging).
+BATCH_FILES = 64
+#: Stripped bytes posted per batch: rows are streamed back from the zstd copies
+#: and posted as they are read, so this bounds what one batch reads, not memory.
+BATCH_BYTES = 64 * 2 ** 20
+
+
+def _insert_file(client: vlogs.VLogsClient, entry: Entry, zst_path: str, lines: int) -> dict:
+    """Post one file's rows (no flush) and return the token totals of what was sent."""
+    acct = {}
+
+    def gen():
+        nonlocal acct
+        for line, row_acct in row_lines(entry, zst_path):
+            acct = row_acct
+            yield line
+
+    sent = client.insert(gen())
+    if sent != lines:
+        raise ArchiveError("sent %d rows for %d lines" % (sent, lines))
+    return dict(acct) if acct else _sent_tokens(entry, zst_path)
+
+
+def _store_batch(client: vlogs.VLogsClient, items: list[dict]) -> None:
+    """Post a batch of files, flush once, then verify every file in it.
+
+    Each item is ``{"entry", "zst", "lines"}``; success fills in ``ing``,
+    ``sent_acct``, ``stored`` and ``got``, and a failure fills in ``error``.
+    Nothing here reclaims: the caller does that only for items without an
+    error, so one bad file in a batch is recorded and left alone while its
+    batch mates are archived. The safety checks are unchanged: the store is
+    asked per path how many rows it already has (0 ingest, the expected count
+    already done, anything else an error), then one flush makes the batch
+    searchable, then each file's row count and token sums must match.
+    """
+    if not items:
+        return
+    before = counts_by_path(client, [it["entry"].rel for it in items])
+    to_send = []
+    for it in items:
+        have = before.get(it["entry"].rel, 0)
+        if have == it["lines"]:
+            it["ing"] = {"status": "already-ingested"}
+            it["sent_acct"] = None
+        elif have == 0:
+            it["ing"] = {"status": "ingested"}
+            to_send.append(it)
+        else:
+            it["error"] = ArchiveError(
+                "store has %d rows for %s, expected 0 or %d; remove them before retrying"
+                % (have, it["entry"].rel, it["lines"])
+            )
+    posted = False
+    for it in to_send:
+        try:
+            it["sent_acct"] = _insert_file(client, it["entry"], it["zst"], it["lines"])
+            posted = True
+        except Exception as exc:  # this file only; the rest of the batch goes on
+            it["error"] = exc
+    if posted:
+        try:
+            client.flush()  # one flush for the batch, after every POST it needs
+        except Exception as exc:
+            for it in to_send:
+                it.setdefault("error", exc)
+    ok = [it for it in items if "error" not in it]
+    if not ok:
+        return
+    try:
+        counts = counts_by_path(client, [it["entry"].rel for it in ok])
+        sums: dict = {}
+        groups: dict = {}
+        for it in ok:
+            groups.setdefault(token_type(it["entry"].kind), []).append(it["entry"].rel)
+        for tok, rels in sorted(groups.items()):
+            sums.update(token_sums_by_path(client, rels, tok))
+    except Exception as exc:  # the store stopped answering: no file is verified
+        for it in ok:
+            it["error"] = exc
+        return
+    for it in ok:
+        entry, rel = it["entry"], it["entry"].rel
+        stored = counts.get(rel, 0)
+        if stored != it["lines"]:
+            it["error"] = ArchiveError("store has %d rows for %s, expected %d" % (stored, rel, it["lines"]))
+            continue
+        acct = it["sent_acct"] if it["sent_acct"] is not None else _sent_tokens(entry, it["zst"])
+        it["sent_acct"] = acct
+        want = {key: acct.get(key, 0) for key in ("messages", "input", "output", "cache_read")}
+        got = sums.get(rel) or _zero_tokens()
+        if got != want:
+            it["error"] = ArchiveError("store token sums %s differ from sent %s" % (got, want))
+            continue
+        it["stored"] = stored
+        it["got"] = got
+
+
 def ingest(entry: Entry, zst_path: str, lines: int, client: vlogs.VLogsClient) -> dict:
-    """Post the rows of one archived file once, and verify the store. Returns the result."""
-    before = client.count(entry.rel)
-    if before == lines:
-        sent_acct = None
-        status = "already-ingested"
-    elif before == 0:
-        gen_acct = {}
+    """Post the rows of one archived file once, and verify the store. Returns the result.
 
-        def gen():
-            nonlocal gen_acct
-            for line, acct in row_lines(entry, zst_path):
-                gen_acct = acct
-                yield line
-
-        sent = client.insert(gen())
-        sent_acct = dict(gen_acct)
-        status = "ingested"
-        if sent != lines:
-            raise ArchiveError("sent %d rows for %d lines" % (sent, lines))
-        client.flush()
-    else:
-        raise ArchiveError(
-            "store has %d rows for %s, expected 0 or %d; remove them before retrying" % (before, entry.rel, lines)
-        )
-    stored = client.count(entry.rel)
-    if stored != lines:
-        raise ArchiveError("store has %d rows for %s, expected %d" % (stored, entry.rel, lines))
-    if sent_acct is None:
-        sent_acct = _sent_tokens(entry, zst_path)
-    got = _store_tokens(client, entry.rel, token_type(entry.kind))
-    want = {"messages": sent_acct["messages"], "input": sent_acct["input"], "output": sent_acct["output"], "cache_read": sent_acct["cache_read"]}
-    if got != want:
-        raise ArchiveError("store token sums %s differ from sent %s" % (got, want))
+    Kept as the one-file entry point; the pass itself uses ``_store_batch``,
+    which does the same checks for a batch of files with one flush.
+    """
+    item = {"entry": entry, "zst": zst_path, "lines": lines}
+    _store_batch(client, [item])
+    if "error" in item:
+        raise item["error"]
     return {
-        "status": status,
-        "vl_rows": stored,
-        "vl_tokens": got,
-        "truncated": sent_acct["truncated"],
-        "redactions": sent_acct["redactions"],
+        "status": item["ing"]["status"],
+        "vl_rows": item["stored"],
+        "vl_tokens": item["got"],
+        "truncated": item["sent_acct"]["truncated"],
+        "redactions": item["sent_acct"]["redactions"],
     }
 
 
@@ -1180,8 +1324,16 @@ def process(
     root: Path,
     limit: int | None,
     out,
+    batch_files: int = BATCH_FILES,
+    batch_bytes: int = BATCH_BYTES,
 ) -> tuple[Totals, dict]:
-    """Run the pipeline over candidate plans. Dry run measures only."""
+    """Run the pipeline over candidate plans. Dry run measures only.
+
+    With ``apply`` the files come in batches of at most ``batch_files`` or
+    ``batch_bytes`` stripped bytes: every file is measured and posted in the
+    batch, one flush covers them all, then each file is verified and, only if
+    it verified, reclaimed.
+    """
     totals = Totals()
     results = {"archived": 0, "reclaimed": 0, "done": 0, "errors": 0, "planned": 0, "skipped": {}}
     manifest = Manifest(root) if apply else None
@@ -1193,6 +1345,59 @@ def process(
             results["skipped"][key] = results["skipped"].get(key, 0) + 1
     if limit is not None:
         candidates = candidates[:limit]
+    pending: list[dict] = []
+    pending_bytes = 0
+
+    def store_batch() -> None:
+        """Post and verify what is pending, then archive/reclaim the files that verified."""
+        nonlocal pending_bytes
+        if not pending:
+            return
+        items = list(pending)
+        pending.clear()
+        pending_bytes = 0
+        _store_batch(client, items)
+        for it in items:
+            e = it["entry"]
+            if "error" in it:
+                exc = it["error"]
+                results["errors"] += 1
+                reason = "%s: %s" % (exc.__class__.__name__, exc)
+                manifest.write({"path": e.rel, "source": e.path, "size": e.size, "mtime_ns": e.mtime_ns, "status": "error", "error": reason[:500]})
+                print("  ERROR %s: %s" % (e.rel, reason), file=out)
+                continue
+            try:
+                ing = it["ing"]
+                acct = it["sent_acct"]
+                rec = dict(
+                    it["rec"],
+                    status="archived",
+                    vl_rows=it["stored"],
+                    vl_tokens=it["got"],
+                    truncated=acct["truncated"],
+                    redactions=acct["redactions"],
+                    ingest=ing["status"],
+                )
+                manifest.write(rec)
+                results["archived"] += 1
+                k = keep_for(e, keep)
+                _count(totals, e, _Measured(rec), keep=k)
+                reclaim(e, it["zst"], k, rec)
+                done_rec = dict(rec, status="reclaimed", keep=k)
+                if k != "remove" and os.path.exists(e.path):
+                    # The file was rewritten in place: record its new identity so the next
+                    # pass skips it instead of archiving the stripped copy again.
+                    st = os.stat(e.path)
+                    done_rec.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
+                manifest.write(done_rec)
+                results["reclaimed"] += 1
+                print("  archived %s  raw %s -> zst %s  rows %d (%s)  reclaimed" % (e.rel, _fmt(e.size), _fmt(rec["zst_bytes"]), rec["vl_rows"], ing["status"]), file=out)
+            except Exception as exc:  # one file never stops the run; the manifest keeps the reason
+                results["errors"] += 1
+                reason = "%s: %s" % (exc.__class__.__name__, exc)
+                manifest.write({"path": e.rel, "source": e.path, "size": e.size, "mtime_ns": e.mtime_ns, "status": "error", "error": reason[:500]})
+                print("  ERROR %s: %s" % (e.rel, reason), file=out)
+
     for plan in candidates:
         e = plan.entry
         prior = done_paths.get(e.rel)
@@ -1211,6 +1416,8 @@ def process(
             if prior and _same_file(prior, e) and prior.get("status") == "archived" and zst.exists():
                 rec = prior
             else:
+                # Measure now and post the rows with the rest of the batch; the
+                # measured record lands now so a crash keeps the verified copy.
                 tmp_zst = str(zst) + ".tmp"
                 m = measure(e.path, tmp_zst, token_type(e.kind), compressed=e.compressed)
                 _verify_measure(m)
@@ -1241,28 +1448,17 @@ def process(
                     "stripped_tokens": m.stripped_tokens,
                 }
                 manifest.write(rec)
-            ing = ingest(e, str(zst), rec["stripped_lines"], client)
-            rec = dict(rec, status="archived", vl_rows=ing["vl_rows"], vl_tokens=ing["vl_tokens"], truncated=ing["truncated"], redactions=ing["redactions"], ingest=ing["status"])
-            manifest.write(rec)
-            results["archived"] += 1
-            k = keep_for(e, keep)
-            _count(totals, e, _Measured(rec), keep=k)
-            reclaim(e, zst, k, rec)
-            done_rec = dict(rec, status="reclaimed", keep=k)
-            if k != "remove" and os.path.exists(e.path):
-                # The file was rewritten in place: record its new identity so the next
-                # pass skips it instead of archiving the stripped copy again.
-                st = os.stat(e.path)
-                done_rec.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
-            manifest.write(done_rec)
-            results["reclaimed"] += 1
-            print("  archived %s  raw %s -> zst %s  rows %d (%s)  reclaimed" % (e.rel, _fmt(e.size), _fmt(rec["zst_bytes"]), rec["vl_rows"], ing["status"]), file=out)
+            pending.append({"entry": e, "zst": str(zst), "rec": rec, "lines": rec["stripped_lines"]})
+            pending_bytes += rec["stripped_bytes"]
+            if len(pending) >= batch_files or pending_bytes >= batch_bytes:
+                store_batch()
         except Exception as exc:  # one file never stops the run; the manifest keeps the reason
             results["errors"] += 1
             reason = "%s: %s" % (exc.__class__.__name__, exc)
             if manifest:
                 manifest.write({"path": e.rel, "source": e.path, "size": e.size, "mtime_ns": e.mtime_ns, "status": "error", "error": reason[:500]})
             print("  ERROR %s: %s" % (e.rel, reason), file=out)
+    store_batch()
     return totals, results
 
 
@@ -1404,6 +1600,8 @@ def archive_entries(
     ws_scoped: bool = True,
     limit: int | None = None,
     client=None,
+    batch_files: int = BATCH_FILES,
+    batch_bytes: int = BATCH_BYTES,
 ) -> tuple[int, Totals, dict, list[Plan]]:
     """Plan, then measure/verify/ingest/reclaim a known set of entries.
 
@@ -1453,7 +1651,15 @@ def archive_entries(
             entries = kept
         plans = plan_entries(entries, min_idle_hours=min_idle_hours, now=now, ws_scoped=ws_scoped)
         totals, results = process(
-            plans, apply=apply, keep=keep, client=client, root=root, limit=limit, out=out
+            plans,
+            apply=apply,
+            keep=keep,
+            client=client,
+            root=root,
+            limit=limit,
+            out=out,
+            batch_files=batch_files,
+            batch_bytes=batch_bytes,
         )
         results["done"] = results.get("done", 0) + done
         return (1 if results["errors"] else 0), totals, results, plans

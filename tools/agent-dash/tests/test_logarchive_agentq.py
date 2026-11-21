@@ -307,6 +307,116 @@ class PipelineTest(Base):
         self.assertTrue(stream.is_file())
 
 
+class BatchTest(Base):
+    """Many files, one store flush: a flush per small file is what made the pass crawl.
+
+    Each flush makes VictoriaLogs seal a part and then merge it, so the pass
+    posts a batch of files and flushes once (2026-11-21: ~1 file per 15 s with
+    ~27,000 queued). The safety rules are per file, inside the batch: the store
+    is still asked per path what it already has, and a file whose verify fails
+    is recorded as an error and left alone while its batch mates are reclaimed.
+    """
+
+    def three_files(self):
+        """Two streams and a session: three files, two token types, one batch."""
+        self.tree.stream(name="stream-%s-a.ndjson" % LABEL)
+        self.tree.stream(name="stream-%s-b.ndjson" % LABEL)
+        self.tree.session(name="s1.jsonl")
+        entries, _skipped = self.discover()
+        self.assertEqual(len(entries), 3)
+        return entries
+
+    def test_one_flush_covers_a_whole_batch(self):
+        entries = self.three_files()
+        rc, _totals, results, _plans = self.archive(entries)
+        self.assertEqual((rc, results["archived"], results["reclaimed"], results["errors"]), (0, 3, 3, 0))
+        self.assertEqual(self.client.flushes, 1)
+
+    def test_a_short_batch_flushes_per_batch_not_per_file(self):
+        entries = self.three_files()
+        rc, _totals, results, _plans = self.archive(entries, batch_files=2)
+        self.assertEqual((rc, results["reclaimed"], results["errors"]), (0, 3, 0))
+        self.assertEqual(self.client.flushes, 2)
+
+    def test_the_batch_asks_the_store_once_for_the_whole_batch(self):
+        """Before-count, row count and token sums: three grouped queries per batch, not per file."""
+        entries = self.three_files()
+        self.archive(entries)
+        # one before-count + one row count + one token query per token type.
+        self.assertEqual(self.client.queries, 4)
+
+    def test_a_store_too_old_for_in_falls_back_to_one_query_per_path(self):
+        class NoIn(FakeClient):
+            def query(self, logsql):
+                if "path:in(" in logsql:
+                    raise la.vlogs.VLogsError("cannot parse `in(`")
+                return super().query(logsql)
+
+        self.client = NoIn()
+        entries = self.three_files()
+        rc, _totals, results, _plans = self.archive(entries)
+        self.assertEqual((rc, results["reclaimed"], results["errors"]), (0, 3, 0))
+        for entry in entries:
+            self.assertTrue(self.client.rows[entry.rel])
+
+    def test_a_file_whose_verify_fails_is_kept_and_the_rest_are_reclaimed(self):
+        entries = self.three_files()
+        bad = entries[0].rel
+
+        class LosesOne(FakeClient):
+            def query(self, logsql):
+                rows = super().query(logsql)
+                out = []
+                for row in rows:
+                    if row.get("path") == bad:
+                        continue  # the store never counts this path's rows
+                    out.append(row)
+                return out
+
+        self.client = LosesOne()
+        rc, _totals, results, _plans = self.archive(entries)
+        self.assertEqual(rc, 1)
+        self.assertEqual((results["archived"], results["reclaimed"], results["errors"]), (2, 2, 1))
+        latest = la.Manifest(la.archive_root(self.tree.state)).latest
+        self.assertEqual(latest[bad]["status"], "error")
+        self.assertIn("expected 3", latest[bad]["error"])
+        others = [e for e in entries if e.rel != bad]
+        self.assertEqual([latest[e.rel]["status"] for e in others], ["reclaimed"] * 2)
+        # The rewritten files are still there: a failed batch mate never stops a reclaim.
+        self.assertTrue(all(Path(e.path).is_file() for e in others))
+
+    def test_a_partial_store_refuses_that_file_only(self):
+        entries = self.three_files()
+        bad = entries[0]
+        self.client.rows[bad.rel] = [{"path": bad.rel, "type": "message_end", "_msg": "{}", "role": "user"}]
+        rc, _totals, results, _plans = self.archive(entries)
+        self.assertEqual(rc, 1)
+        self.assertEqual((results["reclaimed"], results["errors"]), (2, 1))
+        self.assertTrue(Path(bad.path).is_file())
+        self.assertEqual(len(self.client.rows[bad.rel]), 1)  # nothing was posted for it
+
+    def test_a_batch_retries_cleanly_after_a_crash_between_post_and_reclaim(self):
+        """Rows already in the store: no second POST, no second row, still verified and reclaimed."""
+        entries = self.three_files()
+        for entry in entries:
+            for line, _acct in la.row_lines(entry, self._zst(entry)):
+                self.client.insert(iter([line]))
+        posts = self.client.posts
+        rc, _totals, results, _plans = self.archive(entries)
+        self.assertEqual((rc, results["reclaimed"], results["errors"]), (0, 3, 0))
+        self.assertEqual(self.client.posts, posts)
+        self.assertEqual(self.client.flushes, 0)
+
+    def _zst(self, entry):
+        """The stripped zstd copy of one entry, written straight into the archive tree."""
+        root = la.archive_root(self.tree.state)
+        zst = la.zst_path_for(root, entry)
+        zst.parent.mkdir(parents=True, exist_ok=True)
+        m = la.measure(entry.path, str(zst), la.token_type(entry.kind), compressed=entry.compressed)
+        la._verify_measure(m)
+        return str(zst)
+
+
 class ArchiveStatusTest(Base):
     def test_status_is_none_before_and_reclaimed_after(self):
         self.tree.stream()

@@ -22,13 +22,18 @@ Native agent session history (Claude Code, Codex, Grok build, Cursor, Command
 Code, pi, muse) is handled by a separate, lossless job: see
 [session archive](session-archive.md).
 
-## The archive pass, per file
+## The archive pass, per batch of files
 
-1. **measure** (one streaming pass): filter, count lines and assistant tokens on the raw and stripped bytes, write `zstd -19 --long=31` to a temp file, keep the stripped sha256.
-2. **verify the copy**: `zstd -d --long=31` of the copy must hash to the stripped sha256; raw and stripped line counts and token sums must be equal; no unparsed message lines.
-3. **ingest**: rows are read back from the zstd copy (never the raw file), redacted, truncated if over 1.8 MiB, posted with `Content-Type: application/stream+json`. Before posting, the store is asked how many rows the path already has: 0 means ingest; the expected count means done (skip the POST); anything else is an error that names the path and stops that file.
-4. **verify the store**: row count equals the line count; stored token sums (`unpack_json` over `_msg`) equal the sums over the rows sent.
-5. **reclaim** (`--apply` only): re-check size, mtime and open handles, then apply `--keep`.
+The pass works through the candidate files in batches (`BATCH_FILES` = 64 files or
+`BATCH_BYTES` = 64 MiB of stripped bytes, whichever comes first). Steps 1-2 run
+per file as the batch fills; steps 3-5 run once for the batch, with the safety
+checks still per file:
+
+1. **measure** (one streaming pass, per file): filter, count lines and assistant tokens on the raw and stripped bytes, write `zstd -19 --long=31` to a temp file, keep the stripped sha256.
+2. **verify the copy** (per file): `zstd -d --long=31` of the copy must hash to the stripped sha256; raw and stripped line counts and token sums must be equal; no unparsed message lines.
+3. **ingest** (per batch, one flush): rows are read back from the zstd copies (never the raw files), redacted, truncated if over 1.8 MiB, posted with `Content-Type: application/stream+json`. Before posting, the store is asked in one grouped query (`path:in(...) | stats by (path) count()`) how many rows each path already has: 0 means ingest; the expected count means done (skip the POST); anything else is an error that names that path. Then **one** `force_flush` makes the whole batch searchable. A flush per file made VictoriaLogs seal and merge a part per file: 2026-11-21, a live pass archived 470 files in 2 h (~27,000 queued) with the server at 250% CPU merging.
+4. **verify the store** (per batch, per file): for each file, row count equals the line count and the stored token sums (`unpack_json` over `_msg`) equal the sums over the rows sent, both read from one grouped query per token type.
+5. **reclaim** (per file, `--apply` only): re-check size, mtime and open handles, then apply `--keep`. A file that fails step 3 or 4 is recorded as an error and left alone; its batch mates still archive and reclaim.
 
 Per-file failures are recorded in the manifest (`status: error`) and do not stop the run. Exit codes: 0 ok, 1 failures or a dry run that planned nothing on real input, 2 bad options, 3 another run holds the lock, 5 store unreachable.
 
