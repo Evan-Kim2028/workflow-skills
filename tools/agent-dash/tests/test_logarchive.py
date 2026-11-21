@@ -572,8 +572,8 @@ class ZstdLevelTest(unittest.TestCase):
     """New copies are ``-19 --long=31``; every reader passes ``--long=31``."""
 
     def test_the_module_uses_the_small_level(self):
-        self.assertEqual(la.ZSTD_LEVEL, "-19")
-        self.assertEqual(la.ZSTD_LONG, "--long=31")
+        self.assertEqual(la.ZSTD_LEVEL, "-9")
+        self.assertEqual(la.ZSTD_LONG, "--long=27")
 
     def test_a_long_window_frame_round_trips_through_the_reader(self):
         tmp = tempfile.TemporaryDirectory()

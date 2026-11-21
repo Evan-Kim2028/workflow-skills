@@ -6,7 +6,7 @@ and, for each finished one, does this, in order:
 
 1. **measure** (one streaming pass, bounded memory): base64 runs are
    replaced with ``dash.logfilter`` markers, the stripped bytes go through
-   ``zstd -19 --long=31`` into the mirror path under ``<state>/log-archive/``, and both
+   ``zstd -9 --long=27`` into the mirror path under ``<state>/log-archive/``, and both
    the raw and the stripped bytes are scanned for line count and assistant
    token totals (``message_end``, role assistant: input, output, cacheRead).
    A sha256 of the stripped bytes is kept.
@@ -86,10 +86,11 @@ def default_roots() -> list[str]:
     return [os.path.expanduser(r) for r in section["roots"] if isinstance(r, str) and r]
 
 MIN_IDLE_HOURS = 3.0
-ZSTD_LEVEL = "-19"
-#: ``--long=31`` (2 GiB window) is what makes -19 pay off on a whole stream;
-#: every reader must pass it too (``zstd -d --long=31``), or the frame fails.
-ZSTD_LONG = "--long=31"
+ZSTD_LEVEL = "-9"
+#: -9 with a 128 MiB window: -19 --long=31 saved 2-5% for 20-180x the CPU
+#: (2026-11-21 measurement), too costly on the shared laptop. Readers pass the
+#: same window flag.
+ZSTD_LONG = "--long=27"
 #: Largest message_end line whose body is kept for token parsing. Larger
 #: lines are counted but not parsed; the verify step then refuses them.
 PARSE_CAP = 64 * 2**20
