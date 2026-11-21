@@ -454,6 +454,14 @@ with each job.
 - Watchdog, for a live worker: past `max_runtime_s` it is killed and the job fails
   with the reason. Silent for 45 min (no file in the run folder changed) it is
   killed and requeued once if it has no report; a second stall fails it.
+- Repetition guard, in the launcher (`scripts/launch_pi.py` with
+  `agentq/repetition_guard.py`): a pi worker that repeats one tool call 8 times in
+  a row, or 12 times in its last 30 calls, or compacts 20 times, is stopped by the
+  launcher itself. It writes a `BLOCKED` report naming the call, so the job
+  finishes with a verdict instead of dying and being requeued into the same loop.
+  `AGENTQ_REPEAT_RUN`, `AGENTQ_REPEAT_COUNT`, `AGENTQ_REPEAT_WINDOW` and
+  `AGENTQ_REPEAT_COMPACTIONS` move the thresholds; `AGENTQ_REPEAT_GUARD=0` turns
+  the guard off.
 - Every state change is conditional on the state it was decided in. A cancel
   that lands during a launch stops the new worker; a terminal state is never
   overwritten.

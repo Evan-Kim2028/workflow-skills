@@ -73,6 +73,15 @@ plugins instead. ``shim_environ`` sets, on the pi child:
   (explicit ``-n``, ``-n auto``, ``-n logical``), so a shared laptop is not
   oversubscribed; ``PYTEST_XDIST_AUTO_NUM_WORKERS`` only makes ``-n auto`` cheap.
 
+A repetition guard watches the stream while the child runs
+(``agentq/repetition_guard.py``): the same tool call ``K`` times in a row, or
+``M`` times in the last ``W`` calls, or ``C`` compactions, stops the child and
+writes a ``BLOCKED`` report naming the call, so the broker records a finish
+with a verdict instead of a death. Defaults are 8 in a row, 12 of the last 30,
+and 20 compactions, overridable with ``AGENTQ_REPEAT_RUN``,
+``AGENTQ_REPEAT_COUNT``, ``AGENTQ_REPEAT_WINDOW`` and
+``AGENTQ_REPEAT_COMPACTIONS``; ``AGENTQ_REPEAT_GUARD=0`` turns it off.
+
 ``AGENT_DASH_PI_ENV_FILE`` names an env file to source before the run:
 ``run_worker.py`` sets it for a tier that declares ``standby_env_file``, so
 a rate-limited primary credential switches to the standby one. Only the
@@ -95,6 +104,7 @@ ROOT = HERE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agentq import repetition_guard as repeat_guard  # noqa: E402
 from agentq import slots as agentq_slots  # noqa: E402
 from dash import labels as label_lib  # noqa: E402
 from dash import logfilter  # noqa: E402
@@ -588,9 +598,13 @@ def shim_environ(environ, shims_dir=SHIMS_DIR, python=sys.executable, plugin_dir
     return environ
 
 
-def run_pi(argv, stream, workspace, se):
-    """Run one pi command through the base64 filter into ``stream``; return its exit code."""
-    return logfilter.run_filtered(
+def run_pi(argv, stream, workspace, se, on_start=None):
+    """Run one pi command through the base64 filter into ``stream``; return its exit code.
+
+    ``on_start`` receives the ``logfilter`` run object once the child is up, so a
+    guard can stop it by ``run.proc.pid``.
+    """
+    run = logfilter.start_filtered(
         argv,
         stream,
         cwd=str(Path(workspace).expanduser()),
@@ -599,6 +613,9 @@ def run_pi(argv, stream, workspace, se):
         warn=logfilter.warn_to(se),
         detached=True,
     )
+    if on_start is not None:
+        on_start(run)
+    return run.wait()
 
 
 def pi_refused_resume(rc, stream) -> bool:
@@ -658,22 +675,57 @@ def main(argv=None):
     requested = (os.environ.get(RESUME_ENV) or "").strip()
     resume = resume_source(requested)
     resumed_from = None
-    with open(err, "a") as se:
-        se.write(f"--- pi launch label {label} model {model} at {started}\n")
-        se.flush()
-        if requested and resume is None:
-            se.write(f"resume: {requested} is missing or empty; starting fresh\n")
+    guard = repeat_guard.RepetitionGuard() if repeat_guard.enabled() else None
+    state = {"trip": None, "stopped": False, "pid": None, "live": False}
+
+    def on_trip(found):
+        if not state["live"]:
+            return
+        state["trip"] = found
+        state["stopped"] = repeat_guard.stop_child(state["pid"])
+
+    def on_start(run):
+        state["pid"] = getattr(getattr(run, "proc", None), "pid", None)
+        state["live"] = True
+
+    watcher = None
+    if guard is not None:
+        watcher = repeat_guard.StreamWatcher(
+            stream, guard, on_trip, poll_s=repeat_guard.poll_interval()
+        ).start()
+    rc = 0
+    try:
+        with open(err, "a") as se:
+            se.write(f"--- pi launch label {label} model {model} at {started}\n")
             se.flush()
-        if resume is not None:
-            rc = run_pi(build_resume_argv(resume, out, model, local_prompt, extension, thinking), stream, workspace, se)
-            if pi_refused_resume(rc, stream):
-                se.write(f"resume: pi refused {resume} (exit {rc}, no output); starting fresh\n")
+            if requested and resume is None:
+                se.write(f"resume: {requested} is missing or empty; starting fresh\n")
                 se.flush()
-                resume = None
-            else:
-                resumed_from = str(resume)
-        if resume is None:
-            rc = run_pi(build_argv(label, workspace, local_prompt, out, model, extension, thinking), stream, workspace, se)
+            if resume is not None:
+                rc = run_pi(
+                    build_resume_argv(resume, out, model, local_prompt, extension, thinking),
+                    stream, workspace, se, on_start,
+                )
+                state["live"] = False
+                if not state["stopped"] and pi_refused_resume(rc, stream):
+                    se.write(f"resume: pi refused {resume} (exit {rc}, no output); starting fresh\n")
+                    se.flush()
+                    resume = None
+                else:
+                    resumed_from = str(resume)
+            if resume is None and not state["stopped"]:
+                rc = run_pi(
+                    build_argv(label, workspace, local_prompt, out, model, extension, thinking),
+                    stream, workspace, se, on_start,
+                )
+                state["live"] = False
+            if state["stopped"]:
+                se.write(f"repetition guard: stopped the run, {state['trip'].summary()}\n")
+                se.flush()
+    finally:
+        if watcher is not None:
+            watcher.stop()
+    trip = state["trip"] if state["stopped"] else None
     try:
         os.unlink(out / run_id)
     except FileNotFoundError:
@@ -688,14 +740,20 @@ def main(argv=None):
     text = pi_source.final_text(raw)
     ended = int(time.time())
 
+    if trip is not None:
+        text = repeat_guard.report(trip, label, model, stream)
     (out / f"out-{label}.md").write_text(text if text.strip() else "", encoding="utf-8")
+    if trip is not None:
+        (out / "report.md").write_text(text, encoding="utf-8")
     manifest = out / "pi-sessions.tsv"
     with open(manifest, "a", encoding="utf-8") as fh:
         if manifest.stat().st_size == 0:
             fh.write("label\tsession_id\tstarted_epoch\tmodel\ttier\n")
         fh.write(f"{label}\t{sid}\t{started}\t{model}\t{tier}\n")
 
-    if quota:
+    if trip is not None:
+        verdict, status = "BLOCKED", "done"
+    elif quota:
         (out / f"QUOTA-{label}").write_text(f"model\t{model}\nlabel\t{label}\n", encoding="utf-8")
         verdict, status = "BLOCKED", "died_early"
     else:
@@ -740,7 +798,10 @@ def main(argv=None):
         f"launched pi {label} model {model} status {status} verdict {verdict}"
         f" rate_limit_retries={retries}"
         + (f" resumed_from={resumed_from}" if resumed_from else "")
+        + (f" stopped={trip.summary()}" if trip is not None else "")
     )
+    if trip is not None:
+        return 0
     return 0 if status == "done" and rc == 0 else 1
 
 

@@ -13,7 +13,10 @@ os.environ["AGENT_DASH_IGNORE_LOCAL"] = "1"
 import builtins
 import importlib.util
 import json
+import subprocess
 import tempfile
+import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +30,8 @@ sys.path.insert(0, str(ROOT))
 
 from dash import pricing  # noqa: E402
 from dash.models import model_key, run_model_key  # noqa: E402
+from agentq import broker  # noqa: E402
+from agentq import repetition_guard as repeat_guard  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("dash_sources_pi", ROOT / "dash" / "sources" / "pi.py")
 pi = importlib.util.module_from_spec(SPEC)
@@ -85,6 +90,24 @@ class Store:
 
     def get_run(self, run_id):
         return self.runs.get(run_id)
+
+
+class FakeRun:
+    """A stand-in for logfilter's run object: a child pid, its exit code, and a hold.
+
+    ``hold_s`` is the child's lifetime: ``wait`` sleeps that long, so a guard
+    watching the stream has the same window a live child would give it.
+    """
+
+    def __init__(self, rc=0, pid=None, hold_s=0.0):
+        self.rc = rc
+        self.hold_s = hold_s
+        self.proc = types.SimpleNamespace(pid=pid)
+
+    def wait(self):
+        if self.hold_s:
+            time.sleep(self.hold_s)
+        return self.rc
 
 
 class ParserTest(unittest.TestCase):
@@ -285,7 +308,7 @@ class LauncherQuotaMarkerTest(unittest.TestCase):
         patches = [
             mock.patch.object(launch, "state_dir", return_value=self.state),
             mock.patch.object(launch, "register_run_dir", return_value=None),
-            mock.patch.object(launch.logfilter, "run_filtered", return_value=0),
+            mock.patch.object(launch.logfilter, "start_filtered", return_value=FakeRun(0)),
         ]
         for patch in patches:
             patch.start()
@@ -345,7 +368,7 @@ class LauncherResumeTest(unittest.TestCase):
             mock.patch.object(launch, "register_run_dir", return_value=None),
             mock.patch.object(launch, "report_lines", side_effect=lambda state, lines: self.captured.extend(lines)),
             mock.patch.object(launch, "quota_hit", return_value=False),
-            mock.patch.object(launch.logfilter, "run_filtered", side_effect=self.fake_pi),
+            mock.patch.object(launch.logfilter, "start_filtered", side_effect=self.fake_pi),
         ]
         for patch in patches:
             patch.start()
@@ -362,7 +385,7 @@ class LauncherResumeTest(unittest.TestCase):
         self.calls.append(list(argv))
         rc = self.results[min(len(self.calls), len(self.results)) - 1]
         Path(stream_path).write_bytes(b"")
-        return rc
+        return FakeRun(rc)
 
     def run_launcher(self, label="ws1-exec-lane-7"):
         return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
@@ -1460,7 +1483,7 @@ class BriefAndPilotTest(unittest.TestCase):
             mock.patch.object(launch, "register_run_dir", return_value=None),
             mock.patch.object(launch, "report_lines", return_value=None),
             mock.patch.object(launch, "quota_hit", return_value=False),
-            mock.patch.object(launch.logfilter, "run_filtered", side_effect=self.fake_pi),
+            mock.patch.object(launch.logfilter, "start_filtered", side_effect=self.fake_pi),
         ]
         for patch in patches:
             patch.start()
@@ -1476,7 +1499,7 @@ class BriefAndPilotTest(unittest.TestCase):
     def fake_pi(self, argv, stream_path, **kwargs):
         self.calls.append(list(argv))
         Path(stream_path).write_bytes(b"")
-        return 0
+        return FakeRun(0)
 
     def write_config(self, fraction=0.5, extension=None):
         config = {"compaction_extension": str(extension or self.extension), "fraction": fraction}
@@ -1577,6 +1600,305 @@ class BriefAndPilotTest(unittest.TestCase):
         name, arm, started = rows[0].split("\t")
         self.assertEqual((name, arm), (label, "ext"))
         self.assertTrue(started.isdigit())
+
+
+def tool_call(command="ls", tool="bash"):
+    """One ``tool_execution_start`` event, the shape the guard keys on."""
+    return {"type": "tool_execution_start", "toolName": tool, "args": {"command": command}}
+
+
+def stream_lines(events):
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+class RepetitionGuardTest(unittest.TestCase):
+    """The guard trips on a loop and never on a run that keeps moving."""
+
+    def guard(self, **limits):
+        return repeat_guard.RepetitionGuard(repeat_guard.Limits(**limits))
+
+    def feed(self, guard, events):
+        trip = None
+        for event in events:
+            trip = guard.observe(event) or trip
+        return trip
+
+    def test_a_looping_stream_trips_on_the_run_limit(self):
+        guard = self.guard()
+        trip = self.feed(guard, [tool_call("grep -n index f.py")] * 8)
+        self.assertIsNotNone(trip)
+        self.assertEqual(trip.kind, "repeat")
+        self.assertEqual(trip.run, 8)
+        self.assertEqual(trip.tool, "bash")
+        self.assertIn("grep -n index f.py", trip.args)
+        self.assertEqual(trip.calls, 8)
+
+    def test_seven_identical_calls_do_not_trip(self):
+        guard = self.guard()
+        self.assertIsNone(self.feed(guard, [tool_call("grep -n index f.py")] * 7))
+
+    def test_a_non_looping_stream_never_trips(self):
+        guard = self.guard()
+        events = [tool_call(f"sed -n '{n},{n + 20}p' f.py") for n in range(200)]
+        events += [{"type": "compaction_start"}] * 3
+        self.assertIsNone(self.feed(guard, events))
+        self.assertEqual(guard.calls, 200)
+        self.assertEqual(guard.compactions, 3)
+
+    def test_the_window_catches_an_alternating_loop(self):
+        guard = self.guard()
+        events = [tool_call("a"), tool_call("b")] * 12
+        trip = self.feed(guard, events)
+        self.assertIsNotNone(trip)
+        self.assertEqual(trip.kind, "repeat")
+        self.assertEqual(trip.count, 12)
+        self.assertEqual(trip.run, 1)
+
+    def test_compactions_trip_the_guard(self):
+        guard = self.guard()
+        trip = self.feed(guard, [{"type": "compaction_start"}] * 20)
+        self.assertIsNotNone(trip)
+        self.assertEqual(trip.kind, "compactions")
+        self.assertEqual(trip.compactions, 20)
+        self.assertIn("compacted 20 times", trip.summary())
+
+    def test_the_trip_is_stable_after_more_events(self):
+        guard = self.guard()
+        first = self.feed(guard, [tool_call("a")] * 8)
+        again = guard.observe(tool_call("b"))
+        self.assertIs(first, again)
+        self.assertEqual(guard.calls, 8)
+
+    def test_limits_come_from_the_environment(self):
+        environ = {
+            repeat_guard.RUN_ENV: "3",
+            repeat_guard.COUNT_ENV: "4",
+            repeat_guard.WINDOW_ENV: "10",
+            repeat_guard.COMPACTIONS_ENV: "2",
+        }
+        limits = repeat_guard.Limits.from_env(environ)
+        self.assertEqual((limits.run, limits.count, limits.window, limits.compactions), (3, 4, 10, 2))
+        guard = repeat_guard.RepetitionGuard(limits)
+        self.assertIsNotNone(self.feed(guard, [tool_call("a")] * 3))
+
+    def test_a_bad_environment_value_falls_back_to_the_default(self):
+        limits = repeat_guard.Limits.from_env({repeat_guard.RUN_ENV: "zero", repeat_guard.WINDOW_ENV: "-4"})
+        self.assertEqual(limits.run, repeat_guard.DEFAULT_RUN)
+        self.assertEqual(limits.window, repeat_guard.DEFAULT_WINDOW)
+
+    def test_the_guard_is_off_with_the_switch(self):
+        self.assertFalse(repeat_guard.enabled({repeat_guard.OFF_ENV: "0"}))
+        self.assertTrue(repeat_guard.enabled({}))
+
+    def test_the_poll_interval_comes_from_the_environment(self):
+        self.assertEqual(repeat_guard.poll_interval({repeat_guard.POLL_ENV: "0.25"}), 0.25)
+        self.assertEqual(repeat_guard.poll_interval({repeat_guard.POLL_ENV: "soon"}), repeat_guard.POLL_S)
+
+    def test_the_report_opens_with_blocked_and_names_the_call(self):
+        guard = self.guard()
+        trip = self.feed(guard, [tool_call("grep -n index f.py")] * 8)
+        text = repeat_guard.report(trip, "ws1-exec-lane-1", DEEPSEEK, "/tmp/stream.ndjson")
+        self.assertTrue(text.startswith("BLOCKED: pi repeated one tool call 8 times in a row"))
+        self.assertIn("`ws1-exec-lane-1`", text)
+        self.assertIn("grep -n index f.py", text)
+        self.assertIn("identical calls in a row: 8", text)
+        self.assertIn("/tmp/stream.ndjson", text)
+        self.assertEqual(broker.verdict_of(text), "BLOCKED")
+        self.assertFalse(broker.tiny_verdictless(text))
+
+    def test_the_window_report_names_the_window_not_a_run(self):
+        guard = self.guard()
+        trip = self.feed(guard, [tool_call("a"), tool_call("b")] * 12)
+        text = repeat_guard.report(trip, "ws1-exec-lane-1", DEEPSEEK)
+        self.assertTrue(text.startswith("BLOCKED: pi repeated one tool call 12 times in the last 30"))
+        self.assertIn("identical calls in the last 30: 12", text)
+        self.assertEqual(broker.verdict_of(text), "BLOCKED")
+
+    def test_the_compaction_report_opens_with_blocked(self):
+        guard = self.guard()
+        trip = self.feed(guard, [{"type": "compaction_start"}] * 20)
+        text = repeat_guard.report(trip, "ws1-exec-lane-1", DEEPSEEK)
+        self.assertTrue(text.startswith("BLOCKED: pi compacted its context 20 times"))
+        self.assertEqual(broker.verdict_of(text), "BLOCKED")
+
+    def test_stop_child_reports_a_gone_pid(self):
+        self.assertFalse(repeat_guard.stop_child(None))
+        self.assertFalse(repeat_guard.stop_child(2 ** 22 + 12345))
+
+    def test_stop_child_kills_a_live_child(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            self.assertTrue(repeat_guard.stop_child(proc.pid, grace_s=5.0))
+            self.assertIsNotNone(proc.wait(timeout=10))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+class StreamWatcherTest(unittest.TestCase):
+    """The watcher tails a growing stream file and trips once, on the guard's answer."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "stream.ndjson"
+        self.trips = []
+
+    def watcher(self, guard=None):
+        guard = guard or repeat_guard.RepetitionGuard()
+        return repeat_guard.StreamWatcher(self.path, guard, self.trips.append, poll_s=0.01)
+
+    def wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_a_looping_stream_file_trips_the_watcher_once(self):
+        watcher = self.watcher().start()
+        self.addCleanup(watcher.stop)
+        self.path.write_text(stream_lines([tool_call("grep -n index f.py")] * 8), encoding="utf-8")
+        self.assertTrue(self.wait_for(lambda: self.trips))
+        self.assertEqual(len(self.trips), 1)
+        self.assertEqual(self.trips[0].run, 8)
+        self.assertIs(watcher.trip, self.trips[0])
+
+    def test_a_non_looping_stream_file_does_not_trip(self):
+        watcher = self.watcher().start()
+        self.addCleanup(watcher.stop)
+        self.path.write_text(
+            stream_lines([tool_call(f"sed -n '{n},{n + 20}p' f.py") for n in range(100)]),
+            encoding="utf-8",
+        )
+        self.assertFalse(self.wait_for(lambda: self.trips, timeout=0.5))
+        self.assertIsNone(watcher.trip)
+
+    def test_a_partial_last_line_waits_for_its_newline(self):
+        watcher = self.watcher().start()
+        self.addCleanup(watcher.stop)
+        line = json.dumps(tool_call("grep -n index f.py"))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("".join(line + "\n" for _ in range(7)) + line[:20])
+            fh.flush()
+        self.assertFalse(self.wait_for(lambda: self.trips, timeout=0.3))
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(line[20:] + "\n")
+        self.assertTrue(self.wait_for(lambda: self.trips))
+
+    def test_a_truncated_file_is_read_from_the_start(self):
+        self.path.write_text(stream_lines([tool_call("a")] * 3), encoding="utf-8")
+        watcher = self.watcher().start()
+        self.addCleanup(watcher.stop)
+        self.assertTrue(self.wait_for(lambda: watcher.guard.calls == 3))
+        self.path.write_text(stream_lines([tool_call("b")] * 2), encoding="utf-8")
+        self.assertTrue(self.wait_for(lambda: watcher.guard.calls == 5))
+
+    def test_a_missing_file_is_waited_for(self):
+        watcher = self.watcher().start()
+        self.addCleanup(watcher.stop)
+        time.sleep(0.05)
+        self.path.write_text(stream_lines([tool_call("a")] * 8), encoding="utf-8")
+        self.assertTrue(self.wait_for(lambda: self.trips))
+
+
+class LauncherRepetitionGuardTest(unittest.TestCase):
+    """launch_pi stops a looping run and writes a BLOCKED report the broker reads as a finish."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        self.ws = root / "ws"
+        self.ws.mkdir()
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("do the task\n", encoding="utf-8")
+        self.outdir = root / "pi"
+        self.calls = []
+        self.captured = []
+        self.stream_text = ""
+        self.hold_s = 0.0
+        self.rc = 1
+        patches = [
+            mock.patch.object(launch, "state_dir", return_value=self.state),
+            mock.patch.object(launch, "register_run_dir", return_value=None),
+            mock.patch.object(launch, "report_lines", side_effect=lambda state, lines: self.captured.extend(lines)),
+            mock.patch.object(launch, "quota_hit", return_value=False),
+            mock.patch.object(launch.logfilter, "start_filtered", side_effect=self.fake_pi),
+            mock.patch.object(launch.repeat_guard, "stop_child", return_value=True),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        env = mock.patch.dict(
+            os.environ,
+            {repeat_guard.POLL_ENV: "0.01", repeat_guard.OFF_ENV: "1"},
+            clear=False,
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(launch.RESUME_ENV, None)
+
+    def fake_pi(self, argv, stream_path, **kwargs):
+        self.calls.append(list(argv))
+        Path(stream_path).write_text(self.stream_text, encoding="utf-8")
+        return FakeRun(self.rc, hold_s=self.hold_s)
+
+    def run_launcher(self, label="ws1-exec-lane-11"):
+        return launch.main([label, str(self.ws), str(self.prompt), str(self.outdir), "--model", DEEPSEEK])
+
+    def out_text(self, label="ws1-exec-lane-11"):
+        return (self.outdir / f"out-{label}.md").read_text(encoding="utf-8")
+
+    def test_a_looping_run_is_stopped_with_a_blocked_report(self):
+        self.stream_text = stream_lines([tool_call("grep -n index f.py")] * 8)
+        self.hold_s = 0.5
+        self.assertEqual(self.run_launcher(), 0)
+        text = self.out_text()
+        self.assertTrue(text.startswith("BLOCKED: pi repeated one tool call 8 times in a row"))
+        self.assertEqual(broker.verdict_of(text), "BLOCKED")
+        self.assertEqual((self.outdir / "report.md").read_text(encoding="utf-8"), text)
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertEqual((run["status"], run["verdict"]), ("done", "BLOCKED"))
+        self.assertIn("repetition guard: stopped the run", (self.outdir / "err-ws1-exec-lane-11.log").read_text())
+
+    def test_a_clean_run_keeps_its_own_report(self):
+        self.stream_text = stream_lines(
+            [tool_call(f"sed -n '{n},{n + 20}p' f.py") for n in range(40)]
+            + [{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "PASS: done"}]}}]
+        )
+        self.hold_s = 0.2
+        self.rc = 0
+        self.assertEqual(self.run_launcher(), 0)
+        self.assertIn("PASS", self.out_text())
+        self.assertFalse((self.outdir / "report.md").exists())
+        run = [line for line in self.captured if line.get("type") == "run"][-1]
+        self.assertEqual(run["verdict"], "PASS")
+
+    def test_the_guard_can_be_turned_off(self):
+        os.environ[repeat_guard.OFF_ENV] = "0"
+        self.stream_text = stream_lines([tool_call("grep -n index f.py")] * 8)
+        self.hold_s = 0.2
+        self.rc = 0
+        self.run_launcher()
+        self.assertFalse(self.out_text().startswith("BLOCKED"))
+        self.assertFalse((self.outdir / "report.md").exists())
+
+    def test_a_stopped_resume_is_not_relaunched_fresh(self):
+        old = Path(self.tmp.name) / "old.jsonl"
+        old.write_text('{"type":"session"}\n', encoding="utf-8")
+        os.environ[launch.RESUME_ENV] = str(old)
+        self.stream_text = stream_lines([tool_call("grep -n index f.py")] * 8)
+        self.hold_s = 0.5
+        self.assertEqual(self.run_launcher(), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("--fork", self.calls[0])
+        self.assertTrue(self.out_text().startswith("BLOCKED"))
 
 
 if __name__ == "__main__":
