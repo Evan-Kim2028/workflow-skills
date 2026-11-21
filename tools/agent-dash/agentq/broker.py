@@ -68,6 +68,7 @@ from agentq import fill as fill_lib
 from agentq import filler as filler_lib
 from agentq import headroom as headroom_lib
 from agentq import janitor as janitor_lib
+from agentq import verdict as verdict_lib
 
 TICK_S = 2.0
 BACKLOG_RETRY_S = 300.0
@@ -115,7 +116,7 @@ LAUNCH_TIMEOUT_S = 120.0
 MAX_CONCURRENT_LAUNCHES = 8
 LAPTOP_GATED = ("tests", "light")
 memory_free_pct = headroom_lib.memory_free_pct
-VERDICT_LINE = re.compile(r"^\W*(?:verdict\W*)?(PASS|PARTIAL|BLOCKED)\b", re.IGNORECASE)
+NO_VERDICT_DETAIL = "no verdict line in report"
 RATE_LIMIT_BODY = re.compile(r"\b429\b\s*[:\-]?\s*\{|Rate limit exceeded", re.IGNORECASE)
 LAUNCH_LINE_PREFIX = "launched "
 AGENT_DASH_LABEL = Path(__file__).resolve().parents[1] / "agent_dash.py"
@@ -754,17 +755,15 @@ class ProxyHealer:
 
 
 def verdict_of(text: str) -> str:
-    """Verdict from the last line that opens with PASS, PARTIAL or BLOCKED, else ``none``.
+    """Verdict from the first line that opens with a verdict word, else ``none``.
 
-    A line may open with ``verdict`` (any case) before the word, and trailing text
-    is ignored: ``PASS (no BLOCKED items)`` reads PASS.
+    The words and the matching rules live in ``agentq.verdict``: ``PASS``,
+    ``PARTIAL`` and ``BLOCKED`` for a work job, ``APPROVE``,
+    ``APPROVE_WITH_CHANGES``, ``REQUEST_CHANGES`` and ``REJECT`` for a review.
+    A line may open with ``verdict`` (any case) before the word, and trailing
+    text is ignored: ``PASS (no BLOCKED items)`` reads PASS.
     """
-    verdict = "none"
-    for line in text.splitlines():
-        match = VERDICT_LINE.match(line.strip())
-        if match:
-            verdict = match.group(1).upper()
-    return verdict
+    return verdict_lib.verdict_of(text) or "none"
 
 
 def _read(path) -> str:
@@ -1849,11 +1848,16 @@ class Broker:
             filler_lib.index_job(conn, job["id"], now, text=text)
         verdict = verdict_of(text)
         note = "; ".join(part for part in (note, worktree_note(job)) if part)
-        self._move(
-            conn, job["id"], ("running",), now, "finish", f"verdict {verdict}" + (f"; {note}" if note else ""),
-            state="done", verdict=verdict, report_path=str(dest), finished_at=now,
-            pi_session=pi_session_of(job["run_dir"], job["label"]) or job["pi_session"],
-        )  # fmt: skip
+        detail = f"verdict {verdict}" + (f"; {note}" if note else "")
+        fields = {
+            "state": "done", "verdict": verdict, "report_path": str(dest), "finished_at": now,
+            "pi_session": pi_session_of(job["run_dir"], job["label"]) or job["pi_session"],
+        }  # fmt: skip
+        if verdict == "none":
+            # A silent ``none`` hides a report that never stated a verdict; the job
+            # detail says so, so ``agentq ls`` and ``agentq result`` show it.
+            fields["detail"] = f"{detail}; {NO_VERDICT_DETAIL}"
+        self._move(conn, job["id"], ("running",), now, "finish", detail, **fields)
 
     def _retry_indexing(self, conn, now: float) -> None:
         """Index finished filler jobs whose findings failed to index earlier. Tried at most once a minute."""

@@ -90,6 +90,13 @@ worker, name it in your report; the lead submits it.
 - Report: start with a verdict line, `PASS`, `PARTIAL` (list what was not
   covered or compared), or `BLOCKED`. Cite `file:line`, list exact test
   commands with pass/fail counts, and state what was not done.
+- Review jobs: the verdict line is one of `APPROVE`, `APPROVE_WITH_CHANGES`,
+  `REQUEST_CHANGES` or `REJECT`, and it is the first line of the report (for
+  example `**Verdict: REQUEST_CHANGES.**`). The broker stores that word
+  verbatim. The parser reads the first verdict-looking line, case-insensitive,
+  with or without bold, a colon or a `Verdict:` label; a report with no such
+  line is recorded as `none` and its job detail says "no verdict line in
+  report".
 - Data access, efficient by default (owner rule, 2026-10-30):
   - Postgres: one set-based query per question, never a loop of per-batch
     or per-id queries (36 batches of 200 ids re-scanned a 5.7 GB table 36

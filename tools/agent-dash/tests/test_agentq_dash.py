@@ -777,6 +777,23 @@ class BucketAndTotalsTest(unittest.TestCase):
         self.assertEqual(totals["finished"], {"PASS": 1, "PARTIAL": 0, "FAIL": 0})
         self.assertEqual(totals["tokens"]["output"], 7000 + 100 + 500000 + 5)
 
+    def test_finished_totals_fold_review_verdicts_into_the_three_buckets(self) -> None:
+        totals = dash.finished_totals(
+            {
+                "PASS": 2,
+                "APPROVE": 3,
+                "APPROVE_WITH_CHANGES": 4,
+                "APPROVE_WITH_NITS": 1,
+                "PARTIAL": 5,
+                "REQUEST_CHANGES": 6,
+                "REJECT": 7,
+                "BLOCKED": 8,
+                "DEAD": 9,
+                "none": 10,
+            }
+        )
+        self.assertEqual(totals, {"PASS": 2 + 3 + 4 + 1, "PARTIAL": 5 + 6 + 7, "FAIL": 0})
+
     def test_runs_started_counts_runs_whose_start_is_inside_the_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = make_runs_home(Path(tmp))

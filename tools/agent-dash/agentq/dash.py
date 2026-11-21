@@ -33,6 +33,12 @@ from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
+# This module runs as a script from its own folder (the launchd plist names
+# ``agentq/dash.py``), so the package root is not on the path yet. The verdict
+# vocabulary and its buckets live in ``agentq.verdict``, shared with the broker.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from agentq import verdict as verdict_lib  # noqa: E402
+
 DEFAULT_PORT = 18791
 DEFAULT_HOME = "~/.local/state/agentq"
 PROXY_STATUS_URL = "http://127.0.0.1:18790/agentq/status"
@@ -457,7 +463,7 @@ td.wrap .cont { color: var(--ink-3); display: block; }
     <section class="panel" aria-labelledby="g-runs">
       <h3 class="group" id="g-runs">Work, <span class="rng">last 6 h</span></h3>
       <div class="kpis">
-        <div class="kpi"><div class="label">Finished, <span class="rng">last 6 h</span></div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL</div></div>
+        <div class="kpi"><div class="label">Finished, <span class="rng">last 6 h</span></div><div class="value sm" id="r-finished">—</div><div class="note">PASS / PARTIAL / FAIL, review words folded in</div></div>
         <div class="kpi"><div class="label">Tokens, <span class="rng">last 6 h</span></div><div class="value" id="r-tokens">—</div><div class="note">all runs, billed</div></div>
         <div class="kpi"><div class="label">429s absorbed, <span class="rng">last 6 h</span></div><div class="value" id="r-429">—</div><div class="note">retried by the proxy</div></div>
       </div>
@@ -2621,6 +2627,22 @@ def bucket_workers(samples: list[dict], size: int) -> list[dict]:
     return rows
 
 
+def finished_totals(verdicts: dict[str, int]) -> dict[str, int]:
+    """PASS / PARTIAL / FAIL totals from a verdict-to-count map.
+
+    Review verdicts fold in through ``agentq.verdict.bucket``: ``APPROVE``,
+    ``APPROVE_WITH_CHANGES`` and ``APPROVE_WITH_NITS`` count as PASS, and
+    ``REQUEST_CHANGES`` and ``REJECT`` as PARTIAL. ``BLOCKED``, ``DEAD`` (a
+    failed job) and ``none`` stay out of the three totals, as before.
+    """
+    totals = {verdict: 0 for verdict in VERDICTS}
+    for verdict, count in verdicts.items():
+        bucket = verdict_lib.bucket(verdict)
+        if bucket in totals:
+            totals[bucket] += int(count)
+    return totals
+
+
 def range_totals(raw: dict[int, dict], since: int, until: int, runs: list[dict], verdicts: dict[str, int]) -> dict:
     """Totals over the selected range: tokens by kind, requests, 429s absorbed, runs started and queue verdicts finished."""
     rows = [raw[t] for t in range(since, until, 60) if t in raw]
@@ -2639,7 +2661,7 @@ def range_totals(raw: dict[int, dict], since: int, until: int, runs: list[dict],
         "r429": total("r429"),
         "ds_output": total("ds_output"),
         "runs_started": sum(1 for run in runs if run["started"] is not None and since <= run["started"] < until),
-        "finished": {verdict: int(verdicts.get(verdict, 0)) for verdict in VERDICTS},
+        "finished": finished_totals(verdicts),
     }
 
 
