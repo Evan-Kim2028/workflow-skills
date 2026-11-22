@@ -662,6 +662,19 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(rows["ws2"]["live_only_rows"], 0)
         self.assertIn("live-only: 1 rows", out.getvalue())
 
+    def test_live_only_rows_copied_across_verify(self):
+        """After cutover's copy step the rebuilt store holds the live-only rows: not a gap."""
+        old, new = FakeClient(), FakeClient()
+        rows = [json.dumps(self._row("ws1", "u1")), json.dumps(self._row("ws1", "un-archived"))]
+        old.insert(rows)
+        new.insert(rows)
+        out = io.StringIO()
+        ok, table = storebuild.verify(old, new, out=out, expected_paths={"u1"})
+        self.assertTrue(ok, out.getvalue())
+        self.assertEqual(table[0]["live_only_rows"], 0)
+        self.assertEqual(table[0]["expected_rows"], 2)
+        self.assertEqual(table[0]["new_rows"], 2)
+
     def test_a_short_rebuild_fails(self):
         old = FakeClient()
         old.insert([json.dumps(self._row("ws1", "u1")), json.dumps(self._row("ws1", "u2"))])
