@@ -343,6 +343,12 @@ class GcCommandTest(unittest.TestCase):
             "PATH": os.environ["PATH"],
         }
         self.client = FakeClient()
+        # Default the store client to the fake, so no test can post to the live
+        # VictoriaLogs on 127.0.0.1:19428 (one did: agentq/jobs/a1b2c3d4e5f0/...).
+        # A test that patches its own client inside the test still wins.
+        patcher = mock.patch("dash.logarchive.vlogs.VLogsClient", lambda url: self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def insert_job(self, job_id: str, state: str, finished_at) -> None:
         conn = db.connect(self.home)
