@@ -75,6 +75,41 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(sb.human_days(400), "400 d")
         self.assertEqual(sb.human_days(812), "2.2 y")
 
+    def test_the_report_shows_on_disk_and_apparent(self):
+        components = {
+            name: {"bytes": 0, "physical": 0, "units": 0} for name, _label in sb.COMPONENTS
+        }
+        components["worktrees"] = {
+            "bytes": 4 * GIB,
+            "physical": 1 * GIB,
+            "units": 10,
+            "count": 3,
+            "idle_hours": 50.0,
+            "idle_path": "/w/old",
+        }
+        sample = {
+            "ts": 1000.0,
+            "iso": sb.iso(1000.0),
+            "disk": {"path": "/d", "total": 10 * GIB, "used": 1 * GIB, "free": 9 * GIB, "pct": 10.0},
+            "components": components,
+            "footprint": 4 * GIB,
+            "footprint_physical": 1 * GIB,
+        }
+        payload = {
+            "state": "ok",
+            "sample": sample,
+            "growth": {"components": {}, "footprint": 1.0, "footprint_logical": 4.0, "span_days": 2.0},
+            "projection": {"days": {"70": 10.0, "78": 20.0, "85": 30.0}, "rate_bytes_per_day": 1.0},
+        }
+        buf = io.StringIO()
+        sb.format_report(payload, out=buf)
+        text = buf.getvalue()
+        self.assertIn("on disk", text)
+        self.assertIn("apparent", text)
+        self.assertIn("git worktrees", text)
+        self.assertIn("worktrees: 3, oldest idle 50 h (/w/old)", text)
+        self.assertIn("apparent rate", text)
+
 
 class MeasureTest(unittest.TestCase):
     def setUp(self):
@@ -103,39 +138,160 @@ class MeasureTest(unittest.TestCase):
         self._write(self.agentq / "jobs" / "j1" / "out.log", 700)
         self._write(self.scratch / "ws" / "big.bin", 900)
         self._write(self.originals / "s" / "a.jsonl", 100)
+        worktrees = {"bytes": 4000, "physical": 1000, "units": 3, "count": 2, "idle_hours": 5.0}
         with mock.patch.object(sb, "_archive_dest", lambda cfg=None: self.dest), mock.patch.object(
             sb, "_originals_roots", lambda: [str(self.originals)]
         ), mock.patch.object(sb, "_scratch_root", lambda: self.scratch), mock.patch.object(
             sb, "_agentq_home", lambda: self.agentq
-        ), mock.patch.object(sb, "_state_dir", lambda cfg=None: self.state):
+        ), mock.patch.object(sb, "_state_dir", lambda cfg=None: self.state), mock.patch.object(
+            sb, "_worktrees", lambda now: dict(worktrees)
+        ):
             sample = sb.measure(metrics={"compressed": 10_000, "uncompressed": 60_000}, now=1000.0)
         comp = sample["components"]
         self.assertEqual(comp["vlogs_compressed"]["bytes"], 10_000)
+        self.assertEqual(comp["vlogs_compressed"]["physical"], 10_000)
         self.assertEqual(comp["vlogs_uncompressed"]["bytes"], 60_000)
-        self.assertEqual(comp["session_archive"], {"bytes": 1500, "units": 2})
-        self.assertEqual(comp["session_manifest"], {"bytes": 500, "units": 2})
-        self.assertEqual(comp["log_archive"], {"bytes": 400, "units": 1})
-        self.assertEqual(comp["agentq_jobs"], {"bytes": 700, "units": 1})
-        self.assertEqual(comp["scratch"], {"bytes": 900, "units": 1})
-        self.assertEqual(comp["session_originals"], {"bytes": 100, "units": 1})
-        self.assertEqual(sample["footprint"], 10_000 + 1500 + 500 + 400 + 700 + 900 + 100)
+        self.assertEqual((comp["session_archive"]["bytes"], comp["session_archive"]["units"]), (1500, 2))
+        self.assertEqual((comp["session_manifest"]["bytes"], comp["session_manifest"]["units"]), (500, 2))
+        self.assertEqual((comp["log_archive"]["bytes"], comp["log_archive"]["units"]), (400, 1))
+        self.assertEqual((comp["agentq_jobs"]["bytes"], comp["agentq_jobs"]["units"]), (700, 1))
+        self.assertEqual((comp["scratch"]["bytes"], comp["scratch"]["units"]), (900, 1))
+        self.assertEqual((comp["session_originals"]["bytes"], comp["session_originals"]["units"]), (100, 1))
+        self.assertEqual(comp["worktrees"]["count"], 2)
+        self.assertEqual(sample["footprint"], 10_000 + 1500 + 500 + 400 + 700 + 900 + 4000 + 100)
+        self.assertEqual(sample["footprint_physical"], 10_000 + 1500 + 500 + 400 + 700 + 900 + 1000 + 100)
         self.assertGreater(sample["disk"]["total"], 0)
         self.assertEqual(sample["iso"], "1970-01-01T00:16:40Z")
 
     def test_walk_false_skips_the_trees(self):
         sample = sb.measure(metrics={"compressed": 5, "uncompressed": 9}, walk=False, now=1.0)
         self.assertEqual(sample["components"]["session_archive"]["bytes"], 0)
+        self.assertEqual(sample["components"]["worktrees"]["physical"], 0)
         self.assertEqual(sample["footprint"], 5)
+        self.assertEqual(sample["footprint_physical"], 5)
 
     def test_a_missing_tree_is_zero_not_an_error(self):
-        self.assertEqual(sb._dir_bytes(self.home / "nope"), (0, 0))
-        self.assertEqual(sb._file_bytes(self.home / "nope"), (0, 0))
-        self.assertEqual(sb._glob_bytes(self.home / "nope", "**/*.zst"), (0, 0))
+        self.assertEqual(sb._tree(self.home / "nope")["bytes"], 0)
+        self.assertEqual(sb._tree(self.home / "nope")["units"], 0)
+        self.assertEqual(sb._file_tree(self.home / "nope")["bytes"], 0)
+        self.assertEqual(sb._glob_tree(self.home / "nope", "**/*.zst")["bytes"], 0)
 
     def test_a_symlink_is_not_followed(self):
         self._write(self.home / "real" / "a.bin", 100)
         os.symlink(self.home / "real", self.home / "link")
-        self.assertEqual(sb._dir_bytes(self.home / "link"), (0, 0))
+        self.assertEqual(sb._tree(self.home / "link")["bytes"], 0)
+
+    def test_a_small_file_is_counted_at_its_apparent_size(self):
+        self._write(self.home / "small.bin", 1000)
+        tree = sb._tree(self.home)
+        self.assertEqual(tree["bytes"], 1000)
+        self.assertEqual(tree["physical"], 1000)
+        self.assertEqual(tree["small"], 1)
+        self.assertEqual(tree["probed"], 0)
+
+    def test_a_deep_tree_is_walked_once(self):
+        # The walk shares a directory queue between threads; a deep tree with
+        # more directories than threads must still be counted exactly once.
+        for i in range(40):
+            self._write(self.home / f"d{i}" / f"e{i}" / "f.bin", 10)
+        tree = sb._tree(self.home)
+        self.assertEqual(tree["units"], 40)
+        self.assertEqual(tree["bytes"], 400)
+        self.assertEqual(tree["physical"], 400)
+
+    def test_an_unprobeable_file_falls_back_to_apparent(self):
+        self._write(self.home / "big.bin", sb.PHYSICAL_MIN_BYTES + 1)
+        with mock.patch.object(sb, "_extent_offset", lambda path: None):
+            tree = sb._tree(self.home)
+        self.assertEqual(tree["physical"], sb.PHYSICAL_MIN_BYTES + 1)
+        self.assertEqual(tree["probed"], 0)
+
+    def test_extent_offset_is_none_when_the_open_fails(self):
+        with mock.patch.object(sb.os, "open", side_effect=OSError("nope")):
+            self.assertIsNone(sb._extent_offset(str(self.home / "x")))
+
+    @unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+    def test_a_clone_is_counted_once_on_disk(self):
+        import subprocess
+
+        self._write(self.home / "a.bin", 2 * 1024 * 1024)
+        subprocess.run(["cp", "-c", str(self.home / "a.bin"), str(self.home / "b.bin")], check=True)
+        tree = sb._tree(self.home)
+        self.assertEqual(tree["units"], 2)
+        self.assertEqual(tree["bytes"], 4 * 1024 * 1024)
+        if tree["probed"] != 2:
+            self.skipTest("the volume does not answer F_LOG2PHYS_EXT")
+        self.assertLess(tree["physical"], tree["bytes"])
+        self.assertLessEqual(tree["physical"], 3 * 1024 * 1024)
+
+    @unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+    def test_a_clone_across_two_roots_is_counted_once(self):
+        import subprocess
+
+        first = self.home / "first"
+        second = self.home / "second"
+        first.mkdir()
+        second.mkdir()
+        self._write(first / "big.bin", 2 * 1024 * 1024)
+        subprocess.run(["cp", "-c", str(first / "big.bin"), str(second / "big.bin")], check=True)
+        seen: dict = {}
+        one = sb._tree(first, seen=seen)
+        two = sb._tree(second, seen=seen)
+        if one["probed"] != 1 or two["probed"] != 1:
+            self.skipTest("the volume does not answer F_LOG2PHYS_EXT")
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(sum(seen.values()), 3 * 1024 * 1024)
+
+    def test_worktrees_counts_roots_and_the_oldest_idle(self):
+        base = self.home / "worktrees"
+        projects = self.home / "projects"
+        old = base / "repo" / "old-task"
+        new = base / "repo" / "new-task"
+        nested = projects / "proj" / ".worktrees" / "nested-task"
+        for root in (old, new, nested):
+            (root / ".git").mkdir(parents=True)
+            (root / ".git" / "index").write_bytes(b"x" * 10)
+            (root / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+            (root / "file.bin").write_bytes(b"y" * 100)
+        now = 1_000_000.0
+        for root, hours in ((old, 100), (new, 2), (nested, 5)):
+            for name in ("index", "HEAD"):
+                stamp = now - hours * 3600
+                os.utime(root / ".git" / name, (stamp, stamp))
+        with mock.patch.dict(os.environ, {sb.WORKTREES_ENV: str(base)}), mock.patch.object(
+            sb, "PROJECTS_ROOT", str(projects)
+        ):
+            out = sb._worktrees(now)
+        self.assertEqual(out["count"], 3)
+        self.assertEqual(out["units"], 9)
+        self.assertEqual(out["bytes"], 3 * (10 + 21 + 100))
+        self.assertEqual(out["idle_hours"], 100.0)
+        self.assertEqual(out["idle_path"], os.path.realpath(str(old)))
+
+    def test_a_nested_worktrees_dir_is_not_counted_twice(self):
+        base = self.home / "worktrees"
+        outer = base / "repo" / "task"
+        inner = outer / ".worktrees" / "inner"
+        for root in (outer, inner):
+            (root / ".git").mkdir(parents=True)
+            (root / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+        with mock.patch.dict(os.environ, {sb.WORKTREES_ENV: str(base)}), mock.patch.object(
+            sb, "PROJECTS_ROOT", str(self.home / "no-projects")
+        ):
+            roots = sb._worktree_roots()
+        self.assertEqual(roots, [os.path.realpath(str(outer))])
+
+    def test_a_linked_worktree_reads_its_gitdir(self):
+        root = self.home / "wt"
+        gitdir = self.home / "main" / ".git" / "worktrees" / "wt"
+        gitdir.mkdir(parents=True)
+        root.mkdir()
+        (root / ".git").write_text("gitdir: %s\n" % gitdir, encoding="utf-8")
+        (gitdir / "index").write_bytes(b"x")
+        now = 1_000_000.0
+        os.utime(gitdir / "index", (now - 3 * 3600, now - 3 * 3600))
+        self.assertAlmostEqual(sb._idle_hours(str(root), now), 3.0, places=1)
+        self.assertIsNone(sb._idle_hours(str(self.home / "nope"), now))
 
 
 class HistoryTest(unittest.TestCase):
@@ -144,17 +300,24 @@ class HistoryTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "storage-budget.jsonl"
 
-    def sample(self, ts, compressed, used=100, total=1000):
+    def sample(self, ts, compressed, used=100, total=1000, physical=None):
         return {
             "ts": ts,
             "iso": sb.iso(ts),
             "store": True,
             "disk": {"path": "/d", "total": total, "used": used, "free": total - used, "pct": 100.0 * used / total},
             "components": {
-                name: {"bytes": compressed if name == "vlogs_compressed" else 0, "units": 0}
+                name: {
+                    "bytes": compressed if name == "vlogs_compressed" else 0,
+                    "physical": (compressed if physical is None else physical)
+                    if name == "vlogs_compressed"
+                    else 0,
+                    "units": 0,
+                }
                 for name, _label in sb.COMPONENTS
             },
             "footprint": compressed,
+            "footprint_physical": compressed if physical is None else physical,
         }
 
     def test_append_and_read_back(self):
@@ -211,6 +374,29 @@ class HistoryTest(unittest.TestCase):
     def test_a_flat_rate_projects_nothing(self):
         proj = sb.project(self.sample(1.0, 0), {"footprint": 0.0})
         self.assertIsNone(proj["days"]["80"])
+
+    def test_growth_uses_the_on_disk_bytes(self):
+        now = 1000.0 + 2 * 86400
+        rows = [self.sample(1000.0, 10 * GIB, physical=1 * GIB), self.sample(now, 20 * GIB, physical=2 * GIB)]
+        rates = sb.growth(rows, now)
+        self.assertAlmostEqual(rates["footprint"], 0.5 * GIB, delta=1.0)
+        self.assertAlmostEqual(rates["footprint_logical"], 5 * GIB, delta=1.0)
+        self.assertAlmostEqual(rates["components"]["vlogs_compressed"], 0.5 * GIB, delta=1.0)
+
+    def test_an_old_sample_without_physical_reads_apparent(self):
+        now = 1000.0 + 2 * 86400
+        old = self.sample(1000.0, 1 * GIB)
+        for comp in old["components"].values():
+            comp.pop("physical", None)
+        old.pop("footprint_physical", None)
+        rates = sb.growth([old, self.sample(now, 3 * GIB)], now)
+        self.assertAlmostEqual(rates["footprint"], 1 * GIB, delta=1.0)
+
+    def test_the_projection_uses_the_on_disk_rate(self):
+        sample = self.sample(1000.0, 0, used=600, total=1000)
+        proj = sb.project(sample, {"footprint": 10.0, "footprint_logical": 100.0})
+        self.assertEqual(proj["days"]["80"], 20.0)
+        self.assertEqual(proj["rate_bytes_per_day"], 10.0)
 
 
 class RunTest(unittest.TestCase):
@@ -291,6 +477,20 @@ class RunTest(unittest.TestCase):
         payload = sb.latest(path=self.path, now=1000.0)
         self.assertEqual(payload["state"], "ok")
         self.assertEqual(payload["samples"], 1)
+
+    def test_latest_fills_the_on_disk_figures_of_an_old_sample(self):
+        sb.append_history(
+            self.path,
+            {
+                "ts": 1000.0,
+                "disk": {"total": 10, "used": 1, "pct": 10.0},
+                "components": {"scratch": {"bytes": 500, "units": 2}},
+                "footprint": 500,
+            },
+        )
+        payload = sb.latest(path=self.path, now=1000.0)
+        self.assertEqual(payload["sample"]["components"]["scratch"]["physical"], 500)
+        self.assertEqual(payload["sample"]["footprint_physical"], 500)
 
     def test_parse_args(self):
         self.assertEqual(sb.parse_args(["--json"])["json"], True)
