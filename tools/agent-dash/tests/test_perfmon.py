@@ -122,6 +122,25 @@ class PerfMonitorTest(unittest.TestCase):
         self.assertLess(summary["idle"]["cpu_s_total"], 0.05)
         self.assertGreaterEqual(summary["idle"]["last_s"], 0.1)
 
+    def test_cpu_charge_fills_a_named_bucket_in_the_cpu_breakdown(self):
+        with mock.patch.object(perfmon, "_MONITOR", self.mon):
+            with perfmon.cpu_charge("reconcile"):
+                end = time.thread_time() + 0.03
+                while time.thread_time() < end:
+                    pass
+        self.mon.record_poll("pi", 0.5, 2.0, cpu_s=0.25)
+        by = self.mon.snapshot()["cpu"]["by"]
+        self.assertGreaterEqual(by["reconcile"], 0.03)
+        self.assertAlmostEqual(by["polls"], 0.25)
+        self.assertIn("unattributed", by)
+
+    def test_cpu_charge_still_charges_when_the_block_raises(self):
+        with mock.patch.object(perfmon, "_MONITOR", self.mon):
+            with self.assertRaises(ValueError):
+                with perfmon.cpu_charge("requests"):
+                    raise ValueError("boom")
+        self.assertIn("requests", self.mon.snapshot()["cpu"]["by"])
+
     def test_singleflight_stats(self):
         flight = SingleFlight()
         flight.do(("a", 1), lambda: 1)

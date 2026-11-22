@@ -1085,6 +1085,30 @@ class QuotaAndPidFileTests(unittest.TestCase):
             self.assertFalse(liveness.file_shows_quota(os.path.join(tmp, "missing.log")))
             self.assertFalse(liveness.file_shows_quota(None))
 
+    def test_file_shows_quota_answers_an_unchanged_file_without_rereading_it(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "err-cached.log")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("starting\nall fine\n")
+            self.assertFalse(liveness.file_shows_quota(path))
+            with mock.patch("builtins.open", side_effect=AssertionError("reread")):
+                self.assertFalse(liveness.file_shows_quota(path))
+
+    def test_file_shows_quota_rescans_once_the_file_changes(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "err-grows.log")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("starting\n")
+            self.assertFalse(liveness.file_shows_quota(path))
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("Error: rate limit exceeded\n")
+            self.assertTrue(liveness.file_shows_quota(path))
+
     def test_read_pid_file(self):
         import tempfile
 

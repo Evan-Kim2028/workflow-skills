@@ -7,7 +7,7 @@
    loadProjectPlans (the all-scope project-view refresh paths); warming,
    warmTabs (background per-tab warmup); showSnapError,
    clearSnapError, renderErrBanner (loud fetch failures); STALE_AFTER_S,
-   updateStale (tick-freshness badge); refreshAll, setLive, stream,
+   updateStale (tick-freshness badge); refreshAll, setLive, stream, startStream,
    refreshSnapshot (the one-response refresh paths), execSig, execPlanDue,
    PLAN_EVERY_MS (the quiet workstream-tab refresh).
    Needs: FIX from el.js; WINDOW_HOURS, state, since, wsParam, groupFor,
@@ -571,9 +571,31 @@
     snapCoolUntil = Date.now() + snapMinInterval();
     if (lastTickView != null && lastTickView !== curView() && !tabHidden()) wantQuietRefresh();
   }
+  /* The stream is opened and closed by AdStreamGate (static/core/streamgate.js):
+     a page nobody looks at lets go of it, so the server can drop to idle polling.
+     startStream wires the page events to the gate; the gate calls stream to open
+     and closeStream to close. */
+  var liveStream = null;
+  function startStream() {
+    if (FIX || !window.EventSource) return;
+    var gate = window.AdStreamGate.create({open: stream, close: closeStream, now: Date.now});
+    document.addEventListener("visibilitychange", function () { gate.visibility(document.hidden); });
+    window.addEventListener("focus", function () { gate.focus(true); });
+    window.addEventListener("blur", function () { gate.focus(false); });
+    ["pointerdown", "pointermove", "keydown", "wheel", "touchstart"].forEach(function (name) {
+      window.addEventListener(name, gate.input, {passive: true});
+    });
+    setInterval(gate.check, 30000);
+    gate.start(document.hidden, document.hasFocus());
+  }
+  function closeStream() {
+    if (liveStream) { liveStream.close(); liveStream = null; }
+    setLive(false);
+  }
   function stream() {
     if (FIX || !window.EventSource) return;
     var es = new EventSource("/api/stream");
+    liveStream = es;
     es.addEventListener("tick", function (ev) {
       if (tabHidden()) return;
       try {
@@ -714,6 +736,7 @@
   global.refreshBusy = refreshBusy;
   global.setLive = setLive;
   global.stream = stream;
+  global.startStream = startStream;
   global.refreshSnapshot = refreshSnapshot;
   global.tickView = tickView;
   global.curView = curView;

@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from dash.perfmon import cpu_charge as _perfmon_cpu_charge
 from dash import respcache as _respcache_mod
 from dash.buildinfo import build_info
 from dash.bundles import approvals_all, approvals_for, list_bundles, load_bundle_api, plans_stamp, read_page, resolve_plan, start_prompt_text, workstream_plan_ids
@@ -92,7 +93,8 @@ class _StateBuildGate:
 
                 def work():
                     try:
-                        job["result"] = fn()
+                        with _perfmon_cpu_charge("state_build"):
+                            job["result"] = fn()
                     except BaseException as exc:  # shared with every waiter
                         job["error"] = exc
                     finally:
@@ -434,7 +436,11 @@ class DashServer(ThreadingHTTPServer):
                 pass
 
         try:
-            thread = threading.Thread(target=_fill, name="dash-warm", daemon=True)
+            def _charged_fill():
+                with _perfmon_cpu_charge("warm"):
+                    _fill()
+
+            thread = threading.Thread(target=_charged_fill, name="dash-warm", daemon=True)
             thread.start()
         except Exception:
             pass
@@ -460,7 +466,8 @@ class DashServer(ThreadingHTTPServer):
                     mono = time.monotonic()
                     if not health_store_refresh_due(key, last_key, last_at, mono):
                         continue
-                    current = _health_store_snapshot(self.store, bounded=True)
+                    with _perfmon_cpu_charge("health_refresh"):
+                        current = _health_store_snapshot(self.store, bounded=True)
                 except Exception:
                     continue
                 self._health_store_snapshot = current
@@ -507,11 +514,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/stream":
             # Long-lived SSE: timing it as one request would poison max.
-            self._dispatch_get(parsed)
+            with _perfmon_cpu_charge("stream"):
+                self._dispatch_get(parsed)
             return
         start = time.monotonic()
         try:
-            self._dispatch_get(parsed)
+            with _perfmon_cpu_charge("requests"):
+                self._dispatch_get(parsed)
         finally:
             _record_http(self.server, parsed, (time.monotonic() - start) * 1000.0)
 
@@ -600,7 +609,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         start = time.monotonic()
         try:
-            self._dispatch_post(parsed)
+            with _perfmon_cpu_charge("requests"):
+                self._dispatch_post(parsed)
         finally:
             _record_http(self.server, parsed, (time.monotonic() - start) * 1000.0)
 

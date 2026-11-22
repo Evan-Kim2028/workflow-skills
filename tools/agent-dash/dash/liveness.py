@@ -10,6 +10,7 @@ and the store use the same reap-safe check. A zombie still answers
 from __future__ import annotations
 
 import os
+import threading
 import re
 
 # A running row with no fresher evidence than this is stale in views and
@@ -169,21 +170,36 @@ def text_shows_quota(text, patterns=QUOTA_PATTERNS) -> bool:
     return False
 
 
+#: Quota verdicts by (path, size, mtime_ns, max_bytes). A log that has not
+#: changed since the last poll gives the same answer, so the manifests source
+#: no longer reopens and rescans every run's err/out tail on every poll.
+_QUOTA_SEEN: dict = {}
+_QUOTA_SEEN_MAX = 8192
+_QUOTA_SEEN_LOCK = threading.Lock()
+
+
 def file_shows_quota(path, max_bytes=QUOTA_TAIL_BYTES) -> bool:
     """True when the tail of ``path`` matches a quota pattern.
 
     Reads only the last ``max_bytes``. Missing or unreadable files read
     as False, never an exception: sources stay exception-safe and a
-    failed read simply skips the quota close-out.
+    failed read simply skips the quota close-out. An unchanged file
+    (same size and mtime) answers from the last scan.
     """
     if not path or not isinstance(path, str):
         return False
     try:
-        size = os.path.getsize(path)
+        st = os.stat(path)
     except OSError:
         return False
+    size = st.st_size
     if size <= 0:
         return False
+    key = (path, size, st.st_mtime_ns, max_bytes)
+    with _QUOTA_SEEN_LOCK:
+        seen = _QUOTA_SEEN.get(key)
+    if seen is not None:
+        return seen
     try:
         with open(path, "rb") as fh:
             if size <= max_bytes:
@@ -197,7 +213,12 @@ def file_shows_quota(path, max_bytes=QUOTA_TAIL_BYTES) -> bool:
         text = data.decode("utf-8", "replace")
     except (UnicodeError, ValueError):
         return False
-    return text_shows_quota(text)
+    verdict = text_shows_quota(text)
+    with _QUOTA_SEEN_LOCK:
+        if len(_QUOTA_SEEN) >= _QUOTA_SEEN_MAX:
+            _QUOTA_SEEN.clear()
+        _QUOTA_SEEN[key] = verdict
+    return verdict
 
 
 def read_pid_file(path):
