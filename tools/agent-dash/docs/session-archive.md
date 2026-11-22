@@ -262,16 +262,25 @@ Streams are keyed by `ws,label`, so each session is its own stream.
    included).
 4. **verify**: stream the copy back through `tarfile` and compare every
    member's sha256 and size; then atomic rename to the final path.
-5. **ingest**: if `count_uniq(member, line)` for the current rev already
-   equals the expected count, send nothing. Otherwise send from the last
-   confirmed line when a member's old bytes are a prefix of the new file
-   (append growth); if the old bytes are not a prefix (rewrite), bump `rev`
-   and resend every member. Then `flush()` and verify with `count_uniq`.
+5. **ingest**: base64 images are replaced by a marker before the row is
+   built (the tar keeps the original bytes) and the row carries
+   `path`/`label` only. If `count_uniq(member, line)` for the current rev
+   already equals the expected count, send nothing. Otherwise send from the
+   last confirmed line when a member's old bytes are a prefix of the new
+   file (append growth); if the old bytes are not a prefix (rewrite), bump
+   `rev` and resend every member. Then `flush()` and verify with
+   `count_uniq`.
+   The pass batches this: up to `BATCH_UNITS` units (or 64 MiB of raw
+   bytes) are posted with no flush, one `flush()` covers the batch, and
+   then each unit is verified and recorded on its own, so a flush per
+   unit no longer makes VictoriaLogs seal and merge a part per unit.
    Any mismatch is `status: error` naming the unit, keeping the previous
-   confirmed members; the pass continues.
+   confirmed members; the pass continues and the batch's other units are
+   still archived and reclaimed.
 6. **record** `archived` with each member's `rel`, `size`, `mtime_ns`,
-   `sha256`, `lines`, `rev`, the archive path and byte counts, and the
-   `archives` list.
+   `sha256`, `lines`, `rev`, the archive path and byte counts, the
+   `archives` list, and the `stripped_bytes`/`stripped_rows` the base64
+   filter removed.
 7. **reclaim** (unless `--no-reclaim`) is a journaled two-phase move, never
    a straight unlink. Preconditions, all of them, else keep and record why:
    status `archived`; fingerprint unchanged; idle at least `reclaim_days`

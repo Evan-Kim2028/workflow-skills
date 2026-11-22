@@ -49,12 +49,27 @@ def session_bytes():
     )
 
 
+def query_paths(logsql):
+    """The paths a count or token query names: ``path:in("a","b")`` or ``path:="a"``.
+
+    ``dash/logarchive.py`` asks for a whole batch of files in one grouped query
+    and falls back to one query per path, so the fake answers both.
+    """
+    if "path:in(" in logsql:
+        inner = logsql.split("path:in(", 1)[1]
+        inner = inner[: inner.index(")")]
+        return [part.strip().strip('"') for part in inner.split(",") if part.strip()]
+    return [logsql.split('path:="', 1)[1].split('"', 1)[0]]
+
+
 class FakeClient:
     """The slice of ``dash.vlogs.VLogsClient`` the archive uses, in memory."""
 
     def __init__(self):
         self.rows = {}
         self.posts = 0
+        self.flushes = 0
+        self.queries = 0
 
     def healthy(self):
         return True
@@ -72,21 +87,43 @@ class FakeClient:
         return sent
 
     def flush(self):
-        pass
+        self.flushes += 1
 
     def query(self, logsql):
-        rel = logsql.split('path:="', 1)[1].split('"', 1)[0]
-        tok = "message_end" if "type:=message_end" in logsql else "message"
-        n = i = o = c = 0
-        for row in self.rows.get(rel, []):
-            if row["type"] != tok:
+        self.queries += 1
+        grouped = "path:in(" in logsql
+        # A count query names no type and counts every row; a token query names one.
+        tok = None
+        if "type:=message_end" in logsql:
+            tok = "message_end"
+        elif "type:=message" in logsql:
+            tok = "message"
+        out = []
+        for rel in query_paths(logsql):
+            rows = self.rows.get(rel, [])
+            if tok is None:
+                row_out = {"n": str(len(rows))}
+                if grouped:
+                    row_out["path"] = rel
+                out.append(row_out)
                 continue
-            message = json.loads(row["_msg"]).get("message") or {}
-            if message.get("role") != "assistant":
+            n = i = o = c = 0
+            for row in rows:
+                if row["type"] != tok:
+                    continue
+                message = json.loads(row["_msg"]).get("message") or {}
+                if message.get("role") != "assistant":
+                    continue
+                usage = message.get("usage") or {}
+                n += 1
+                i += usage.get("input", 0)
+                o += usage.get("output", 0)
+                c += usage.get("cacheRead", 0)
+            if not n:
+                # The store leaves a path with no counted row out of the answer.
                 continue
-            usage = message.get("usage") or {}
-            n += 1
-            i += usage.get("input", 0)
-            o += usage.get("output", 0)
-            c += usage.get("cacheRead", 0)
-        return [{"n": str(n), "i": str(i) if n else "NaN", "o": str(o) if n else "NaN", "c": str(c) if n else "NaN"}]
+            row_out = {"n": str(n), "i": str(i), "o": str(o), "c": str(c)}
+            if grouped:
+                row_out["path"] = rel
+            out.append(row_out)
+        return out

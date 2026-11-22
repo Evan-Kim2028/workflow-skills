@@ -321,6 +321,8 @@ class SilentClient(FakeClient):
     """A store that accepts rows and then reports none: the verify step must refuse."""
 
     def query(self, logsql):
+        if "path:in(" in logsql:  # a grouped query names every path it wants
+            return []
         return [{"n": "0", "i": "NaN", "o": "NaN", "c": "NaN"}]
 
 
@@ -411,7 +413,7 @@ class GcCommandTest(unittest.TestCase):
         with mock.patch("dash.logarchive.vlogs.VLogsClient", lambda url: SilentClient()):
             code, text = self.run_cli(["gc", "--runs-older-than", "7d", "--apply"])
         self.assertEqual(code, 1, text)
-        self.assertIn("differ from sent", text)
+        self.assertIn("store has 0 rows", text)
         self.assertTrue(old.exists())
 
     def test_keep_stripped_leaves_the_stripped_copy_at_the_path(self) -> None:

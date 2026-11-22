@@ -824,6 +824,98 @@ class DriverTest(Base):
         self.assertIn("under the archive dest", rec["error"])
 
 
+class BatchTest(Base):
+    """A pass posts a batch of units and flushes once for the whole batch.
+
+    A flush per unit makes VictoriaLogs seal and merge a part per unit, which
+    is what made the tool-side pass crawl (2026-11-21). The claims stay per
+    unit: each is verified and archived on its own after the flush.
+    """
+
+    def _run(self, root, client, **opts):
+        base = {"apply": False, "no_reclaim": False, "scheduled": False, "tools": ["pi"], "limit": None,
+                "max_minutes": None, "url": None, "dest": str(self.home / "dest")}
+        base.update(opts)
+        with mock.patch.dict(sa.TOOLS, {"pi": (str(root), sa.discover_pi)}), mock.patch.object(
+            sa.vlogs, "VLogsClient", lambda url=None: client
+        ), mock.patch.object(sa, "live_files", lambda names: []):
+            return sa.run(base, out=open(os.devnull, "w"), state=self.home / "state")
+
+    def _units(self, n=3):
+        """``n`` units of one member each, each old enough to reclaim."""
+        root = self.home / "pi"
+        paths = []
+        for i in range(n):
+            path = write(root / "proj" / ("s%d.jsonl" % i), '{"type":"session"}\n{"type":"message"}\n')
+            age(path, 30)
+            paths.append(path)
+        return root, paths
+
+    def test_one_flush_covers_the_whole_batch(self):
+        root, paths = self._units(3)
+        client = FakeClient()
+        code = self._run(root, client, apply=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.flushes, 1)
+        self.assertEqual(len([r for r in client.rows]), 6)
+        self.assertEqual([p.exists() for p in paths], [False] * 3)
+
+    def test_a_batch_that_fills_flushes_once_per_batch(self):
+        root, paths = self._units(3)
+        client = FakeClient()
+        with mock.patch.object(sa, "BATCH_UNITS", 2):
+            code = self._run(root, client, apply=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.flushes, 2)
+        self.assertEqual([p.exists() for p in paths], [False] * 3)
+
+    def test_a_batch_records_the_stripped_counters_and_path_label_rows(self):
+        """The batched path keeps main's stripping: counters in the record, no unit/session fields."""
+        root = self.home / "pi"
+        image = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk=" * 40
+        line = json.dumps({"type": "message", "data": image}, separators=(",", ":"))
+        path = write(root / "proj" / "s0.jsonl", line + "\n" + '{"type":"message"}\n')
+        age(path, 30)
+        uid = sa.discover_pi(str(root))[0].uid
+        client = FakeClient()
+        code = self._run(root, client, apply=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.flushes, 1)
+        self.assertEqual(len(client.rows), 2)
+        self.assertNotIn(image, client.rows[0]["_msg"])
+        self.assertIn("<img sha256=", client.rows[0]["_msg"])
+        for row in client.rows:
+            self.assertNotIn("unit", row)
+            self.assertNotIn("session", row)
+            self.assertTrue(row["path"].startswith("pi/"))
+            self.assertTrue(row["label"])
+        rec = sa.Manifest(self.home / "dest" / "state").latest[uid]
+        self.assertEqual(rec["status"], "reclaimed")
+        self.assertEqual(rec["stripped_rows"], 1)
+        self.assertGreaterEqual(rec["stripped_bytes"], len(image))
+
+    def test_a_unit_that_does_not_verify_is_kept_and_its_batch_mates_reclaimed(self):
+        root, paths = self._units(3)
+        unit = sa.discover_pi(str(root))[0]
+        client = FakeClient()
+        real = client.query
+
+        def query(text):
+            rows = real(text)
+            if ('path:="%s"' % unit.uid) in text and "count_uniq" in text:
+                return [{"n": str(max(0, int(rows[0]["n"]) - 1))}]  # this unit never verifies
+            return rows
+
+        client.query = query
+        code = self._run(root, client, apply=True)
+        self.assertEqual(code, 1)
+        manifest = sa.Manifest(self.home / "dest" / "state")
+        self.assertEqual(manifest.latest[unit.uid]["status"], "error")
+        self.assertTrue(any(not p.exists() for p in paths), "the other units were reclaimed")
+        rec = manifest.latest[unit.uid]
+        self.assertIn("distinct (member,line) rows", rec["error"])
+
+
 class StatusTest(Base):
     def test_status_counts_by_tool(self):
         state = self.home / "state"

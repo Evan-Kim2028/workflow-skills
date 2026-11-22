@@ -61,6 +61,15 @@ def _stream_bytes(with_image=True):
     return b"".join(lines)
 
 
+def _query_paths(query):
+    """The paths a count or token query names: ``path:in("a","b")`` or ``path:="a"``."""
+    if "path:in(" in query:
+        inner = query.split("path:in(", 1)[1]
+        inner = inner[: inner.index(")")]
+        return [part.strip().strip('"') for part in inner.split(",") if part.strip()]
+    return [query.split('path:="', 1)[1].split('"', 1)[0]]
+
+
 class _Store(http.server.BaseHTTPRequestHandler):
     server_version = "fake-vl"
 
@@ -93,10 +102,21 @@ class _Store(http.server.BaseHTTPRequestHandler):
             return self._send(b"")
         if self.path.startswith("/select/logsql/query"):
             query = parse_qs(body.decode())["query"][0]
-            rel = query.split('path:="', 1)[1].split('"', 1)[0]
-            rows = srv.rows.get(rel, [])
-            if "unpack_json" in query:
-                tok = "message_end" if "type:=message_end" in query else "message"
+            grouped = "path:in(" in query
+            tok = None
+            if "type:=message_end" in query:
+                tok = "message_end"
+            elif "type:=message" in query:
+                tok = "message"
+            out = b""
+            for rel in _query_paths(query):
+                rows = srv.rows.get(rel, [])
+                if tok is None:
+                    rec = {"n": str(len(rows))}
+                    if grouped:
+                        rec["path"] = rel
+                    out += json.dumps(rec).encode() + b"\n"
+                    continue
                 n = i = o = c = 0
                 for row in rows:
                     if row["type"] != tok:
@@ -110,9 +130,13 @@ class _Store(http.server.BaseHTTPRequestHandler):
                     i += u.get("input", 0)
                     o += u.get("output", 0)
                     c += u.get("cacheRead", 0)
-                out = {"n": str(n), "i": str(i) if n else "NaN", "o": str(o) if n else "NaN", "c": str(c) if n else "NaN"}
-                return self._send(json.dumps(out).encode() + b"\n")
-            return self._send(json.dumps({"n": str(len(rows))}).encode() + b"\n")
+                if not n:
+                    continue
+                rec = {"n": str(n), "i": str(i), "o": str(o), "c": str(c)}
+                if grouped:
+                    rec["path"] = rel
+                out += json.dumps(rec).encode() + b"\n"
+            return self._send(out)
         return self._send(b"", 404)
 
 

@@ -1552,10 +1552,20 @@ def _prefix_matches(path: str, old: dict) -> bool:
     return seen == size and digest.hexdigest() == old.get("sha256")
 
 
+def verify_unit(client, unit_uid: str, rev: str, total: int) -> None:
+    """Raise unless the store holds every ``(member, line)`` row of this rev."""
+    got = count_uniq_rows(client, unit_uid, rev)
+    if got != total:
+        raise ArchiveError(
+            "store has %d distinct (member,line) rows for %s rev %s, expected %d"
+            % (got, unit_uid, rev, total)
+        )
+
+
 def ingest_unit(
     unit: Unit, records: list[dict], prior: dict | None, client, stats: dict | None = None
 ) -> tuple[str, int, int]:
-    """Send the unit's rows, verify the store, and return ``(rev, total, sent)``.
+    """Send the unit's rows, flush, verify the store, return ``(rev, total, sent)``.
 
     At-least-once: a rerun resends from the last line the manifest confirmed
     (or from line 1 of the current rev) and verifies with
@@ -1569,6 +1579,27 @@ def ingest_unit(
     keeps the original bytes), and the row carries ``path``/``label`` only:
     the duplicate ``unit``/``session`` fields are gone. ``stats``, when given,
     receives ``stripped_bytes`` and ``stripped_rows`` for the manifest.
+
+    ``insert_unit`` and ``verify_unit`` are the two halves; the pass posts a
+    batch of units with one flush and then verifies each of them.
+    """
+    rev, total, sent = insert_unit(unit, records, prior, client, stats)
+    if sent:
+        client.flush()
+    verify_unit(client, unit.uid, rev, total)
+    return rev, total, sent
+
+
+def insert_unit(
+    unit: Unit, records: list[dict], prior: dict | None, client, stats: dict | None = None
+) -> tuple[str, int, int]:
+    """Post the unit's rows without flushing. Returns ``(rev, total, sent)``.
+
+    The rows are searchable only after a flush, so a caller that posts several
+    units and then flushes once must verify them all after that flush (see
+    ``verify_unit``). A rerun whose rows are all in the store already sends
+    nothing, and then needs no flush. ``stats``, when given, receives
+    ``stripped_bytes`` and ``stripped_rows`` for the manifest.
     """
     prior_members = {m["rel"]: m for m in (prior or {}).get("members", [])}
     prior_rev = str((prior or {}).get("rev", "0"))
@@ -1641,14 +1672,7 @@ def ingest_unit(
                     yield line
 
         sent = client.insert(gen())
-        client.flush()
 
-    got = count_uniq_rows(client, unit.uid, rev)
-    if got != total:
-        raise ArchiveError(
-            "store has %d distinct (member,line) rows for %s rev %s, expected %d"
-            % (got, unit.uid, rev, total)
-        )
     if stats is not None:
         stats["stripped_bytes"] = stripped
         stats["stripped_rows"] = stripped_rows
@@ -2505,6 +2529,101 @@ def _settled(unit: Unit, manifest: Manifest) -> bool:
 
 # --------------------------------------------------------------- pass
 
+def _prepare_archive(unit: Unit, prior: dict | None, fp, state_dir: Path) -> tuple[list[dict], Path, int, list]:
+    """The unit's archive: reuse the recorded one, or pack, verify and keep a new one.
+
+    A retry after an error record must not pack a second copy of the same
+    content, so the recorded archive is reused whenever its size and members
+    still match this fingerprint.
+    """
+    reuse = None
+    if prior and prior.get("archive") and _fp_equal(prior.get("members"), fp):
+        path = resolve_stored_path(state_dir, prior.get("archive_rel"), prior["archive"])
+        if os.path.exists(path) and os.path.getsize(path) == int(prior.get("archive_bytes") or -1):
+            reuse = prior
+
+    if reuse is not None:
+        records = reuse["members"]
+        archive = Path(resolve_stored_path(state_dir, reuse.get("archive_rel"), reuse["archive"]))
+        seq = int(reuse.get("seq", 0))
+        archives = list(reuse.get("archives") or [])
+        if not archives:
+            archives = [
+                {
+                    "seq": seq,
+                    "path": str(archive),
+                    "rel": dest_rel(archive, state_dir),
+                    "bytes": int(reuse.get("archive_bytes") or 0),
+                    "members": records,
+                }
+            ]
+        return records, archive, seq, archives
+
+    seq = next_archive_seq(state_dir, unit)
+    archive = archive_path(state_dir, unit, seq)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(archive) + ".tmp"
+    try:
+        records = pack(unit, tmp)
+        for rec, member in zip(records, unit.members):
+            if rec["lines"] is None:
+                rec["lines"] = count_member_rows(member, unit)
+        verify_archive(tmp, records)
+        if os.path.exists(archive):
+            raise ArchiveError("refusing to replace existing archive %s" % archive)
+        os.rename(tmp, archive)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    archives = list((prior or {}).get("archives") or [])
+    archives.append(
+        {
+            "seq": seq,
+            "path": str(archive),
+            "rel": dest_rel(archive, state_dir),
+            "bytes": os.path.getsize(archive),
+            "members": records,
+        }
+    )
+    return records, archive, seq, archives
+
+
+def _archived_record(unit: Unit, records: list[dict], archive: Path, seq: int, archives: list,
+                     rev: str, total: int, state_dir: Path, stats: dict | None = None) -> dict:
+    """The manifest record that says "this unit's rows are in the store, verified".
+
+    ``stats`` carries the base64 bytes and rows that ``insert_unit`` replaced
+    with a marker before ingest (the tar keeps the original bytes).
+    """
+    stats = stats or {}
+    return {
+        "unit": unit.uid,
+        "tool": unit.tool,
+        "key": unit.key,
+        "session": unit.session,
+        "root": unit.root,
+        "parent": unit.parent,
+        "archive": str(archive),
+        "archive_rel": dest_rel(archive, state_dir),
+        "archive_bytes": os.path.getsize(archive),
+        "zstd_level": ZSTD_LEVEL,
+        "zstd_long": ZSTD_LONG,
+        "seq": seq,
+        "archives": archives,
+        "raw_bytes": unit.raw_bytes,
+        "rev": rev,
+        "lines": total,
+        "members": records,
+        "status": "archived",
+        # Base64 bytes replaced by a marker before ingest (the tar keeps them).
+        "stripped_bytes": int(stats.get("stripped_bytes") or 0),
+        "stripped_rows": int(stats.get("stripped_rows") or 0),
+    }
+
+
 def process_unit(
     unit: Unit,
     prior: dict | None,
@@ -2534,86 +2653,10 @@ def process_unit(
         print("  reclaimed %s" % unit.uid, file=out)
         return "reclaimed"
 
-    # Reuse the current archive when it already matches this fingerprint
-    # (an ingest retry after an error record must not pack a new version).
-    reuse = None
-    if prior and prior.get("archive") and _fp_equal(prior.get("members"), fp):
-        path = resolve_stored_path(state_dir, prior.get("archive_rel"), prior["archive"])
-        if os.path.exists(path) and os.path.getsize(path) == int(prior.get("archive_bytes") or -1):
-            reuse = prior
-
-    if reuse is not None:
-        records = reuse["members"]
-        archive = Path(resolve_stored_path(state_dir, reuse.get("archive_rel"), reuse["archive"]))
-        seq = int(reuse.get("seq", 0))
-        archives = list(reuse.get("archives") or [])
-        if not archives:
-            archives = [
-                {
-                    "seq": seq,
-                    "path": str(archive),
-                    "rel": dest_rel(archive, state_dir),
-                    "bytes": int(reuse.get("archive_bytes") or 0),
-                    "members": records,
-                }
-            ]
-    else:
-        seq = next_archive_seq(state_dir, unit)
-        archive = archive_path(state_dir, unit, seq)
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        tmp = str(archive) + ".tmp"
-        try:
-            records = pack(unit, tmp)
-            for rec, member in zip(records, unit.members):
-                if rec["lines"] is None:
-                    rec["lines"] = count_member_rows(member, unit)
-            verify_archive(tmp, records)
-            if os.path.exists(archive):
-                raise ArchiveError("refusing to replace existing archive %s" % archive)
-            os.rename(tmp, archive)
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        archives = list((prior or {}).get("archives") or [])
-        archives.append(
-            {
-                "seq": seq,
-                "path": str(archive),
-                "rel": dest_rel(archive, state_dir),
-                "bytes": os.path.getsize(archive),
-                "members": records,
-            }
-        )
-
+    records, archive, seq, archives = _prepare_archive(unit, prior, fp, state_dir)
     stats: dict = {}
     rev, total, sent = ingest_unit(unit, records, prior, client, stats)
-    rec = {
-        "unit": unit.uid,
-        "tool": unit.tool,
-        "key": unit.key,
-        "session": unit.session,
-        "root": unit.root,
-        "parent": unit.parent,
-        "archive": str(archive),
-        "archive_rel": dest_rel(archive, state_dir),
-        "archive_bytes": os.path.getsize(archive),
-        "zstd_level": ZSTD_LEVEL,
-        "zstd_long": ZSTD_LONG,
-        "seq": seq,
-        "archives": archives,
-        "raw_bytes": unit.raw_bytes,
-        "newest_mtime": unit.newest_mtime,
-        "rev": rev,
-        "lines": total,
-        "members": records,
-        "status": "archived",
-        # Base64 bytes replaced by a marker before ingest (the tar keeps them).
-        "stripped_bytes": int(stats.get("stripped_bytes") or 0),
-        "stripped_rows": int(stats.get("stripped_rows") or 0),
-    }
+    rec = _archived_record(unit, records, archive, seq, archives, rev, total, state_dir, stats)
     manifest.write(rec)
     print(
         "  archived %s  raw %d -> zst %d  rows %d (sent %d, rev %s, seq %d)"
@@ -2628,6 +2671,106 @@ def process_unit(
         return "archived"
     print("  reclaimed %s" % unit.uid, file=out)
     return "reclaimed"
+
+
+#: Units posted per store batch when a pass is batching (see ``stage_unit``).
+#: A flush per unit makes VictoriaLogs seal and merge a part each time; one
+#: flush per batch is what keeps a pass over thousands of units linear.
+BATCH_UNITS = 32
+#: Raw bytes per batch. Rows are streamed from the packed archive, so this
+#: bounds how long a batch runs, not memory.
+BATCH_BYTES = 64 * 2 ** 20
+
+
+def stage_unit(unit: Unit, prior: dict | None, cfg: dict, client, state_dir: Path, out) -> dict:
+    """Pack (or reuse) one unit and post its rows, without flushing or claiming anything.
+
+    The rows are posted but not yet flushed, so nothing about this unit is
+    verifiable and no manifest record is written: ``commit_batch`` does that
+    after its one flush. A crash here leaves an archive file on disk and rows
+    in the store, exactly where a crash in the middle of ``process_unit`` left
+    them before; the next run reuses the archive and sees the rows as posted.
+    """
+    records, archive, seq, archives = _prepare_archive(unit, prior, fingerprint(unit), state_dir)
+    stats: dict = {}
+    rev, total, sent = insert_unit(unit, records, prior, client, stats)
+    return {
+        "unit": unit,
+        "rec": _archived_record(unit, records, archive, seq, archives, rev, total, state_dir, stats),
+        "total": total,
+        "sent": sent,
+    }
+
+
+def commit_batch(
+    items: list[dict],
+    cfg: dict,
+    client,
+    manifest: Manifest,
+    state_dir: Path,
+    out,
+    *,
+    no_reclaim: bool,
+    now: float,
+) -> dict:
+    """One flush for the batch, then verify, archive and (unless told not to) reclaim each unit.
+
+    The claims stay per unit and in order: a unit is archived in the manifest
+    only after its own verify passes, and a unit that fails is recorded as an
+    error without stopping the rest of the batch.
+    """
+    results = {"archived": 0, "reclaimed": 0, "errors": 0}
+    if not items:
+        return results
+    if any(item["sent"] for item in items):
+        try:
+            client.flush()
+        except Exception as exc:  # noqa: BLE001 - the whole batch is unverified
+            reason = "%s: %s" % (exc.__class__.__name__, exc)
+            for item in items:
+                results["errors"] += 1
+                _record_error(item, reason, manifest, out)
+            return results
+    for item in items:
+        unit, rec = item["unit"], item["rec"]
+        try:
+            verify_unit(client, unit.uid, rec["rev"], item["total"])
+            manifest.write(rec)
+            print(
+                "  archived %s  raw %d -> zst %d  rows %d (sent %d, rev %s, seq %d)"
+                % (unit.uid, unit.raw_bytes, rec["archive_bytes"], item["total"], item["sent"],
+                   rec["rev"], rec["seq"]),
+                file=out,
+            )
+            if no_reclaim:
+                results["archived"] += 1
+                continue
+            reason = reclaim_unit(unit, rec, cfg, now, manifest, state_dir, client)
+            if reason:
+                print("  keep %s: %s" % (unit.uid, reason), file=out)
+                results["archived"] += 1
+            else:
+                print("  reclaimed %s" % unit.uid, file=out)
+                results["reclaimed"] += 1
+        except Exception as exc:  # noqa: BLE001 - one unit never sinks its batch mates
+            results["errors"] += 1
+            _record_error(item, "%s: %s" % (exc.__class__.__name__, exc), manifest, out)
+    return results
+
+
+def _record_error(item: dict, reason: str, manifest: Manifest, out) -> None:
+    """Record a failed unit so the next run resumes it, keeping any reclaim journal fields."""
+    rec = item["rec"]
+    base = dict(rec)
+    latest = manifest.latest.get(item["unit"].uid) or {}
+    base.update(latest)
+    base.setdefault("unit", item["unit"].uid)
+    base.setdefault("tool", item["unit"].tool)
+    base.setdefault("key", item["unit"].key)
+    base["status"] = "error"
+    base["error"] = reason[:500]
+    manifest.write(base)
+    print("  ERROR %s: %s" % (item["unit"].uid, reason), file=out)
 
 
 def apply_pass(
@@ -2648,6 +2791,20 @@ def apply_pass(
     started = time.monotonic()
     budget = max_minutes * 60.0
     picked = 0
+    # Units posted but not yet flushed: one flush covers the batch, then each
+    # unit is verified and archived on its own. A flush per unit made
+    # VictoriaLogs seal and merge a part per small unit (2026-11-21).
+    batch: list[dict] = []
+    batch_bytes = 0
+
+    def commit() -> None:
+        nonlocal batch, batch_bytes
+        for name, count in commit_batch(
+            batch, cfg, client, manifest, state_dir, out, no_reclaim=no_reclaim, now=now
+        ).items():
+            results[name] += count
+        batch, batch_bytes = [], 0
+
     # Resolve any journal left by a crash before planning new work.
     recover_trash(state_dir, manifest, out)
     for unit in units:
@@ -2669,10 +2826,18 @@ def apply_pass(
             continue
         picked += 1
         try:
-            outcome = process_unit(
-                unit, prior, cfg, client, manifest, state_dir, out, no_reclaim=no_reclaim, now=now
-            )
-            results[outcome] = results.get(outcome, 0) + 1
+            if prior and prior.get("status") in ("archived", "reclaiming"):
+                # Already packed: this pass only re-verifies its rows and maybe
+                # reclaims it, so there is nothing to batch.
+                outcome = process_unit(
+                    unit, prior, cfg, client, manifest, state_dir, out, no_reclaim=no_reclaim, now=now
+                )
+                results[outcome] = results.get(outcome, 0) + 1
+            else:
+                batch.append(stage_unit(unit, prior, cfg, client, state_dir, out))
+                batch_bytes += unit.raw_bytes
+                if len(batch) >= BATCH_UNITS or batch_bytes >= BATCH_BYTES:
+                    commit()
         except Exception as exc:  # one unit never stops the run
             results["errors"] += 1
             reason = "%s: %s" % (exc.__class__.__name__, exc)
@@ -2700,6 +2865,8 @@ def apply_pass(
                 base["members"] = _fp_members(fingerprint(unit))
             manifest.write(base)
             print("  ERROR %s: %s" % (unit.uid, reason), file=out)
+    if batch:
+        commit()
     return results
 
 
