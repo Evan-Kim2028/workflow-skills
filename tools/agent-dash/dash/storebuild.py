@@ -686,6 +686,11 @@ def verify(
     for (ws, path), n in old_map.items():
         if path in expected:
             continue
+        if new_map.get((ws, path)) == n:
+            # Copied across from the live store (cutover's copy step): the
+            # rebuilt store holds every row, so it is not a gap. Counting it
+            # as one made a correct cutover fail its check and swap back.
+            continue
         live_only[ws] = live_only.get(ws, 0) + n
     # A path the archive has and the live store never ingested is new-only:
     # it adds rows instead of missing them, and it is not a failure.
