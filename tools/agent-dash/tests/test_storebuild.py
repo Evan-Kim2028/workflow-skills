@@ -868,3 +868,42 @@ class CopyOnlyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LaunchdServiceRaceTest(unittest.TestCase):
+    """bootstrap right after bootout fails with I/O error 5 until launchd lets go."""
+
+    def make(self, bootstrap_rcs, running_seq):
+        svc = storebuild.LaunchdService("com.example.test", plist="/tmp/x.plist", uid=501)
+        calls = []
+        rcs = iter(bootstrap_rcs)
+        runs = iter(running_seq)
+
+        def fake_run(*args):
+            calls.append(args[0])
+            if args[0] == "bootstrap":
+                return next(rcs)
+            if args[0] == "print":
+                return 0 if next(runs, False) else 113
+            return 0
+
+        svc._run = fake_run
+        return svc, calls
+
+    def test_start_retries_a_failed_bootstrap(self):
+        svc, calls = self.make([5, 5, 0], [False, False])
+        with unittest.mock.patch.object(storebuild.time, "sleep"):
+            self.assertEqual(svc.start(), 0)
+        self.assertEqual(calls.count("bootstrap"), 3)
+
+    def test_start_gives_up_after_its_attempts(self):
+        svc, calls = self.make([5] * 5, [False] * 5)
+        with unittest.mock.patch.object(storebuild.time, "sleep"):
+            self.assertEqual(svc.start(), 5)
+        self.assertEqual(calls.count("bootstrap"), 5)
+
+    def test_stop_waits_until_the_job_is_unloaded(self):
+        svc, calls = self.make([], [True, True, False])
+        with unittest.mock.patch.object(storebuild.time, "sleep"):
+            svc.stop()
+        self.assertEqual(calls.count("print"), 3)
