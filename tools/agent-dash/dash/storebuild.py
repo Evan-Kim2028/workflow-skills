@@ -226,13 +226,29 @@ class LaunchdService:
         except (OSError, subprocess.TimeoutExpired):
             return 127
 
-    def stop(self) -> int:
-        return self._run("bootout", "gui/%d/%s" % (self.uid, self.label))
+    def stop(self, wait_s: float = 30.0) -> int:
+        """Boot the agent out and wait until launchd has really unloaded it.
 
-    def start(self) -> int:
+        A ``bootstrap`` issued while launchd is still tearing the job down fails
+        with "Bootstrap failed: 5: Input/output error" (seen live on 2026-11-21:
+        a cutover's restart never happened and the swap-back fired).
+        """
+        rc = self._run("bootout", "gui/%d/%s" % (self.uid, self.label))
+        deadline = time.time() + wait_s
+        while self.running() and time.time() < deadline:
+            time.sleep(0.5)
+        return rc
+
+    def start(self, attempts: int = 5, pause_s: float = 2.0) -> int:
         if not self.plist:
             return 1
-        return self._run("bootstrap", "gui/%d" % self.uid, self.plist)
+        rc = 1
+        for attempt in range(attempts):
+            rc = self._run("bootstrap", "gui/%d" % self.uid, self.plist)
+            if rc == 0 or self.running():
+                return 0
+            time.sleep(pause_s * (attempt + 1))
+        return rc
 
     def running(self) -> bool:
         return self._run("print", "gui/%d/%s" % (self.uid, self.label)) == 0
