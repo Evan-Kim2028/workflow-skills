@@ -229,6 +229,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
 <script src="/static/core/el.js"></script>
 <script src="/static/core/unattributed.js"></script>
 <script src="/static/core/state.js"></script>
+<script src="/static/core/streamgate.js"></script>
 <script src="/static/core/api.js"></script>
 <script src="/static/core/actions.js"></script>
 <script src="/static/core/cache.js"></script>
@@ -376,7 +377,7 @@ html{scroll-padding-top:calc(var(--pinned-h) + 10px)}
      everything in parallel instead of serializing nav before data. The
      plan branch keeps its own nav for tabs and chrome. */
   loadTaskmap().then(function () { showCurrent(); });
-  stream();
+  startStream();
   /* The slow refresh never stacks on a running one: when the server is
      slow the previous burst is still in flight, and another full burst
      only deepens its queue. The next turn retries. On project views it

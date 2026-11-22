@@ -11,6 +11,8 @@ failing. No parameter values are kept except workstream ids.
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import threading
 import time
 import sys
@@ -37,19 +39,17 @@ class _Ring:
     """Timestamped floats over the last WINDOW_S, bounded count."""
 
     def __init__(self) -> None:
-        self.items: list = []
+        self.items: collections.deque = collections.deque(maxlen=MAX_SAMPLES)
 
     def add(self, value: float, now: float | None = None) -> None:
         now = time.time() if now is None else now
         self.items.append((now, float(value)))
-        if len(self.items) > MAX_SAMPLES:
-            del self.items[: len(self.items) - MAX_SAMPLES]
 
     def window(self, now: float | None = None) -> list:
         now = time.time() if now is None else now
         cutoff = now - WINDOW_S
         while self.items and self.items[0][0] < cutoff:
-            del self.items[0]
+            self.items.popleft()
         return [value for _, value in self.items]
 
     def summary(self, now: float | None = None) -> dict:
@@ -84,6 +84,7 @@ class PerfMonitor:
         self._lock_hold = _Ring()
         self._polls: dict[str, list] = {}
         self._poll_cpu_s: dict[str, float] = {}
+        self._cpu_buckets: dict[str, float] = {}
         self._flight_calls = 0
         self._flight_shared = 0
         self._caches: dict[str, dict[str, int]] = {}
@@ -131,6 +132,15 @@ class PerfMonitor:
                 history.append((now, float(duration_s), lag, interval_s))
                 if len(history) > MAX_POLL_HISTORY:
                     del history[: len(history) - MAX_POLL_HISTORY]
+        except Exception:
+            pass
+
+    def record_cpu(self, bucket: str, cpu_s: float) -> None:
+        """Add thread CPU spent on ``bucket`` (a named piece of non-poll work)."""
+        try:
+            with self._lock:
+                name = str(bucket)
+                self._cpu_buckets[name] = self._cpu_buckets.get(name, 0.0) + float(cpu_s)
         except Exception:
             pass
 
@@ -217,6 +227,7 @@ class PerfMonitor:
                     "cpu_seconds": cpu_now,
                     "pct_1m": _cpu_pct(self._cpu, now, 60.0),
                     "pct_5m": _cpu_pct(self._cpu, now, 300.0),
+                    "by": _cpu_by(cpu_now, self._poll_cpu_s, self._cpu_buckets),
                 }
         except Exception:
             return {}
@@ -242,6 +253,7 @@ class PerfMonitor:
             self._lock_hold = _Ring()
             self._polls = {}
             self._poll_cpu_s = {}
+            self._cpu_buckets = {}
             self._flight_calls = 0
             self._flight_shared = 0
             self._caches = {}
@@ -255,6 +267,19 @@ def _w(ring: _Ring, now: float, pct: float):
     if pct >= 100:
         return vals[-1]
     return _pct(vals, pct)
+
+
+def _cpu_by(cpu_now, poll_cpu: dict, buckets: dict) -> dict:
+    """Process CPU since start split into polls, each named bucket, and the rest.
+
+    ``unattributed`` is what no poll or bucket measured: other threads, the
+    interpreter's own start-up, and subprocess-free work nobody charged yet.
+    """
+    polls = sum(poll_cpu.values())
+    out = {"polls": polls, **buckets}
+    if cpu_now is not None:
+        out["unattributed"] = max(0.0, float(cpu_now) - polls - sum(buckets.values()))
+    return out
 
 
 def _cpu_pct(samples: list, now: float, span: float):
@@ -294,6 +319,16 @@ def record_lock(wait_s: float, hold_s: float) -> None:
 def record_poll(source: str, duration_s: float, interval_s=None, cpu_s=None) -> None:
     """Module shorthand: one finished source poll into the monitor."""
     _MONITOR.record_poll(source, duration_s, interval_s, cpu_s)
+
+
+@contextlib.contextmanager
+def cpu_charge(bucket: str):
+    """Charge the calling thread's CPU inside the block to ``bucket`` (never raises)."""
+    start = time.thread_time()
+    try:
+        yield
+    finally:
+        _MONITOR.record_cpu(bucket, time.thread_time() - start)
 
 
 def record_flight(shared: bool) -> None:

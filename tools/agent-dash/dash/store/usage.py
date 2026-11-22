@@ -30,6 +30,39 @@ from .util import (_ESTIMATE_TOOL, RANGE_S, SAMPLE_KEEP_S,
                  TOKEN_FIELDS, UNASSIGNED, WS_STATUSES,
                  _hour, _manifest_family, _money, _opt_int, _same)
 
+
+#: Prices the hour rebuild already computed, keyed by every input of
+#: ``pricing.cost``. A busy hour holds thousands of usage events and is rebuilt
+#: after every usage write, so without this each rebuild re-priced the whole
+#: hour (about 9 us a row). A new catalog object (the price file changed)
+#: clears it, and so does reaching ``_HOUR_PRICE_MAX`` entries.
+_HOUR_PRICES: dict = {}
+_HOUR_PRICE_TABLE: list = [None]
+_HOUR_PRICE_MAX = 100_000
+
+
+def _hour_price(table, model, input_tokens, output_tokens, cache_read, cache_write,
+                cache_write_5m, cache_write_1h, reasoning, ts):
+    """``pricing.cost`` for one usage row, memoised per catalog object."""
+    if _HOUR_PRICE_TABLE[0] is not table:
+        _HOUR_PRICES.clear()
+        _HOUR_PRICE_TABLE[0] = table
+    key = (model, input_tokens, output_tokens, cache_read, cache_write,
+           cache_write_5m, cache_write_1h, reasoning, ts)
+    try:
+        return _HOUR_PRICES[key]
+    except KeyError:
+        pass
+    priced = price_cost(
+        model, input_tokens, output_tokens, cache_read, cache_write, table,
+        cache_write_5m=cache_write_5m, cache_write_1h=cache_write_1h,
+        reasoning=reasoning, ts=ts,
+    )
+    if len(_HOUR_PRICES) >= _HOUR_PRICE_MAX:
+        _HOUR_PRICES.clear()
+    _HOUR_PRICES[key] = priced
+    return priced
+
 #: Per-run event folds cached beside the database. The file is rewritten
 #: at most once per interval, and a dirty set larger than the cap falls
 #: back to one full scan instead of chunked refolds.
@@ -747,17 +780,17 @@ class UsageMixin:
                         bucket[name] += row[name]
                 if missing:
                     continue
-                priced = price_cost(
+                priced = _hour_price(
+                    table,
                     row["model"],
                     row["input_tokens"],
                     row["output_tokens"],
                     row["cache_read"],
                     row["cache_write"],
-                    table,
-                    cache_write_5m=row["cache_write_5m"],
-                    cache_write_1h=row["cache_write_1h"],
-                    reasoning=row["reasoning"],
-                    ts=row["ts"],
+                    row["cache_write_5m"],
+                    row["cache_write_1h"],
+                    row["reasoning"],
+                    row["ts"],
                 )
                 if priced is None:
                     bucket["unpriced"] = 1

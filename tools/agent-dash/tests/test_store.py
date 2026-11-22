@@ -4893,3 +4893,39 @@ class FamilyTierTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HourPriceMemoTests(unittest.TestCase):
+    """The hour rebuild prices each distinct usage row once per catalog object."""
+
+    def setUp(self):
+        usage_mod._HOUR_PRICES.clear()
+        usage_mod._HOUR_PRICE_TABLE[0] = None
+
+    def price(self, table, ts=1_700_000_000.0, output=50):
+        return usage_mod._hour_price(table, "claude-opus-4-1", 100, output, 0, 0, None, None, None, ts)
+
+    def test_a_repeated_row_is_priced_once_and_matches_pricing_cost(self):
+        table = [dict(row) for row in usage_mod._price_catalog()]
+        with mock.patch.object(usage_mod, "price_cost", wraps=usage_mod.price_cost) as priced:
+            first = self.price(table)
+            second = self.price(table)
+        self.assertEqual(priced.call_count, 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first, cost("claude-opus-4-1", 100, 50, 0, 0, table, ts=1_700_000_000.0))
+
+    def test_any_changed_input_is_priced_again(self):
+        table = usage_mod._price_catalog()
+        with mock.patch.object(usage_mod, "price_cost", wraps=usage_mod.price_cost) as priced:
+            self.price(table)
+            self.price(table, output=51)
+            self.price(table, ts=1_700_003_600.0)
+        self.assertEqual(priced.call_count, 3)
+
+    def test_a_new_catalog_object_clears_the_memo(self):
+        old = [dict(row) for row in usage_mod._price_catalog()]
+        new = [dict(row) for row in usage_mod._price_catalog()]
+        with mock.patch.object(usage_mod, "price_cost", wraps=usage_mod.price_cost) as priced:
+            self.price(old)
+            self.price(new)
+        self.assertEqual(priced.call_count, 2)

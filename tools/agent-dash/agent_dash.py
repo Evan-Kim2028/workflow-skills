@@ -18,6 +18,7 @@ from dash import dataroot
 from dash import errors
 from dash import deploy as deploy_lib
 from dash.buildinfo import build_info
+from dash.perfmon import cpu_charge
 from dash.bundles import cmd_ws
 from dash.locate import expand, ignore_local
 from dash.pricing import reprice as reprice_usage
@@ -2638,11 +2639,16 @@ def _serve() -> None:
         while not stop.wait(0.25):
             now = time.time()
             try:
-                registry.tick(store, cfg, now, stop=stop)
-                last_reconcile = reconcile_if_due(store, now, last_reconcile)
-                last_prune = prune_if_due(store, STATE_DIR, now, last_prune)
-                last_rollup = rollup_if_due(store, cfg, now, last_rollup)
-                last_reprice = reprice_if_due(store, now, last_reprice)
+                with cpu_charge("collector_tick"):
+                    registry.tick(store, cfg, now, stop=stop)
+                with cpu_charge("reconcile"):
+                    last_reconcile = reconcile_if_due(store, now, last_reconcile)
+                with cpu_charge("prune"):
+                    last_prune = prune_if_due(store, STATE_DIR, now, last_prune)
+                with cpu_charge("rollup"):
+                    last_rollup = rollup_if_due(store, cfg, now, last_rollup)
+                with cpu_charge("reprice"):
+                    last_reprice = reprice_if_due(store, now, last_reprice)
             except Exception:
                 logging.exception("collector tick failed")
         server.stop.set()
