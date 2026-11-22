@@ -31,6 +31,7 @@
     ["log_archive", "Log archive"],
     ["agentq_jobs", "agentq job folders"],
     ["scratch", "Worker scratch"],
+    ["worktrees", "Git worktrees"],
     ["session_originals", "Session originals"]
   ];
 
@@ -94,6 +95,7 @@
     var rate = (rates.components || {})[name];
     var tr = el("tr", {class: "sb-row"});
     tr.appendChild(el("th", {scope: "row", text: label}));
+    tr.appendChild(el("td", {class: "sb-num", text: fmtBytes(comp.physical || 0)}));
     tr.appendChild(el("td", {class: "sb-num", text: fmtBytes(comp.bytes || 0)}));
     tr.appendChild(el("td", {class: "sb-num", text: sbRate(rate)}));
     tr.appendChild(el("td", {class: "sb-num", text: comp.units ? fmtN(comp.units) : "-"}));
@@ -139,7 +141,7 @@
     var table = el("table", {class: "sb-table"});
     var thead = el("thead");
     var hr = el("tr");
-    ["Component", "Size", "7-day rate", "Units"].forEach(function (label, i) {
+    ["Component", "On disk", "Apparent", "7-day rate", "Units"].forEach(function (label, i) {
       hr.appendChild(el("th", {scope: "col", class: i ? "sb-num" : "", text: label}));
     });
     thead.appendChild(hr);
@@ -148,12 +150,23 @@
     SB_COMPONENTS.forEach(function (pair) { tbody.appendChild(sbRow(pair[0], pair[1], sample, rates)); });
     var foot = el("tr", {class: "sb-foot"});
     foot.appendChild(el("th", {scope: "row", text: "Footprint (no double count)"}));
+    foot.appendChild(el("td", {class: "sb-num", text: fmtBytes(sample.footprint_physical || 0)}));
     foot.appendChild(el("td", {class: "sb-num", text: fmtBytes(sample.footprint || 0)}));
     foot.appendChild(el("td", {class: "sb-num", text: sbRate(rates.footprint)}));
     foot.appendChild(el("td", {class: "sb-num", text: "-"}));
     tbody.appendChild(foot);
     table.appendChild(tbody);
     c.appendChild(table);
+
+    var worktrees = (sample.components || {}).worktrees || {};
+    if (worktrees.count) {
+      c.appendChild(el("p", {
+        class: "sb-note",
+        text: "Worktrees: " + fmtN(worktrees.count) + ", oldest idle " +
+          (worktrees.idle_hours == null ? "-" : Math.round(worktrees.idle_hours) + " h") +
+          (worktrees.idle_path ? " (" + worktrees.idle_path + ")" : "")
+      }));
+    }
 
     var proj = el("p", {class: "sb-proj"});
     proj.appendChild(el("b", {text: "Days to full: "}));
@@ -162,6 +175,11 @@
       " \u00B7 85% " + storageBudgetDays(days["85"]) + " at " + sbRate(projection.rate_bytes_per_day)
     ));
     c.appendChild(proj);
+    c.appendChild(el("p", {
+      class: "sb-note",
+      text: "On disk counts each physical extent once (APFS clones share extents); " +
+        "files under 64 KiB are counted at their apparent size. The projection uses the on-disk rate."
+    }));
     c.appendChild(el("p", {
       class: "sb-note",
       text: "Warn at " + (th.warn_disk_pct || 70) + "% used or under " + (th.warn_days_to_80 || 365) +
