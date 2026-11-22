@@ -83,13 +83,41 @@ The verification therefore compares per `path` (the unit id), not just per
   shows `n/a` in the token column, because those rows carry usage the
   archive does not hold;
 - a path the archive has and the live store never ingested is `new-only`:
-  it adds rows rather than missing them.
+  it adds rows rather than missing them;
+- a path the archive has, the live store never had, and the rebuilt store
+  lacks is `archive-only`: the store rejected its rows (a future timestamp
+  from a test fixture, or a reader that produced none), so neither store
+  can hold it. The archive still has the bytes, so it is reported, not a
+  failure.
 
 The archive's path list is written to `DIR.rebuild/meta.json` as
 `expected_paths` at the end of a rebuild; the cutover extends it with the
-delta units it re-ingests. A cutover run before those live-only units are
-archived loses their rows: run `agent_dash.py logs sessions` (or the hourly
-job) first, then rebuild again.
+delta units it re-ingests and the paths it copies from the live store.
+
+### Copying the rows the archive cannot reproduce
+
+A live-only path is a session ingested live but not yet archived. The
+cutover copies it from the live store into the rebuilt one before the swap,
+so the swap does not lose it. The same step copies any archived path the
+rebuilt store lacks (nothing to read, so it is reported and skipped).
+
+```sh
+# standalone: copy into an existing rebuilt store, then verify per path
+python3 agent_dash.py logs rebuild-store --data-dir "$AGENT_SCRATCH/vlogs-rebuild" \
+    --port 19429 --copy-from-live --apply
+```
+
+Dry run unless `--apply`. It reads the live store (read-only), queries one
+`path:in(...)` batch at a time, re-inserts each row with the same `_time`,
+`_msg`, `ws`, `label` and fields, applies the same base64 strip and the
+same `unit`/`session` dedupe the rebuild uses, flushes once per batch, and
+verifies per path that the rebuilt count equals the live count. A row the
+rebuilt store already holds is skipped, so a second pass adds only the
+delta. The copied paths are added to `expected_paths` in `meta.json`.
+
+The cutover runs the copy twice: once after pausing the archive job (the
+live-only set is then complete), and again after the delta re-ingest (rows
+that arrived while it ran). It refuses to swap if a path is still short.
 - Never touches the live store or the plist. The live store is read only,
   for the verification queries.
 
@@ -104,18 +132,24 @@ python3 agent_dash.py logs cutover-store --from "$AGENT_SCRATCH/vlogs-rebuild" -
 
 Dry run unless `--apply`. In order:
 
-1. Stops `com.agent-dash.vlogs` and pauses the hourly archive job
-   `com.agent-dash.session-archive`, so nothing is archived mid-swap.
-2. Re-ingests every unit archived **after the rebuild's snapshot**
+1. Pauses the hourly archive job `com.agent-dash.session-archive`, so
+   nothing is archived mid-swap. The live store stays up for the copy.
+2. Copies every live-only path and every archived path the rebuilt store
+   lacks from the live store (see above), and verifies per path.
+3. Re-ingests every unit archived **after the rebuild's snapshot**
    (`DIR.rebuild/meta.json`), so rows written while the rebuild ran are not
    lost.
-3. Renames the live data dir to `<dir>.old-<date>` and moves the rebuilt
-   dir into place (a rename, so both must be on one filesystem).
-4. Starts the service, waits for `/health`, and re-runs the verification
+4. Copies again for the delta: rows that arrived while step 3 ran. The copy
+   skips rows the rebuilt store already holds, so it adds only the new ones.
+   It refuses to swap if a path is still short.
+5. Stops `com.agent-dash.vlogs`, renames the live data dir to
+   `<dir>.old-<date>`, and moves the rebuilt dir into place (a rename, so
+   both must be on one filesystem).
+6. Starts the service, waits for `/health`, and re-runs the verification
    against the live port.
-5. On failure, stops the service, moves the rebuilt dir back, restores the
+7. On failure, stops the service, moves the rebuilt dir back, restores the
    old dir, and starts the service again.
-6. Resumes the archive job.
+8. Resumes the archive job.
 
 The old dir is kept. Remove it when satisfied:
 
