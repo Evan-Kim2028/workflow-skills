@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agentq import cli, db
 from agentq import gc as G
+from dash import logarchive
 from fake_vlogs import FakeClient, stream_bytes
 
 NOW = 1_800_000_000.0
@@ -359,6 +360,13 @@ class GcCommandTest(unittest.TestCase):
         # point it at the temp state dir so a test never writes the live one.
         out = io.StringIO()
         with mock.patch.dict(os.environ, {"AGENT_DASH_STATE_DIR": str(self.state)}):
+            # A regression here once wrote a fixture into the live archive
+            # (agentq/jobs/a1b2c3d4e5f0/...): fail before the run, not after.
+            self.assertEqual(
+                logarchive.archive_root(),
+                self.state / "log-archive",
+                "the test must not write the live log archive",
+            )
             code = cli.main(argv, env=self.env, out=out, now=lambda: NOW)
         return code, out.getvalue()
 

@@ -657,7 +657,13 @@ def verify(
     new_paths = {path for (_ws, path) in new_map}
     # Without the archive's own path list the two stores must agree exactly.
     expected = {path for path in (expected_paths if expected_paths is not None else old_paths)}
-    missing = sorted(expected - new_paths)
+    missing_all = sorted(expected - new_paths)
+    # A path the archive has, the live store never had, and the rebuilt store
+    # lacks is archive-only: the store rejected its rows (a future timestamp)
+    # or the reader produced none, so neither store can hold it. The archive
+    # still has the bytes, so it is not a rebuild failure.
+    archive_only = [p for p in missing_all if p not in old_paths]
+    missing = [p for p in missing_all if p in old_paths]
     # A live-only row: the live store has it and the archive does not, so the
     # rebuild cannot reproduce it. Reported, never counted as loss.
     live_only: dict = {}
@@ -762,7 +768,239 @@ def verify(
         )
         for path in missing[:10]:
             print("    %s" % path, file=out)
+    if archive_only:
+        print(
+            "  archive-only: %d archived paths have no rows in either store"
+            " (the store rejected them, e.g. a future timestamp); the archive"
+            " still holds the bytes" % len(archive_only),
+            file=out,
+        )
+        for path in archive_only[:10]:
+            print("    %s" % path, file=out)
     return ok, table
+
+
+# ------------------------------------------------------- copy from live
+
+#: Fields a copied row must not carry: the store's own stream bookkeeping,
+#: and the duplicate ``unit``/``session`` copies of ``path``/``label`` that
+#: the rebuild does not write. ``session`` is a real field on an agentq row
+#: (the agentq session id), so it is dropped only on a native row.
+COPY_DROP = ("_stream", "_stream_id", "unit")
+
+#: Paths per ``path:in(...)`` query. One query and one flush per batch.
+COPY_BATCH_PATHS = 16
+
+
+def _copy_drop(row: dict) -> set:
+    drop = set(COPY_DROP)
+    if str(row.get("kind") or "") == "native":
+        drop.add("session")
+    return drop
+
+
+def _copy_row(row: dict) -> bytes | None:
+    """One live row as a rebuilt-store row: same _time, _msg, ws, label, fields.
+
+    The live store's rows carry ``unit`` and (on a native row) ``session``,
+    duplicates of ``path`` and ``label`` that the rebuild does not write, and
+    the store's own ``_stream``/``_stream_id``. ``_msg`` is stripped again
+    with the same filter the rebuild uses: a no-op on an already-stripped row,
+    and the right thing on an older one.
+    """
+    msg = row.get("_msg")
+    if not isinstance(msg, str):
+        return None
+    text, _removed, _replaced = logfilter.strip_text(msg)
+    drop = _copy_drop(row)
+    out = {"_time": str(row.get("_time") or ""), "_msg": text}
+    for key, value in row.items():
+        if key in drop or key in ("_time", "_msg"):
+            continue
+        if value is None or value == "":
+            continue
+        out[key] = value
+    return json.dumps(out, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
+
+
+def _row_key(row: dict) -> str:
+    """A row's identity for the copy: every field the rebuild writes, sorted.
+
+    Used to skip a row the rebuilt store already holds, so a second copy
+    pass (the delta after the archive job is paused) adds only new rows
+    instead of duplicating the ones the first pass copied.
+    """
+    drop = _copy_drop(row)
+    items = []
+    for key, value in row.items():
+        if key in drop or value is None or value == "":
+            continue
+        if key == "_msg":
+            value, _removed, _replaced = logfilter.strip_text(value)
+        items.append((key, str(value)))
+    return json.dumps(sorted(items), ensure_ascii=True, separators=(",", ":"))
+
+
+def _in_filter(paths) -> str:
+    return "path:in(%s)" % ",".join('"%s"' % _quote(p) for p in paths)
+
+
+def path_counts(client) -> dict:
+    """``{path: rows}`` for the whole store, in one query."""
+    rows = client.query("* | stats by (path) count() n")
+    return {str(r.get("path") or ""): int(r.get("n") or 0) for r in rows}
+
+
+def copy_plan(live_client, expected_paths) -> tuple[list[str], list[str]]:
+    """``(live_only, missing)``: the paths the copy must read from the live store.
+
+    ``live_only`` is a path the live store has and the archive does not: a
+    session ingested live but not yet archived, which a rebuild cannot
+    reproduce. ``missing`` is a path the archive has and the live store
+    lacks: the copy has nothing to read for it, so it is reported and
+    skipped (the archive still holds the bytes).
+    """
+    live = path_counts(live_client)
+    expected = set(expected_paths)
+    live_only = sorted(p for p in live if p not in expected)
+    missing = sorted(p for p in expected if p not in live)
+    return live_only, missing
+
+
+def copy_from_live(live_client, new_client, paths, out=None, batch=COPY_BATCH_PATHS) -> dict:
+    """Copy every row of ``paths`` from the live store into the rebuilt one.
+
+    One ``path:in(...)`` query and one flush per batch. A row keeps its
+    ``_time``, ``_msg``, ``ws``, ``label`` and every other field, minus the
+    store's own ``_stream``/``_stream_id`` and the duplicate ``unit``/
+    ``session`` fields the rebuild does not write; ``_msg`` is stripped with
+    the same filter the rebuild uses. A row the rebuilt store already holds
+    (by ``_row_key``) is skipped, so a second pass adds only the delta.
+
+    Returns ``{path: {live, copied, rebuilt, ok}}``. A path the live store
+    has no rows for is ``ok`` with nothing copied: the archive has it and
+    the live store never ingested it, so there is nothing to copy.
+    """
+    out = out or sys.stdout
+    live = path_counts(live_client)
+    result = {}
+    wanted = []
+    for path in paths:
+        n = live.get(path, 0)
+        result[path] = {"live": n, "copied": 0, "rebuilt": 0, "ok": n == 0}
+        if n:
+            wanted.append(path)
+    for start in range(0, len(wanted), batch):
+        chunk = wanted[start:start + batch]
+        # All fields, and one row more than the live count so a store that
+        # grew since the count is visible as a short copy, not a silent cut.
+        limit = sum(live[p] for p in chunk) + 1
+        rows = live_client.query("%s | limit %d" % (_in_filter(chunk), limit))
+        have = {}
+        for row in new_client.query(_in_filter(chunk)):
+            key = _row_key(row)
+            have[key] = have.get(key, 0) + 1
+        lines = []
+        per_path = {}
+        for row in rows:
+            path = str(row.get("path") or "")
+            key = _row_key(row)
+            if have.get(key):
+                have[key] -= 1
+                continue
+            line = _copy_row(row)
+            if line is None:
+                continue
+            lines.append(line)
+            per_path[path] = per_path.get(path, 0) + 1
+        new_client.insert(lines)
+        new_client.flush()
+        for path in chunk:
+            rebuilt = new_client.count(path)
+            result[path]["copied"] = per_path.get(path, 0)
+            result[path]["rebuilt"] = rebuilt
+            result[path]["ok"] = rebuilt == live[path]
+    return result
+
+
+def copy_only(
+    *,
+    data_dir,
+    port,
+    apply: bool = False,
+    url: str | None = None,
+    state=None,
+    dest=None,
+    out=None,
+    bin_path=None,
+    plist=None,
+    store=None,
+    client_factory=None,
+    old_client=None,
+    batch=COPY_BATCH_PATHS,
+) -> int:
+    """Copy the live-only and MISSING paths from the live store into a rebuilt one.
+
+    Standalone form of the cutover's copy step: it starts the rebuilt store
+    on its own port, reads the live store (read-only), copies every path the
+    archive cannot reproduce, verifies per path, and records the copied
+    paths in the rebuild metadata so the cutover's verification expects them.
+    """
+    out = out or sys.stdout
+    state_dir = Path(state) if state is not None else _state_dir()
+    dest = dest or sessionarchive.load_config(state_dir)["dest"]
+    live_url = url or "http://127.0.0.1:%d" % live_port(plist)
+    client_factory = client_factory or (lambda u: vlogs.VLogsClient(u, timeout=600.0))
+    meta = read_meta(data_dir)
+    expected = meta.get("expected_paths")
+    if expected is None:
+        jobs = session_jobs(dest) + log_jobs(state_dir)
+        expected = sorted({job_path(job) for job in jobs})
+    live_client = old_client or client_factory(live_url)
+    live_only, missing = copy_plan(live_client, expected)
+    live = path_counts(live_client)
+    rows = sum(live.get(p, 0) for p in live_only)
+    print(
+        "copy plan: %d live-only paths (%d rows), %d archived paths the live store lacks"
+        % (len(live_only), rows, len(missing)),
+        file=out,
+    )
+    for path in missing[:10]:
+        print("  MISSING (nothing to copy): %s" % path, file=out)
+    if not apply:
+        print("dry run: pass --apply to start the store and copy", file=out)
+        return 0
+    if not os.path.isdir(data_dir):
+        print("rebuilt data dir not found: %s" % data_dir, file=sys.stderr)
+        return 2
+    side = sidecar_dir(data_dir)
+    store = store or Store(
+        bin_path or DEFAULT_BIN, data_dir, port, live_flags(plist),
+        log_path=str(side / "vlogs.log"),
+    )
+    store.start()
+    try:
+        new_client = client_factory(store.url)
+        result = copy_from_live(live_client, new_client, live_only + missing, out=out, batch=batch)
+        copied = sorted(p for p, r in result.items() if r["copied"])
+        bad = sorted(p for p, r in result.items() if not r["ok"])
+        print(
+            "copied %d rows in %d paths; %d paths short"
+            % (sum(r["copied"] for r in result.values()), len(copied), len(bad)),
+            file=out,
+        )
+        for path in bad[:10]:
+            r = result[path]
+            print("  SHORT %s: live %d, rebuilt %d" % (path, r["live"], r["rebuilt"]), file=out)
+        if copied:
+            meta["expected_paths"] = sorted(set(expected) | set(copied))
+            write_meta(data_dir, meta)
+        ok, _table = verify(
+            live_client, new_client, out=out, expected_paths=meta.get("expected_paths") or expected
+        )
+    finally:
+        store.stop()
+    return 0 if ok and not bad else 1
 
 
 # --------------------------------------------------------------- rebuild
@@ -1077,13 +1315,14 @@ def cutover(
     old_dir = "%s.old-%s" % (live_data, stamp)
 
     print("cutover plan:", file=out)
-    print("  stop %s" % VLOGS_LABEL, file=out)
     print("  pause %s (so nothing is archived mid-swap)" % ARCHIVE_LABEL, file=out)
+    print("  copy live-only paths and archived paths the live store lacks from %s" % live_url, file=out)
     print(
         "  re-ingest %d units archived after %s (%d rows) into %s"
         % (len(delta), meta["snapshot_ts"], delta_rows, from_dir),
         file=out,
     )
+    print("  copy again for the delta, then stop %s" % VLOGS_LABEL, file=out)
     print("  rename %s -> %s" % (live_data, old_dir), file=out)
     print("  move %s -> %s" % (from_dir, live_data), file=out)
     print("  start %s, verify against %s, swap back on failure" % (VLOGS_LABEL, live_url), file=out)
@@ -1098,14 +1337,30 @@ def cutover(
         log_path=str(sidecar_dir(from_dir) / "vlogs.log"),
     )
 
-    # 1. Stop the live service and pause the hourly archive job, so the delta
-    #    set is complete: nothing can be archived between the scan and the swap.
-    service.stop()
+    # 1. Pause the hourly archive job, so the delta set is complete: nothing
+    #    can be archived between the scan and the swap. The live store stays
+    #    up for the copy, which reads it.
     archive_service.stop()
 
-    # 2. Re-ingest the delta into the rebuilt store.
+    # 2. Copy the rows the archive cannot reproduce (live-only paths) and any
+    #    archived path the rebuild could not ingest, from the live store.
+    store.start()
+    live_client = old_client or client_factory(live_url)
+    live_only, missing = copy_plan(live_client, expected_paths)
+    print(
+        "  copy %d live-only paths and %d archived paths the live store lacks"
+        % (len(live_only), len(missing)),
+        file=out,
+    )
+    copy_result = copy_from_live(
+        live_client, client_factory(store.url), live_only + missing, out=out
+    )
+    copied_paths = {p for p, r in copy_result.items() if r["copied"]}
+    expected_paths |= copied_paths
+
+    # 3. Re-ingest the delta into the rebuilt store.
+    errors = 0
     if delta:
-        store.start()
         local = threading.local()
 
         def client_for():
@@ -1115,7 +1370,6 @@ def cutover(
                 local.client = client
             return client
 
-        errors = 0
         for job in delta:
             try:
                 ingest_job(job, client_for())
@@ -1123,14 +1377,30 @@ def cutover(
                 errors += 1
                 print("  ERROR delta %s: %s" % (job.key, exc), file=out)
         client_for().flush()
-        store.stop()
+
+    # 4. Copy again for the delta: rows that arrived while step 3 ran. The
+    #    copy skips rows the rebuilt store already holds, so this adds only
+    #    the new ones.
+    copy_result = copy_from_live(
+        live_client, client_factory(store.url), live_only + missing, out=out
+    )
+    copied_paths |= {p for p, r in copy_result.items() if r["copied"]}
+    expected_paths |= copied_paths
+    short = sorted(p for p, r in copy_result.items() if not r["ok"])
+    store.stop()
+    if errors or short:
         if errors:
             print("  %d delta units failed; not swapping" % errors, file=out)
-            service.start()
-            archive_service.start()
-            return 1
+        if short:
+            print("  %d paths are still short after the copy; not swapping" % len(short), file=out)
+            for path in short[:10]:
+                r = copy_result[path]
+                print("    %s: live %d, rebuilt %d" % (path, r["live"], r["rebuilt"]), file=out)
+        archive_service.start()
+        return 1
 
-    # 3. Swap the directories.
+    # 5. Stop the live service and swap the directories.
+    service.stop()
     try:
         os.rename(live_data, old_dir)
     except OSError as exc:
@@ -1190,7 +1460,7 @@ USAGE = """\
 usage:
   agent_dash.py logs rebuild-store --data-dir DIR --port P [--apply] [--parallel N]
       [--limit N] [--no-resume] [--keep-running] [--url URL] [--dest DIR]
-      [--bin PATH] [--plist PATH] [--memcap MB] [--no-memcap]
+      [--bin PATH] [--plist PATH] [--memcap MB] [--no-memcap] [--copy-from-live]
   agent_dash.py logs cutover-store --from DIR [--apply] [--url URL] [--dest DIR]
       [--live-data DIR] [--port P] [--plist PATH]
 
@@ -1199,6 +1469,12 @@ second VictoriaLogs on a scratch port and data dir, verifies it per ws
 against the live store, and prints a cutover plan. It never touches the
 live store or the plist. Resumable: a checkpoint per unit lives beside
 the data dir (DIR.rebuild/).
+
+rebuild-store --copy-from-live copies the paths the archive cannot
+reproduce (a session ingested live but not yet archived) and any archived
+path the rebuilt store lacks from the live store into the rebuilt one,
+then verifies per path. It is the cutover's copy step, usable on its own
+before the swap and again for the delta after the archive job is paused.
 
 cutover-store stops the live service, pauses the hourly archive job,
 re-ingests units archived after the rebuild's snapshot, renames the live
@@ -1255,7 +1531,7 @@ def _main_rebuild(argv: list[str]) -> int:
     try:
         opts, rest = _parse(
             argv,
-            {"--apply", "--no-resume", "--keep-running", "--no-memcap"},
+            {"--apply", "--no-resume", "--keep-running", "--no-memcap", "--copy-from-live"},
             {
                 "--data-dir": None,
                 "--port": None,
@@ -1288,6 +1564,16 @@ def _main_rebuild(argv: list[str]) -> int:
     if not opts["--no-memcap"]:
         _memcap_reexec(["rebuild-store", *argv], memcap_mb)
     _low_priority()
+    if opts["--copy-from-live"]:
+        return copy_only(
+            data_dir=opts["--data-dir"],
+            port=port,
+            apply=opts["--apply"],
+            url=opts["--url"],
+            dest=opts["--dest"],
+            bin_path=opts["--bin"],
+            plist=opts["--plist"],
+        )
     return rebuild(
         data_dir=opts["--data-dir"],
         port=port,

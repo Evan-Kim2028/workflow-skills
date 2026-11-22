@@ -9,6 +9,7 @@ are synthetic: a real ``tar.zst`` from ``sessionarchive.pack`` and a real
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,11 @@ from dash import logarchive, sessionarchive, storebuild
 from tests import fake_vlogs
 
 B64 = fake_vlogs.B64
+
+
+def _parse_in(logsql):
+    inner = logsql.split("path:in(", 1)[1].split(")", 1)[0]
+    return {part.strip().strip('"') for part in inner.split(",")}
 
 
 class FakeClient:
@@ -48,6 +54,25 @@ class FakeClient:
         return sum(1 for row in self.rows if row.get("path") == path)
 
     def query(self, logsql):
+        if logsql.startswith("* | stats by (path)"):
+            counts = {}
+            for row in self.rows:
+                path = row.get("path") or ""
+                counts[path] = counts.get(path, 0) + 1
+            return [{"path": path, "n": str(n)} for path, n in counts.items()]
+        if logsql.startswith("path:in("):
+            paths = _parse_in(logsql)
+            rows = [row for row in self.rows if row.get("path") in paths]
+            if "stats by (path)" in logsql:
+                counts = {}
+                for row in rows:
+                    path = row.get("path") or ""
+                    counts[path] = counts.get(path, 0) + 1
+                return [{"path": path, "n": str(n)} for path, n in counts.items()]
+            match = re.search(r"\| limit (\d+)", logsql)
+            if match:
+                rows = rows[: int(match.group(1))]
+            return rows
         if logsql.startswith("* | stats by (ws, path)"):
             counts = {}
             for row in self.rows:
@@ -564,6 +589,42 @@ class CutoverTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(self.service.calls, [])
 
+    def test_cutover_copies_live_only_paths_before_the_swap(self):
+        self._meta(expected_paths=())
+        live = FakeClient()
+        live.insert(
+            [json.dumps({"_time": "t", "_msg": "{}", "ws": "w", "path": "live-only"})]
+        )
+        new = FakeClient()
+        code = self._cutover(
+            apply=True,
+            client_factory=lambda url: new,
+            old_client=live,
+        )
+        self.assertEqual(code, 0, self.out.getvalue())
+        self.assertEqual(new.count("live-only"), 1)
+
+    def test_cutover_refuses_to_swap_when_the_copy_is_short(self):
+        self._meta(expected_paths=())
+        live = FakeClient()
+        live.insert(
+            [json.dumps({"_time": "t", "_msg": "{}", "ws": "w", "path": "live-only"})]
+        )
+
+        class LossyClient(FakeClient):
+            def insert(self, lines):
+                return 0
+
+        code = self._cutover(
+            apply=True,
+            client_factory=lambda url: LossyClient(),
+            old_client=live,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual((self.live / "marker").read_text(), "old")
+        self.assertEqual(self.service.calls, [])
+        self.assertEqual(self.archive_service.calls, ["stop", "start"])
+
 
 class VerifyTest(unittest.TestCase):
     """``verify`` compares per ws and tells a short rebuild from live-only rows."""
@@ -623,6 +684,186 @@ class VerifyTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(table[0]["rows_ok"])
         self.assertFalse(table[0]["tokens_ok"])
+
+    def test_an_archived_path_neither_store_has_is_reported_not_failed(self):
+        old = FakeClient()
+        old.insert([json.dumps(self._row("ws1", "u1"))])
+        new = FakeClient()
+        new.insert([json.dumps(self._row("ws1", "u1"))])
+        out = io.StringIO()
+        ok, _table = storebuild.verify(old, new, out=out, expected_paths={"u1", "future"})
+        self.assertTrue(ok, out.getvalue())
+        self.assertIn("archive-only: 1", out.getvalue())
+
+
+class CopyTest(unittest.TestCase):
+    """``copy_from_live`` copies the rows the archive cannot reproduce."""
+
+    def _row(self, path, ws="native/claude", kind="native", msg="hi", **extra):
+        row = {
+            "_time": "2026-11-12T22:15:41.63Z",
+            "_msg": msg,
+            "ws": ws,
+            "label": "lbl",
+            "path": path,
+            "type": "user",
+            "kind": kind,
+        }
+        row.update(extra)
+        return row
+
+    def test_copy_copies_a_live_only_path_and_drops_duplicate_fields(self):
+        live = FakeClient()
+        live.insert([json.dumps(self._row("live-only", unit="u", session="s"))])
+        new = FakeClient()
+        result = storebuild.copy_from_live(live, new, ["live-only"], out=io.StringIO())
+        self.assertEqual(result["live-only"]["copied"], 1)
+        self.assertTrue(result["live-only"]["ok"])
+        self.assertEqual(new.count("live-only"), 1)
+        row = new.rows[0]
+        self.assertNotIn("unit", row)
+        self.assertNotIn("session", row)
+        self.assertEqual(row["_time"], "2026-11-12T22:15:41.63Z")
+        self.assertEqual(row["ws"], "native/claude")
+
+    def test_copy_keeps_session_on_an_agentq_row(self):
+        live = FakeClient()
+        live.insert(
+            [
+                json.dumps(
+                    self._row(
+                        "agentq/jobs/j1/runs/r1/pi/x.ndjson",
+                        ws="agentq",
+                        kind="log",
+                        session="sess-1",
+                    )
+                )
+            ]
+        )
+        new = FakeClient()
+        storebuild.copy_from_live(
+            live, new, ["agentq/jobs/j1/runs/r1/pi/x.ndjson"], out=io.StringIO()
+        )
+        self.assertEqual(new.rows[0]["session"], "sess-1")
+
+    def test_copy_is_idempotent(self):
+        live = FakeClient()
+        live.insert([json.dumps(self._row("p", n=i)) for i in range(3)])
+        new = FakeClient()
+        storebuild.copy_from_live(live, new, ["p"], out=io.StringIO())
+        storebuild.copy_from_live(live, new, ["p"], out=io.StringIO())
+        self.assertEqual(new.count("p"), 3)
+
+    def test_copy_adds_only_the_delta_on_a_second_pass(self):
+        live = FakeClient()
+        live.insert([json.dumps(self._row("p", n=0))])
+        new = FakeClient()
+        storebuild.copy_from_live(live, new, ["p"], out=io.StringIO())
+        live.insert([json.dumps(self._row("p", n=1))])
+        result = storebuild.copy_from_live(live, new, ["p"], out=io.StringIO())
+        self.assertEqual(result["p"]["copied"], 1)
+        self.assertEqual(new.count("p"), 2)
+
+    def test_copy_reports_a_short_copy(self):
+        live = FakeClient()
+        live.insert([json.dumps(self._row("p", n=i)) for i in range(3)])
+
+        class LossyClient(FakeClient):
+            def insert(self, lines):
+                lines = list(lines)
+                return super().insert(lines[1:])
+
+        new = LossyClient()
+        result = storebuild.copy_from_live(live, new, ["p"], out=io.StringIO())
+        self.assertFalse(result["p"]["ok"])
+        self.assertEqual(result["p"]["rebuilt"], 2)
+
+    def test_copy_skips_a_path_the_live_store_lacks(self):
+        live = FakeClient()
+        new = FakeClient()
+        result = storebuild.copy_from_live(live, new, ["archive-only"], out=io.StringIO())
+        self.assertTrue(result["archive-only"]["ok"])
+        self.assertEqual(result["archive-only"]["copied"], 0)
+
+    def test_copy_plan_splits_live_only_from_missing(self):
+        live = FakeClient()
+        live.insert([json.dumps(self._row("live-only"))])
+        live_only, missing = storebuild.copy_plan(live, {"archive-only"})
+        self.assertEqual(live_only, ["live-only"])
+        self.assertEqual(missing, ["archive-only"])
+
+
+class CopyOnlyTest(unittest.TestCase):
+    """``copy_only`` is the standalone form of the cutover's copy step."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.data = self.root / "rebuilt"
+        self.data.mkdir()
+        self.out = io.StringIO()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _meta(self):
+        storebuild.write_meta(
+            self.data, {"snapshot_ts": 1.0, "port": 19429, "expected_paths": ["u"]}
+        )
+
+    def _live(self):
+        live = FakeClient()
+        live.insert(
+            [
+                json.dumps(
+                    {
+                        "_time": "2026-11-12T22:15:41.63Z",
+                        "_msg": "{}",
+                        "ws": "w",
+                        "path": "live-only",
+                    }
+                )
+            ]
+        )
+        return live
+
+    def test_dry_run_starts_nothing(self):
+        self._meta()
+        live = self._live()
+        store = FakeStore()
+        code = storebuild.copy_only(
+            data_dir=str(self.data),
+            port=19429,
+            apply=False,
+            out=self.out,
+            store=store,
+            client_factory=lambda url: live,
+            old_client=live,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(store.started, 0)
+        self.assertIn("dry run", self.out.getvalue())
+
+    def test_apply_copies_and_records_the_paths(self):
+        self._meta()
+        live = self._live()
+        new = FakeClient()
+        store = FakeStore()
+        code = storebuild.copy_only(
+            data_dir=str(self.data),
+            port=19429,
+            apply=True,
+            out=self.out,
+            store=store,
+            client_factory=lambda url: new,
+            old_client=live,
+        )
+        self.assertEqual(code, 0, self.out.getvalue())
+        self.assertEqual(new.count("live-only"), 1)
+        meta = storebuild.read_meta(self.data)
+        self.assertIn("live-only", meta["expected_paths"])
+        self.assertEqual(store.started, 1)
+        self.assertEqual(store.stopped, 1)
 
 
 if __name__ == "__main__":
