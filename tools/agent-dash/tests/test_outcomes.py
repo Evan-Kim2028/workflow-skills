@@ -53,7 +53,7 @@ CASES = [
     (("died_early", "QUOTA", True, False), "died"),
     (("died_early", "IDLE", True, False), "died"),
     (("died_early", "DEAD", True, False), "died"),
-    # A failed agentq job is a death, never a finish (2026-11-20).
+    # A failed job is a death, never a finish (2026-11-20).
     (("failed", "DEAD", True, False), "died"),
     (("failed", None, True, False), "died"),
     # Deaths by verdict.

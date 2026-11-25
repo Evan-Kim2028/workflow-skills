@@ -1,5 +1,5 @@
 #!/bin/sh
-# session_archive_install.sh - hourly native agent-session and agentq log archive (macOS).
+# session_archive_install.sh - hourly native agent-session archive and storage budget (macOS).
 #
 # Writes a launchd agent that runs `agent_dash.py logs scheduled --apply` once an
 # hour. That one command runs two passes in one process, so the plist's
@@ -10,10 +10,7 @@
 #      lossless tar.zst copies, ingests the transcript lines into the loopback
 #      VictoriaLogs store, and reclaims originals after a longer idle window.
 #      See docs/session-archive.md.
-#   2. `logs archive --agentq --apply --scheduled` archives the finished agentq
-#      job folders under ~/.local/state/agentq/jobs: a stripped zstd copy under
-#      the log-archive tree, the rows in the same store, then the per-tool keep.
-#      See docs/log-archive.md.
+#   2. The daily storage budget sample. See docs/storage-budget.md.
 #
 #   sh scripts/session_archive_install.sh             install or update (idempotent)
 #   sh scripts/session_archive_install.sh --uninstall stop and remove the agent
@@ -28,7 +25,7 @@
 # the job never finished. The job therefore runs the deployed release
 # (~/.local/share/agent-dash/releases/CURRENT) and writes to
 # ~/.local/share/agent-sessions, and this installer refuses (exit 2) any code
-# dir, memcap.sh, dest or agentq home whose realpath is inside a TCC-protected
+# dir, memcap.sh, dest whose realpath is inside a TCC-protected
 # folder.
 #
 # Test overrides (never needed in normal use):
@@ -37,7 +34,6 @@
 #   SESSION_ARCHIVE_CODE_DIR   code dir          (default ~/.local/share/agent-dash/releases/CURRENT/tools/agent-dash)
 #   SESSION_ARCHIVE_DEST       archive dest      (default: config, else ~/.local/share/agent-sessions)
 #   SESSION_ARCHIVE_CONFIG     config file       (default <state>/config.local.json)
-#   SESSION_ARCHIVE_AGENTQ_HOME agentq home      (default $AGENTQ_HOME, else ~/.local/state/agentq)
 #   SESSION_ARCHIVE_NO_LOAD=1  write the plist but do not bootstrap it with launchctl
 
 set -eu
@@ -123,7 +119,6 @@ PY
 
 DEST="${SESSION_ARCHIVE_DEST:-$(configured_dest)}"
 DEST="$(expand_tilde "${DEST:-$HOME/.local/share/agent-sessions}")"
-AGENTQ_HOME_DIR="$(expand_tilde "${SESSION_ARCHIVE_AGENTQ_HOME:-${AGENTQ_HOME:-$HOME/.local/state/agentq}}")"
 
 TCC_HOME="$(resolve_path "$HOME")"
 
@@ -149,7 +144,6 @@ refuse_tcc() {  # refuse_tcc <what> <path>
 refuse_tcc "code dir" "$CODE_DIR"
 refuse_tcc "memcap.sh" "$MEMCAP"
 refuse_tcc "archive dest" "$DEST"
-refuse_tcc "agentq home" "$AGENTQ_HOME_DIR"
 
 if [ ! -f "$AGENT_DASH" ]; then
     warn "session_archive_install: warning: $AGENT_DASH does not exist yet."

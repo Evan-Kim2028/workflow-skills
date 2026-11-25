@@ -2,7 +2,7 @@
 # Run a command under a resident-memory cap on macOS (no systemd-run there).
 # Usage: memcap.sh <max_mb> <command...>   Kills the whole process group past the cap; exit 137.
 # The child leads its own process group, created without bash job control: `set -m` needs
-# setpgid, which some agentq pi workers refuse ("child setpgid ... Operation not permitted"),
+# setpgid, which some sandboxed workers refuse ("child setpgid ... Operation not permitted"),
 # and a refused group leaves the poll loop summing the caller's group, so the cap kill takes
 # out the caller's pipeline and memcap exits 143 with no output. When the group cannot be
 # created, the poll loop sums RSS over the child's descendant tree and kills that tree instead.
@@ -27,7 +27,7 @@ sig=""
 trap 'sig=TERM' TERM
 trap 'sig=INT' INT
 
-# memcap's own polling must not go through a PATH shim: agentq's `sleep` shim refuses a run once
+# memcap's own polling must not go through a PATH shim: a `sleep` shim can refuse a run once
 # its budget is spent, which would turn the poll loop into a fork storm.
 nap() { if [ -x /bin/sleep ]; then /bin/sleep "$1"; else sleep "$1"; fi; }
 

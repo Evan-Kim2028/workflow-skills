@@ -54,32 +54,6 @@ The `commandcode` source reads those rows and the session files under
 `~/.commandcode/projects`. Unlabelled Command Code sessions show as runs with
 no label. Throttled attempts show as `died_early` with verdict `QUOTA`.
 
-### pi workers (`launch_pi.py`)
-
-Retired: the shipped pi tiers are disabled and `muse` is the default worker.
-
-`scripts/launch_pi.py <label> <workspace> <prompt-file> <outdir> [--model M]`
-runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker on the
-River AI provider, defaulting to
-`river/deepseek-ai/DeepSeek-V4.1-Flash-1017` (use
-`--model river/zai-org/GLM-5.3-Flash` for GLM). `outdir` is any folder the
-dashboard scans, such as a scratchpad `pi/` folder. The label is validated
-with `dash/labels.py` (the module behind `agent_dash.py label check`) and
-refused with the exact fix on a weak one, and a prompt without one gets a
-`[label: <label>]` first line in the copied
-`<outdir>/prompt-<label>.md`, so the original is never modified. It writes
-`pi-sessions.tsv` (label, session id, start epoch, model),
-`stream-<label>.ndjson`, `out-<label>.md`, `err-<label>.log`, and
-`running/<label>` while the run is live, and appends `generic.jsonl`
-start/usage/finish lines (run id `pi:<session>:<label>`). The `pi` source
-reads the manifest and a `pi/` folder beside it, takes status and verdict
-from the files, and reads liveness from the live `node .../pi-coding-agent`
-process. Quota/credit exhaustion (or a rate-limit 429 the run never
-recovered from) finishes `died_early` with verdict `BLOCKED` and writes
-`QUOTA-<label>` naming the model and label; a transient 429 pi auto-retried past
-is recorded as `rate_limit_retries=<n>` on the launcher's summary line.
-See [docs/integrate.md](docs/integrate.md).
-
 ### Codex workers (`launch_codex.py`)
 
 `scripts/launch_codex.py <label> <workspace> <prompt-file> <outdir> [--model M] [--reasoning-effort E] [--tier T]`

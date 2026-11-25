@@ -323,28 +323,11 @@ def skipped_session_records(dest) -> tuple[int, int]:
     return count, rows
 
 
-def _agentq_extras(home=None) -> dict:
-    """``{job_id: extra}`` from the agentq database, for records that predate ``extra``."""
-    try:
-        jobs = logarchive.agentq_jobs(home or logarchive.agentq_home())
-    except Exception:
-        return {}
-    return {str(job.get("id")): logarchive.agentq_extra(job) for job in jobs}
-
-
-def _extra_for(rel: str, extras: dict) -> dict:
-    parts = rel.split("/")
-    if len(parts) > 2 and parts[0] == "agentq" and parts[1] == "jobs":
-        return dict(extras.get(parts[2]) or {})
-    return {}
-
-
-def log_jobs(state_dir=None, agentq_home=None) -> list[Job]:
+def log_jobs(state_dir=None) -> list[Job]:
     """One job per archived log-archive file that still has its zst."""
     state = Path(state_dir) if state_dir is not None else _state_dir()
     root = logarchive.archive_root(state)
     manifest = logarchive.Manifest(root)
-    extras = _agentq_extras(agentq_home)
     jobs: list[Job] = []
     for rel, rec in sorted(manifest.latest.items()):
         if rec.get("status") not in ("archived", "reclaimed"):
@@ -354,7 +337,7 @@ def log_jobs(state_dir=None, agentq_home=None) -> list[Job]:
             continue
         extra = rec.get("extra")
         if not isinstance(extra, dict):
-            extra = _extra_for(rel, extras)
+            extra = {}
         mtime_ns = int(rec.get("mtime_ns") or 0)
         entry = logarchive.Entry(
             path=str(rec.get("source") or ""),
@@ -805,8 +788,8 @@ def verify(
 
 #: Fields a copied row must not carry: the store's own stream bookkeeping,
 #: and the duplicate ``unit``/``session`` copies of ``path``/``label`` that
-#: the rebuild does not write. ``session`` is a real field on an agentq row
-#: (the agentq session id), so it is dropped only on a native row.
+#: the rebuild does not write. ``session`` is a real field on a job-log row
+#: (its session id), so it is dropped only on a native row.
 COPY_DROP = ("_stream", "_stream_id", "unit")
 
 #: Paths per ``path:in(...)`` query. One query and one flush per batch.

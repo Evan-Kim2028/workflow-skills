@@ -2,32 +2,8 @@
   "default": "muse",
   "auto_order": ["muse"],
   "cooldown_minutes": 30,
-  "model_caps": {"river/deepseek-ai/DeepSeek-V4.1-Flash-1017": 5},
+  "model_caps": {},
   "workers": {
-    "pi-anthropic-haiku": {
-      "enabled": false,
-      "kind": "pi",
-      "model": "anthropic/claude-haiku-5-5",
-      "extra_args": [],
-      "cap": 10,
-      "pgrep": "[l]aunch_pi.py.*--tier pi-anthropic-haiku( |$)",
-      "manifest": "pi-sessions.tsv",
-      "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
-      "cost_rank": 1
-    },
-    "pi-deepseek-flash": {
-      "enabled": false,
-      "kind": "pi",
-      "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-      "extra_args": [],
-      "cap": 5,
-      "pgrep": "[l]aunch_pi.py.*--tier pi-deepseek-flash( |$)",
-      "manifest": "pi-sessions.tsv",
-      "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
-      "cost_rank": 2
-    },
     "muse": {
       "enabled": true,
       "kind": "muse",
@@ -87,18 +63,6 @@
       "columns": ["label", "session_id", "epoch", "model"],
       "quota_patterns": ["rate limit", "quota", "429", "usage limit", "rate limit reached for requests"],
       "cost_rank": 2
-    },
-    "pi-beam": {
-      "enabled": false,
-      "kind": "pi",
-      "model": "reflection/Beam-1.0-501B-A23B",
-      "extra_args": [],
-      "cap": 5,
-      "pgrep": "[l]aunch_pi.py.*--model reflection/Beam-1.0-501B-A23B( |$)",
-      "manifest": "pi-sessions.tsv",
-      "columns": ["label", "session_id", "epoch", "model"],
-      "quota_patterns": ["rate limit", "quota", "429", "usage limit", "insufficient credits"],
-      "cost_rank": 3
     },
     "codex-luna": {
       "enabled": true,

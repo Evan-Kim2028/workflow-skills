@@ -121,7 +121,7 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py worktrees reap --repo <path> [--apply] [--skip <path-or-branch>] [--min-age <dur>] [--json]
   python3 agent_dash.py worktrees janitor --repo <path> [--apply] [--artifact-age 24h] [--pressure-pct 12] [--daily-maintenance] [--json]
   python3 agent_dash.py lanes live [--json]
-  python3 agent_dash.py logs archive [--root P]... [--agentq] [--ws ID] [--exclude GLOB]... [--min-idle-hours 3] [--keep remove|stub|stripped] (default: per tool) [--apply]
+  python3 agent_dash.py logs archive [--root P]... [--ws ID] [--exclude GLOB]... [--min-idle-hours 3] [--keep remove|stub|stripped] (default: per tool) [--apply]
   python3 agent_dash.py logs sessions [--apply] [--no-reclaim] [--scheduled] [--tool NAME]... [--limit N] [--max-minutes M] [--url URL] [--dest DIR]
   python3 agent_dash.py logs sessions restore <session-id|unit|archive> [--to DIR]
   python3 agent_dash.py logs sessions status
@@ -136,7 +136,6 @@ USAGE = """agent-dash: local read-only execution dashboard
   python3 agent_dash.py scratch status [--top N] [--json]
   python3 agent_dash.py janitor postgres [--min-age 1h] [--apply]
   python3 agent_dash.py janitor temp [--min-age 5h] [--apply]
-  python3 agent_dash.py janitor agentq [--older-than-days 7] [--apply] [--json]
 
 Agents working on a project pass --project <id> (or set the env) for
 state, check, doctor, ws ..., status: it sets the data root, state
@@ -503,10 +502,6 @@ def main(argv: list[str] | None = None) -> int:
             from dash.tempjanitor import cmd_temp
 
             return cmd_temp(args[2:])
-        if len(args) >= 2 and args[1] == "agentq":
-            from dash.agentqjanitor import cmd_agentq
-
-            return cmd_agentq(args[2:])
         if len(args) < 2 or args[1] != "postgres":
             print(USAGE, end="", file=sys.stderr)
             return 2
@@ -518,14 +513,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_logs_scheduled(argv: list[str] | None = None) -> int:
-    """The hourly launchd pass: native session archive, then the agentq log archive.
+    """The hourly launchd pass: native session archive, then the storage budget.
 
     One process, so the plist's ``taskpolicy -b``, ``memcap.sh`` and
     ``LowPriorityIO`` cover both passes, and each pass takes its own lock. The
     session pass keeps its own skip rules (20 h since the last success, memory,
-    battery). The agentq pass runs every tick: it is the only thing that moves a
-    finished job's stream into the search store, and it is incremental (a file
-    the manifest already reclaimed is skipped without being read).
+    battery).
 
     Exit code: the worse of the two (0 ok, 1 failures, 3 lock held, 5 store
     unreachable, 6 no access for a scheduled run).
@@ -548,20 +541,10 @@ def cmd_logs_scheduled(argv: list[str] | None = None) -> int:
             print("unknown logs scheduled argument: %s" % a, file=sys.stderr)
             return 2
         i += 1
-    from dash import agentqjanitor, logarchive, sessionarchive, storagebudget
+    from dash import sessionarchive, storagebudget
 
     print("== logs sessions --scheduled", flush=True)
     sessions_rc = sessionarchive.run({"apply": apply, "scheduled": True, "url": url})
-    print("== logs archive --agentq --scheduled", flush=True)
-    archive_rc = logarchive.run(
-        {"agentq": True, "apply": apply, "scheduled": True, "url": url or logarchive.vlogs.DEFAULT_URL}
-    )
-    # agentq's own backup cruft (broker.json.bak-*, agentq.db.bak-*,
-    # ws-live-edits-*.patch) is compressed in place, never deleted. It is a
-    # no-op when nothing is older than 7 days, so the hourly tick costs one
-    # directory listing.
-    print("== janitor agentq", flush=True)
-    janitor_rc = agentqjanitor.run(apply=apply)
     # The storage budget measures once a day (it skips when the last sample is
     # under 20 h old). It never deletes anything; an alert exits 1 so the
     # launchd job's failure is visible, and the doctor check reads the same
@@ -570,7 +553,7 @@ def cmd_logs_scheduled(argv: list[str] | None = None) -> int:
     # A dry run measures and prints but records no sample: only --apply (what
     # the launchd job runs) writes history.
     storage_rc = storagebudget.run({"scheduled": True, "url": url, "record": bool(apply)})
-    return max(sessions_rc, archive_rc, janitor_rc, storage_rc)
+    return max(sessions_rc, storage_rc)
 
 
 def cmd_run(argv: list[str] | None = None) -> int:

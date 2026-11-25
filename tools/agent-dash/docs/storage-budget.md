@@ -18,8 +18,7 @@ anything, and it never sets a VictoriaLogs option that drops old partitions.
 | `vlogs_uncompressed` | `vl_uncompressed_data_size_bytes` | The same rows before compression; reported, never added to the footprint. |
 | `session_archive` | `<dest>/archive/**/*.tar.zst` | Lossless native session archive. |
 | `session_manifest` | `<dest>/state/manifest.jsonl` + `manifest-segments/` | The append-only manifest and its rolled-off segments. |
-| `log_archive` | `<state>/log-archive/` | Stripped zstd copies of agentq job streams. |
-| `agentq_jobs` | `~/.local/state/agentq/jobs` | Finished and running job folders. |
+| `log_archive` | `<state>/log-archive/` | Stripped zstd copies of job streams. |
 | `scratch` | `$AGENT_DASH_SCRATCH_ROOT` (default `~/.cache/agent-dash/scratch`) | Worker scratch. |
 | `worktrees` | `~/Documents/worktrees/<repo>/<task>` plus a main checkout's `.worktrees/<task>` | Git worktrees, with the count and the oldest idle hours (newest of the worktree's git index/HEAD mtime). |
 | `session_originals` | the tool roots in `sessionarchive.TOOLS` | Session files not reclaimed yet. |
@@ -56,7 +55,6 @@ A full measurement on this laptop (2026-11-21, read-only, `--no-record`):
 | component | on disk | apparent | files |
 |---|---|---|---|
 | git worktrees | 60.2 GiB | 111.3 GiB | 3,655,354 |
-| agentq job folders | 12.1 GiB | 12.1 GiB | 280,376 |
 | session archive | 11.1 GiB | 11.1 GiB | 11,386 |
 | session originals | 10.3 GiB | 10.3 GiB | 71,887 |
 | worker scratch | 4.7 GiB | 11.8 GiB | 243,199 |
@@ -100,9 +98,9 @@ dashboard card and the doctor check read the same verdict.
 ## Where it runs
 
 `agent_dash.py logs scheduled --apply` (the hourly
-`com.agent-dash.session-archive` job) calls it after the two archive passes.
+`com.agent-dash.session-archive` job) calls it after the session archive pass.
 It skips when the last sample is under 20 hours old, so the hourly tick
-records once a day. The same tick runs `janitor agentq` (see below).
+records once a day.
 
 ## Dashboard
 
@@ -131,27 +129,4 @@ python3 agent_dash.py storage budget --no-record
 
 # store counters only, no tree walk
 python3 agent_dash.py storage budget --no-walk
-```
-
-## agentq backup cruft
-
-`~/.local/state/agentq` accumulates `broker.json.bak-*`,
-`agentq.db.bak-*`, `ws-live-edits-*.patch` and `*.plist.bak-*` files that
-nothing pruned. `agent_dash.py janitor agentq` zstd-compresses a backup
-older than `--older-than-days` (default 7) in place to `<name>.zst` and
-removes the plain file only after the compressed copy decompresses to the
-identical sha256. It never deletes history: the compressed copy stays.
-
-It skips a file that is a symlink, not a regular file, already compressed,
-has a `.zst` beside it, is newer than the cutoff, or is held open by a
-process (one `lsof -Fn` snapshot; a failing lsof keeps everything). Dry run
-unless `--apply`; a dry run compresses to a temp file to measure the real
-saving, then deletes it. The hourly archive tick runs it with `--apply`; it
-is a no-op when nothing is old enough, so the tick costs one directory
-listing.
-
-```sh
-python3 agent_dash.py janitor agentq                 # dry run
-python3 agent_dash.py janitor agentq --apply         # compress in place
-python3 agent_dash.py janitor agentq --json          # machine output
 ```

@@ -126,7 +126,7 @@ class MemcapTest(unittest.TestCase):
 
 
 class MemcapWithoutJobControlTest(unittest.TestCase):
-    """The agentq pi worker condition: a session leader with no controlling terminal.
+    """A worker with a restricted session: a session leader with no controlling terminal.
 
     There `set -m` cannot create the child's process group ("child setpgid ... Operation not
     permitted"), and the old script summed the caller's group, so the cap kill took out the
@@ -144,7 +144,7 @@ class MemcapWithoutJobControlTest(unittest.TestCase):
         self.assertIn("hi", proc.stdout)
 
     def test_poll_loop_does_not_use_path_sleep(self):
-        """agentq's `sleep` shim can refuse a run; the poll loop must not fork-storm on it."""
+        """A PATH shim's `sleep` can refuse a run; the poll loop must not fork-storm on it."""
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / "sleep"
             fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")

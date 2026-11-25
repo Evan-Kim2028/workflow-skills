@@ -38,8 +38,8 @@ CLI: ``python3 dash/logfilter.py < in.ndjson > out.ndjson`` (stdin to
 stdout, same batching). Exit 0 on success, including fallback.
 
 Two environment knobs, for a launcher that needs different behaviour:
-``AGENTQ_STREAM_FLUSH_S`` (group-flush interval, default 2) and
-``AGENTQ_STREAM_COALESCE=0`` (keep every delta line as it arrived).
+``AGENT_DASH_STREAM_FLUSH_S`` (group-flush interval, default 2) and
+``AGENT_DASH_STREAM_COALESCE=0`` (keep every delta line as it arrived).
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ import time
 MIN_RUN = 2000
 #: Read size per pump step. A line longer than this spans several steps.
 CHUNK = 1 << 16
-#: Seconds between group flushes of the stream file (``AGENTQ_STREAM_FLUSH_S``).
+#: Seconds between group flushes of the stream file (``AGENT_DASH_STREAM_FLUSH_S``).
 FLUSH_INTERVAL = 2.0
 #: How often the flush ticker wakes while a stream is open, in seconds.
 TICK_S = 0.25
@@ -68,8 +68,8 @@ MAX_BUFFER = 1 << 20
 FLUSH_MARKS = (b'"type":"turn_end"', b'"type":"message_end"', b'"type":"agent_end"')
 #: Token delta events that are merged while they arrive back to back.
 DELTA_KINDS = ("text_delta", "thinking_delta", "toolcall_delta")
-FLUSH_ENV = "AGENTQ_STREAM_FLUSH_S"
-COALESCE_ENV = "AGENTQ_STREAM_COALESCE"
+FLUSH_ENV = "AGENT_DASH_STREAM_FLUSH_S"
+COALESCE_ENV = "AGENT_DASH_STREAM_COALESCE"
 _DELTA_KINDS_B = tuple(kind.encode("ascii") for kind in DELTA_KINDS)
 
 #: The base64 alphabet plus padding. A maximal match is one run.
@@ -198,7 +198,7 @@ def _long_run_re(min_run: int):
 
 
 def flush_interval(environ=None) -> float:
-    """The group-flush interval for a new sink: ``AGENTQ_STREAM_FLUSH_S``, else 2 s."""
+    """The group-flush interval for a new sink: ``AGENT_DASH_STREAM_FLUSH_S``, else 2 s."""
     env = os.environ if environ is None else environ
     try:
         value = float((env.get(FLUSH_ENV) or "").strip())
@@ -208,7 +208,7 @@ def flush_interval(environ=None) -> float:
 
 
 def coalesce_enabled(environ=None) -> bool:
-    """False when ``AGENTQ_STREAM_COALESCE=0``: every delta line is kept as it arrived."""
+    """False when ``AGENT_DASH_STREAM_COALESCE=0``: every delta line is kept as it arrived."""
     env = os.environ if environ is None else environ
     return (env.get(COALESCE_ENV) or "").strip() not in ("0", "false", "no")
 

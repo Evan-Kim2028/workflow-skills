@@ -47,15 +47,8 @@ A provider fault (HTTP 5xx, a connection error, a 400/404 naming the model or
 variant, a 401/403 from the provider, "overloaded") reports
 ``reason=provider`` and is never retried on another tier here: the provider
 is down, so the dispatcher waits and probes the same tier.
-A ``pi`` tier whose registry entry names ``standby_env_file`` relabels the
-launch as ``<name>-standby`` (its own tier and cooldown) and runs the
-launcher with ``AGENT_DASH_PI_ENV_FILE`` set to that path, so the launcher
-sources the standby credential instead of the primary one. The path is
-only passed through; no key is ever read or printed here.
-
 Two caps gate a launch. The pool is the live workers of one base model across
-every tier that runs it (``pi-deepseek-flash`` and ``pi-deepseek-flash-low``
-both run ``morph/morph-dsv41flash-1017``; a ``:<level>`` suffix is a thinking
+every tier that runs it (two tiers may name one model; a ``:<level>`` suffix is a thinking
 level and is stripped). Its limit is the registry's ``model_caps`` entry for
 the model when it has one, else the largest enabled tier ``cap`` among those
 tiers, so a smaller tier's cap never throttles a bigger one. The tier is its
@@ -63,11 +56,6 @@ own pattern's live count against its own ``cap``. A launch is refused when
 either is full. A named tier at its limit gets
 ``STATUS: failed reason=none-available`` at once, the same answer ``auto``
 gives when nothing is eligible; nothing waits.
-
-A direct launch (``AGENTQ_JOB`` unset) also yields a pool to the agentq queue:
-while the broker heartbeat is fresh and agentq.db holds a ready queued job for
-the same base model, the launch gets ``none-available`` as a full pool does.
-Any failure reading the heartbeat or the database allows the launch.
 
 Prints one line:
 STATUS: running|done|failed out=<report> err=<stderr> tier=<name> [reason=...]
@@ -79,7 +67,6 @@ import fcntl
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -91,18 +78,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agentq.db import LAUNCH_LABEL_RE as LABEL_OK  # noqa: E402
 from dash.caps import PgrepFailed, as_int, base_model, cap_block  # noqa: E402
+from dash.labels import LAUNCH_LABEL_RE as LABEL_OK  # noqa: E402
 
 RUN_RULE = (
     "RUN RULE: this is one non-interactive turn. Keep calling tools until the task is complete, "
     "then end with the full final report as your last message (it is captured from stdout). "
     "A run that ends without the report is a failed run."
 )
-KINDS = ("muse", "cursor", "grok-build", "pi", "codex")
+KINDS = ("muse", "cursor", "grok-build", "codex")
 READ_LIMIT = 262144
-AGENTQ_HOME_DEFAULT = "~/.local/state/agentq"
-HEARTBEAT_FRESH_S = 120
 #: A finished report is at least this many bytes after stripping; below it
 #: the out file counts toward a quota hit in full. In a report at or above
 #: the threshold, only quota wording in the last REPORT_TAIL_BYTES counts,
@@ -128,7 +113,6 @@ PROVIDER_PATTERNS = (
 #: restart (cold caches, polls holding the store lock), so the preflight
 #: budget is generous; a timeout below warns instead of refusing.
 PREFLIGHT_TIMEOUT_S = 10.0
-STANDBY_SUFFIX = "-standby"
 #: Worker rules template, shipped in the repo and linked into ~/.claude/templates.
 RULES_TEMPLATE = ROOT / "templates" / "worker-common.md"
 #: Stable line that opens the template. A prompt carrying it already has the rules.
@@ -158,7 +142,6 @@ HARNESS_BY_KIND = {
     "muse": "muse",
     "cursor": "cursor",
     "grok-build": "grok-cli",
-    "pi": "pi",
     "codex": "codex",
 }
 
@@ -213,7 +196,7 @@ def run_preflight(registry, requested: str, ctx) -> int | None:
         return None
     worker = (registry.get("workers") or {}).get(target) or {}
     problem = preflight_for_launch(
-        launch_worker(target, worker, ctx),
+        target,
         worker,
         str(ctx["run_dir"]),
         str(state_dir()),
@@ -237,44 +220,7 @@ def run_preflight(registry, requested: str, ctx) -> int | None:
     return 1
 
 
-class LaunchTiming:
-    """Seconds spent in each launch phase, for diagnosing a slow launch.
-
-    Written to ``<run-dir>/launch-timing.json`` only when ``AGENTQ_JOB`` is set
-    (a broker launch), so a slow phase shows up in the run folder next time.
-    """
-
-    def __init__(self, clock=time.monotonic):
-        self._clock = clock
-        self._last = clock()
-        self.phases: dict[str, float] = {}
-        self.run_dir: Path | None = None
-
-    def lap(self, phase: str) -> None:
-        now = self._clock()
-        self.phases[phase] = round(now - self._last, 3)
-        self._last = now
-
-    def write(self) -> None:
-        job = os.environ.get("AGENTQ_JOB")
-        if not job or self.run_dir is None or not self.run_dir.is_dir():
-            return
-        doc = {"job": job, "phases_s": self.phases, "total_s": round(sum(self.phases.values()), 3)}
-        try:
-            (self.run_dir / "launch-timing.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-        except OSError:
-            pass
-
-
 def run(argv, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid=None) -> int:
-    timing = LaunchTiming()
-    try:
-        return _run(argv, timing, spawn, pgrep, sleep, now, alive, new_uuid)
-    finally:
-        timing.write()
-
-
-def _run(argv, timing, spawn=None, pgrep=None, sleep=None, now=None, alive=None, new_uuid=None) -> int:
     hooks = {
         "spawn": spawn or default_spawn,
         "pgrep": pgrep or pgrep_count,
@@ -321,8 +267,6 @@ def _run(argv, timing, spawn=None, pgrep=None, sleep=None, now=None, alive=None,
     elif verdict.get("warning"):
         print(verdict["warning"], file=sys.stderr)
     run_path = Path(run_dir)
-    timing.run_dir = run_path
-    timing.lap("label")
     out = run_path / f"out-{label}.md"
     err = run_path / f"err-{label}.log"
     if not os.path.isdir(workspace) or not os.path.isfile(prompt_file):
@@ -354,9 +298,7 @@ def _run(argv, timing, spawn=None, pgrep=None, sleep=None, now=None, alive=None,
         "minutes": _minutes(registry),
         "exclude": set(exclude),
         "admission": admission_config(registry),
-        "timing": timing,
     }
-    timing.lap("registry")
     if tier_path.is_file():
         stored = tier_path.read_text(encoding="utf-8").strip() or requested
         return observe(ctx, stored, set())
@@ -364,20 +306,16 @@ def _run(argv, timing, spawn=None, pgrep=None, sleep=None, now=None, alive=None,
         blocked = run_preflight(registry, requested, ctx)
         if blocked is not None:
             return blocked
-    timing.lap("preflight")
     prepare_prompt(ctx, no_rules)
     if prompt_over_budget(ctx) is not None:
         emit("failed", out, err, requested, "prompt-budget")
         return 2
-    timing.lap("prompt")
-    ctx["queued"] = direct_queue(registry, ctx["hooks"]["now"]())
     name, reason = pick_initial(ctx)
     if not name:
         code = 0 if reason == "none-available" else 2
         emit("failed", out, err, requested, reason)
         return code
     lease = admit_run(ctx, name)
-    timing.lap("caps")
     if lease is not None and not lease.get("ok"):
         emit("failed", out, err, requested, lease.get("reason") or "capacity")
         return 0
@@ -599,41 +537,6 @@ def prompt_over_budget(ctx):
     return size
 
 
-def direct_queue(registry, now) -> dict:
-    """Ready queued jobs per base model, for a direct launch to yield to.
-
-    Empty when the launch came from the broker (``AGENTQ_JOB`` set), when the
-    broker heartbeat is not fresh, or when agentq.db cannot be read: then the
-    launch proceeds as it did before the queue existed. A job whose tier is not
-    a registry worker (``auto``, for one) counts toward no pool.
-    """
-    if os.environ.get("AGENTQ_JOB"):
-        return {}
-    home = Path(os.path.expanduser(os.environ.get("AGENTQ_HOME") or AGENTQ_HOME_DEFAULT))
-    try:
-        age = now - float((home / "broker.heartbeat").read_text(encoding="utf-8").strip())
-        if not 0 <= age <= HEARTBEAT_FRESH_S:
-            return {}
-        conn = sqlite3.connect(f"{(home / 'agentq.db').resolve().as_uri()}?mode=ro", uri=True, timeout=2)
-        try:
-            rows = conn.execute(
-                "SELECT tier, COUNT(*) FROM jobs WHERE state = 'queued' AND not_before <= ? GROUP BY tier",
-                (now,),
-            ).fetchall()
-        finally:
-            conn.close()
-    except (OSError, ValueError, sqlite3.Error):
-        return {}
-    workers = registry.get("workers") or {}
-    pools: dict[str, int] = {}
-    for tier, count in rows:
-        worker = workers.get(tier)
-        if isinstance(worker, dict) and worker.get("model"):
-            model = base_model(worker["model"])
-            pools[model] = pools.get(model, 0) + count
-    return pools
-
-
 def pick_initial(ctx):
     requested = ctx["requested"]
     registry = ctx["registry"]
@@ -660,34 +563,17 @@ def pick_initial(ctx):
             file=sys.stderr,
         )
         return None, "none-available"
-    waiting = ctx.get("queued", {}).get(base_model(worker.get("model")), 0)
-    if waiting:
-        print(f"agentq queue has {waiting} waiting job(s) for this model; queue first", file=sys.stderr)
-        return None, "none-available"
     return name, None
 
 
-def worker_at(name):
-    """Registry name behind a launch name: a standby name reads its base tier.
-
-    ``<tier>-standby`` names the same registry entry as ``<tier>``; only a
-    ``pi`` entry that declares ``standby_env_file`` is ever launched this
-    way, so the standby name always reads the same model, flags, and cap.
-    """
-    text = str(name or "")
-    if text.endswith(STANDBY_SUFFIX) and len(text) > len(STANDBY_SUFFIX):
-        return text[: -len(STANDBY_SUFFIX)]
-    return text
-
-
 def worker_for(ctx, name):
-    """Registry entry for a launch name, standby names included."""
-    return (ctx["registry"].get("workers") or {}).get(worker_at(name)) or {}
+    """Registry entry for a launch name."""
+    return (ctx["registry"].get("workers") or {}).get(name) or {}
 
 
 def launch(ctx, name, tried) -> int:
     worker = worker_for(ctx, name)
-    tier = launch_worker(name, worker, ctx)
+    tier = name
     session_id = "-" if worker.get("kind") == "cursor" else ctx["hooks"]["uuid"]()
     ctx["tier_path"].write_text(tier + "\n", encoding="utf-8")
     append_manifest(
@@ -705,38 +591,14 @@ def launch(ctx, name, tried) -> int:
     )
     scratch = ensure_scratch(ctx)
     try:
-        pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"], env=launch_env(worker, scratch))
+        pid = ctx["hooks"]["spawn"](cmd, ctx["out"], ctx["err"], env=launch_env(scratch))
     except OSError:
         ctx["tier_path"].unlink(missing_ok=True)
         emit("failed", ctx["out"], ctx["err"], tier, "spawn")
         return 2
-    ctx["timing"].lap("spawn")
     ctx["pid_path"].write_text(str(int(pid)) + "\n", encoding="utf-8")
     write_meta(ctx, tier, worker, pid)
-    ctx["timing"].lap("pid-file")
     return observe(ctx, tier, tried)
-
-
-def launch_worker(name, worker, ctx=None) -> str:
-    """Tier a launch records: the registry name, or its standby relabel.
-
-    A ``pi`` tier with ``standby_env_file`` launches on the standby
-    credential and records itself as ``<tier>-standby``, so a primary
-    rate-limit cooldown never blocks the standby run (and vice versa).
-    Every other tier records its registry name unchanged, which is what
-    the dashboard shows for a Grok Build run.
-    """
-    if standby_file(worker) and str((worker or {}).get("kind") or "") == "pi":
-        return name + STANDBY_SUFFIX
-    return name
-
-
-def standby_file(worker):
-    """The registry's ``standby_env_file`` path, or None. Never read, only passed."""
-    value = (worker or {}).get("standby_env_file")
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return os.path.expanduser(value.strip())
 
 
 def ensure_scratch(ctx) -> str:
@@ -754,16 +616,9 @@ def ensure_scratch(ctx) -> str:
         return str(scratchdir.scratch_path(ctx["label"]))
 
 
-def launch_env(worker, scratch=None):
-    """Extra env for the child launcher: ``AGENT_SCRATCH`` for every tier,
-    and the standby file for a ``pi`` tier that declares one."""
-    env = {}
-    path = standby_file(worker)
-    if path is not None and str((worker or {}).get("kind") or "") == "pi":
-        env["AGENT_DASH_PI_ENV_FILE"] = path
-    if scratch:
-        env["AGENT_SCRATCH"] = str(scratch)
-    return env or None
+def launch_env(scratch=None):
+    """Extra env for the child launcher: ``AGENT_SCRATCH``."""
+    return {"AGENT_SCRATCH": str(scratch)} if scratch else None
 
 
 def write_meta(ctx, tier, worker, pid) -> None:
@@ -792,7 +647,7 @@ def write_meta(ctx, tier, worker, pid) -> None:
 
 
 def observe(ctx, tier, tried) -> int:
-    name = worker_at(tier)
+    name = tier
     worker = (ctx["registry"].get("workers") or {}).get(name) or {}
     pid = read_pid(ctx["pid_path"])
     if pid and still_running(pid, ctx["max_wait"], ctx["hooks"]):
@@ -829,12 +684,9 @@ def eligible(ctx, skip):
     A tier whose model has no catalog price is skipped with a stderr note;
     an explicitly named tier is not affected (the preflight refuses it).
 
-    ``skip`` holds launch names already tried this call (standby names
-    included). A cooling tier is passed over in favour of the next one:
-    the whole point of a quota cooldown is to stop relaunching into the
-    limit. A ``pi`` tier whose next launch would use its standby
-    credential is judged under the standby name and the standby tier's
-    cooldown, since that is the attempt that would actually run.
+    ``skip`` holds launch names already tried this call. A cooling
+    tier is passed over in favour of the next one: the whole point of a
+    quota cooldown is to stop relaunching into the limit.
     """
     registry = ctx["registry"]
     now = ctx["hooks"]["now"]()
@@ -846,14 +698,13 @@ def eligible(ctx, skip):
             continue
         if worker.get("kind") not in KINDS:
             continue
-        launch_name = launch_worker(name, worker, ctx)
-        if name in skip or launch_name in skip:
+        if name in skip:
             continue
-        if cooling(ctx["cooldowns"], launch_name, now):
+        if cooling(ctx["cooldowns"], name, now):
             continue
         if not model_priced(worker):
             print(
-                f"auto: skipping {launch_name}: model {worker.get('model')!r} has no catalog price",
+                f"auto: skipping {name}: model {worker.get('model')!r} has no catalog price",
                 file=sys.stderr,
             )
             continue
@@ -862,13 +713,11 @@ def eligible(ctx, skip):
         try:
             blocked = cap_block(ctx["registry"], worker, ctx["hooks"]["pgrep"])
         except PgrepFailed as exc:
-            print(f"auto: skipping {launch_name}: cannot count live workers: {exc}", file=sys.stderr)
+            print(f"auto: skipping {name}: cannot count live workers: {exc}", file=sys.stderr)
             continue
         if blocked is not None:
             continue
-        if ctx.get("queued", {}).get(base_model(worker.get("model")), 0):
-            continue
-        return launch_name
+        return name
     return None
 
 
@@ -970,16 +819,14 @@ def outcome(worker, out_path, err_path):
 def quota_file_hit(ctx) -> bool:
     """True when a launcher QUOTA marker names this label from this attempt.
 
-    ``launch_pi.py`` and ``launch_codex.py`` both write ``QUOTA-<label>``
+    ``launch_codex.py`` writes ``QUOTA-<label>``
     (``model`` and ``label`` lines) beside the launcher's outdir, which the
     log-pattern scan cannot see when the worker's quota error never reaches
     the report tails (an empty report with a quota marker is a quota hit,
     not an empty report). The name is per run, so runs sharing an outdir
     each keep their own marker. Only a marker naming this label and written
     after this attempt's tier file counts, so a previous attempt's marker
-    never cools this launch. The bare ``pi/QUOTA`` file that launchers
-    wrote before the per-label name is still read, matched on its label
-    line the same way, so a pi run started before the change is seen.
+    never cools this launch.
     """
     label = ctx.get("label") or ""
     try:
@@ -989,8 +836,6 @@ def quota_file_hit(ctx) -> bool:
     base = Path(ctx["run_dir"])
     candidates = [
         base / f"QUOTA-{label}",
-        base / "pi" / f"QUOTA-{label}",
-        base / "pi" / "QUOTA",
         base / "codex" / f"QUOTA-{label}",
     ]
     for path in candidates:
@@ -1063,10 +908,7 @@ def quota_hit(worker, out_path, err_path) -> bool:
 def command(worker, label, workspace, prompt_file, session_id, run_dir=None, tier=None):
     """The exact argv for one worker launch.
 
-    ``pi`` runs ``launch_pi.py`` with the run folder's ``pi/`` outdir, so a
-    pi tier launches through the one launcher every other tier uses and
-    the pi source finds its manifest, stream, and out files where it
-    already looks for them. ``codex`` runs ``launch_codex.py`` (headless
+    ``codex`` runs ``launch_codex.py`` (headless
     ``codex exec``) in the run folder itself, so the manifests source
     finds its ``codex-sessions.tsv`` row beside ``out-<label>.md``; the
     launcher's one summary line goes to stderr, never stdout, so the
@@ -1091,20 +933,6 @@ def command(worker, label, workspace, prompt_file, session_id, run_dir=None, tie
         ]
     if kind == "cursor":
         return [str(ROOT / "scripts" / "launch_grok.sh"), label, workspace, prompt_file, model]
-    if kind == "pi":
-        return [
-            "python3",
-            str(ROOT / "scripts" / "launch_pi.py"),
-            label,
-            workspace,
-            prompt_file,
-            str(Path(run_dir or Path(prompt_file).parent) / "pi"),
-            "--model",
-            model,
-            "--tier",
-            str(tier or worker.get("tier") or ""),
-            *extra,
-        ]
     if kind == "codex":
         return [
             "python3",
@@ -1148,7 +976,6 @@ MANIFEST_BY_KIND = {
     "muse": ("muse-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "cursor": ("cursor-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "grok-build": ("glm-sessions.tsv", ["label", "session_id", "epoch", "model"]),
-    "pi": ("pi-sessions.tsv", ["label", "session_id", "epoch", "model"]),
     "codex": ("codex-sessions.tsv", ["label", "session_id", "epoch", "model"]),
 }
 
@@ -1342,7 +1169,7 @@ def pgrep_count(pattern: str) -> int:
 
 
 def spawn_env(extra=None):
-    """Parent env plus a launcher's extra variables (a standby env-file path)."""
+    """Parent env plus a launcher's extra variables."""
     if not extra:
         return None
     env = dict(os.environ)
