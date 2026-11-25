@@ -9,13 +9,10 @@
     "test_server"
   ],
   "map": {
-    "agentq/gc.py": ["test_agentq_gc"],
-    "agentq/proxy.py": ["test_agentq_proxy"],
-    "agentq/worker_env.py": ["test_agentq_pytest_plugin", "test_launch_codex"],
-    "agentq/slots.py": ["test_agentq_shims"],
-    "agentq/repetition_guard.py": ["test_pi"],
-    "agentq/pyplugin/**": ["test_agentq_pytest_plugin", "test_agentq_pytest_cache"],
-    "scripts/perf_probe.py": ["test_perf_stage3", "test_perf_stage2"],
+    "scripts/perf_probe.py": [
+      "test_perf_stage3",
+      "test_perf_stage2"
+    ],
     "agent_dash.py": [
       "test_server",
       "test_config",
@@ -47,7 +44,9 @@
       "test_planrender",
       "test_errors"
     ],
-    "dash/deploy.py": ["test_deploy"],
+    "dash/deploy.py": [
+      "test_deploy"
+    ],
     "dash/doctor.py": [
       "test_doctor",
       "test_state",
@@ -86,7 +85,10 @@
       "test_ws_cli",
       "test_bundles_api"
     ],
-    "dash/outcomes.py": ["test_outcomes", "test_server"],
+    "dash/outcomes.py": [
+      "test_outcomes",
+      "test_server"
+    ],
     "dash/perfmon.py": [
       "test_perfmon",
       "test_doctor",
@@ -212,7 +214,10 @@
       "test_poll_budgets",
       "perf/test_perf_budget"
     ],
-    "dash/sources/reaper.py": ["test_reaper", "test_poll_budgets"],
+    "dash/sources/reaper.py": [
+      "test_reaper",
+      "test_poll_budgets"
+    ],
     "dash/sources/process.py": [
       "test_process_liveness",
       "test_store",
@@ -238,7 +243,9 @@
       "perf/test_perf_budget",
       "test_rollup"
     ],
-    "dash/storebuild.py": ["test_storebuild"],
+    "dash/storebuild.py": [
+      "test_storebuild"
+    ],
     "dash/taskmatch.py": [
       "test_page_rules",
       "perf/test_perf_budget"
@@ -327,9 +334,6 @@
       "test_storagebudget",
       "test_doctor"
     ],
-    "dash/agentqjanitor.py": [
-      "test_agentqjanitor"
-    ],
     "static/cards/storage-budget.js": [
       "test_page_rules"
     ],
@@ -353,10 +357,6 @@
     ],
     "scripts/log_keep_eval.py": [
       "test_logarchive"
-    ],
-    "scripts/launch_pi.py": [
-      "test_pi",
-      "test_label_guard_clis"
     ],
     "scripts/launch_codex.py": [
       "test_launch_codex",
@@ -456,36 +456,6 @@
     ],
     "dash/worktrees.py": [
       "test_worktrees"
-    ],
-    "agentq/broker.py": [
-      "test_agentq_broker",
-      "test_agentq_janitor"
-    ],
-    "agentq/cli.py": [
-      "test_agentq_findings",
-      "test_agentq_queue_wait",
-      "test_agentq_broker"
-    ],
-    "agentq/dash.py": [
-      "test_agentq_dash"
-    ],
-    "agentq/db.py": [
-      "test_agentq_queue_wait",
-      "test_agentq_broker",
-      "test_agentq_filler_supply"
-    ],
-    "agentq/filler.py": [
-      "test_agentq_filler_supply",
-      "test_agentq_findings"
-    ],
-    "agentq/findings.py": [
-      "test_agentq_findings"
-    ],
-    "agentq/janitor.py": [
-      "test_agentq_janitor"
-    ],
-    "agentq/wtreap.py": [
-      "test_agentq_janitor"
     ],
     "dash/wtjanitor.py": [
       "test_wtjanitor"

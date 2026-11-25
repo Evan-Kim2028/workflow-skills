@@ -72,8 +72,9 @@ _REVIEW_TAIL_RE = re.compile(r"-(?:rev|fix|check)(?:\d+$|-|$)")
 #: downgrade a refusal to a stderr warning when this is ``1``.
 LEGACY_ENV = "AGENT_DASH_ALLOW_LEGACY_LABELS"
 
-from agentq.db import LAUNCH_LABEL_MAX as _MAX_LABEL  # noqa: E402
-from agentq.db import LAUNCH_LABEL_RE  # noqa: E402
+_MAX_LABEL = 80
+#: Every launcher refuses a label this does not match.
+LAUNCH_LABEL_RE = re.compile(rf"^[\w.+-]{{1,{_MAX_LABEL}}}$")
 
 
 def legacy_allowed() -> bool:

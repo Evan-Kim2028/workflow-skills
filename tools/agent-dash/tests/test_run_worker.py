@@ -17,7 +17,6 @@ ROOT = HERE.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from dash.caps import PgrepFailed, anchored  # noqa: E402
-from agentq import cli, db  # noqa: E402
 SID = "11111111-1111-4111-8111-111111111111"
 NOW = 1_700_000_000.0
 
@@ -146,8 +145,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(data["workers"]["muse"]["model"], "muse-spark-1.3-contributor")
         self.assertEqual(
             set(data["workers"]),
-            {"pi-anthropic-haiku", "pi-deepseek-flash", "muse", "grok-build-47", "deepseek-flash",
-             "glm", "glm-flash", "pi-beam", "codex-luna"},
+            {"muse", "grok-build-47", "deepseek-flash", "glm", "glm-flash", "codex-luna"},
         )
         kinds = {name: row["kind"] for name, row in data["workers"].items()}
         self.assertNotIn("cursor", kinds.values())  # retired; no tier may use it
@@ -157,22 +155,15 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(kinds["glm"], "grok-build")
         self.assertEqual(kinds["glm-flash"], "grok-build")
         self.assertEqual(kinds["deepseek-flash"], "grok-build")
-        self.assertEqual(kinds["pi-beam"], "pi")
-        self.assertEqual(kinds["pi-anthropic-haiku"], "pi")
         self.assertEqual(kinds["codex-luna"], "codex")
-        self.assertEqual(kinds["pi-deepseek-flash"], "pi")
         manifests = {name: row["manifest"] for name, row in data["workers"].items()}
         self.assertEqual(manifests["codex-luna"], "codex-sessions.tsv")
-        self.assertEqual(manifests["pi-deepseek-flash"], "pi-sessions.tsv")
-        self.assertEqual(manifests["pi-anthropic-haiku"], "pi-sessions.tsv")
         self.assertEqual(manifests["glm"], "glm-sessions.tsv")
         tiers = {name: row["pgrep"] for name, row in data["workers"].items()}
         self.assertIn("--tier codex-luna", tiers["codex-luna"])
-        self.assertIn("--tier pi-deepseek-flash", tiers["pi-deepseek-flash"])
-        self.assertIn("--tier pi-anthropic-haiku", tiers["pi-anthropic-haiku"])
         for name, row in data["workers"].items():
             self.assertIn("[", row["pgrep"])
-            self.assertEqual(row["enabled"], row["kind"] != "pi", name)
+            self.assertTrue(row["enabled"], name)
             self.assertIn("cap", row)
             self.assertIn("quota_patterns", row)
             self.assertIn("columns", row)
@@ -218,7 +209,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("no catalog price", err.getvalue())
 
     def test_auto_skips_every_unpriced_tier_then_reports_none_available(self):
-        self._with_unpriced(["muse", "glm-flash", "codex-luna", "pi-deepseek-flash"])
+        self._with_unpriced(["muse", "glm-flash", "codex-luna", "shared-flash"])
         self.counts = {}
         launch = Launch()
         with contextlib.redirect_stderr(io.StringIO()):
@@ -265,27 +256,6 @@ class RunWorkerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual((self.run_dir / "ws1-plan-lane-1.pid").read_text(encoding="utf-8").strip(), "4001")
 
-    def test_broker_launch_writes_phase_timings(self):
-        self.counts = {}
-        with mock.patch.dict(os.environ, {"AGENTQ_JOB": "job-timing"}):
-            code, _ = self.go("muse", Launch())
-        self.assertEqual(code, 0)
-        doc = json.loads((self.run_dir / "launch-timing.json").read_text(encoding="utf-8"))
-        self.assertEqual(doc["job"], "job-timing")
-        self.assertEqual(
-            set(doc["phases_s"]), {"label", "registry", "preflight", "prompt", "caps", "spawn", "pid-file"}
-        )
-        self.assertTrue(all(value >= 0 for value in doc["phases_s"].values()))
-        self.assertAlmostEqual(doc["total_s"], sum(doc["phases_s"].values()), places=2)
-
-    def test_direct_launch_writes_no_timing_file(self):
-        self.counts = {}
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AGENTQ_JOB", None)
-            code, _ = self.go("muse", Launch())
-        self.assertEqual(code, 0)
-        self.assertFalse((self.run_dir / "launch-timing.json").exists())
-
     def test_auto_skips_a_worker_at_its_cap(self):
         self.counts = {"[m]use-bin|[m]use exec": 25}
         launch = Launch()
@@ -300,21 +270,21 @@ class RunWorkerTests(unittest.TestCase):
         )
 
     def test_named_tier_at_its_cap_refuses_without_waiting(self):
-        self.counts = {"[l]aunch_pi.py.*--tier pi-deepseek-flash": 5}
+        self.counts = {"[l]aunch_shared.py.*--tier shared-flash": 5}
         launch = Launch()
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code, line = self.go("pi-deepseek-flash", launch, max_wait="540")
+            code, line = self.go("shared-flash", launch, max_wait="540")
         self.assertEqual(code, 0)
         self.assertIn("STATUS: failed", line)
         self.assertIn("reason=none-available", line)
         self.assertEqual(launch.cmds, [])
-        self.assertIn("pi-deepseek-flash is full", err.getvalue())
+        self.assertIn("shared-flash is full", err.getvalue())
 
     def test_named_tier_below_its_cap_launches(self):
-        self.counts = {"[l]aunch_pi.py.*--tier pi-deepseek-flash": 4}
+        self.counts = {"[l]aunch_shared.py.*--tier shared-flash": 4}
         launch = Launch()
-        code, line = self.go("pi-deepseek-flash", launch)
+        code, line = self.go("shared-flash", launch)
         self.assertIn("STATUS: done", line)
         self.assertEqual(len(launch.cmds), 1)
 
@@ -323,22 +293,22 @@ class RunWorkerTests(unittest.TestCase):
         return lambda pattern: sum(1 for line in lines if re.search(pattern, line))
 
     def _shared_model_lines(self, flash, low):
-        base = "launch_pi.py ws1 /ws/prompt /out --model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
-        return [base + " --tier pi-deepseek-flash"] * flash + [base + " --tier pi-deepseek-flash-low"] * low
+        base = "launch_shared.py ws1 /ws/prompt /out --model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        return [base + " --tier shared-flash"] * flash + [base + " --tier shared-flash-low"] * low
 
     def _flash_and_low(self, flash_cap=26, low_cap=20, model_caps=None):
         """Flash and low tiers on one model. Their patterns end on a word boundary, so a
         flash count does not also take the low runs."""
         workers = registry()["workers"]
-        workers["pi-deepseek-flash"] = dict(
-            workers["pi-deepseek-flash"], cap=flash_cap,
-            pgrep="[l]aunch_pi.py.*--tier pi-deepseek-flash( |$)",
+        workers["shared-flash"] = dict(
+            workers["shared-flash"], cap=flash_cap,
+            pgrep="[l]aunch_shared.py.*--tier shared-flash( |$)",
         )
-        workers["pi-deepseek-flash-low"] = dict(
-            workers["pi-deepseek-flash"],
+        workers["shared-flash-low"] = dict(
+            workers["shared-flash"],
             model="river/deepseek-ai/DeepSeek-V4.1-Flash-1017:low",
             cap=low_cap,
-            pgrep="[l]aunch_pi.py.*--tier pi-deepseek-flash-low( |$)",
+            pgrep="[l]aunch_shared.py.*--tier shared-flash-low( |$)",
         )
         data = registry()
         data["workers"] = workers
@@ -352,7 +322,7 @@ class RunWorkerTests(unittest.TestCase):
         self._flash_and_low()
         self.pgrep = self._process_table(self._shared_model_lines(flash=5, low=20))
         launch = Launch()
-        code, line = self.go("pi-deepseek-flash", launch)
+        code, line = self.go("shared-flash", launch)
         self.assertIn("STATUS: done", line)
         self.assertEqual(len(launch.cmds), 1)
 
@@ -360,10 +330,10 @@ class RunWorkerTests(unittest.TestCase):
         self._flash_and_low()
         self.pgrep = self._process_table(self._shared_model_lines(flash=0, low=20))
         launch = Launch()
-        code, line = self.go("pi-deepseek-flash", launch)
+        code, line = self.go("shared-flash", launch)
         self.assertIn("STATUS: done", line)
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            code, line = self.go("pi-deepseek-flash-low", Launch(), label="ws1-plan-lane-2")
+            code, line = self.go("shared-flash-low", Launch(), label="ws1-plan-lane-2")
         self.assertIn("reason=none-available", line)
         self.assertIn("its tier is at 20 of 20", err.getvalue())
 
@@ -371,8 +341,8 @@ class RunWorkerTests(unittest.TestCase):
         self._flash_and_low()
         self.pgrep = self._process_table(self._shared_model_lines(flash=6, low=20))
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            code, line = self.go("pi-deepseek-flash", Launch())
-            code2, line2 = self.go("pi-deepseek-flash-low", Launch(), label="ws1-plan-lane-2")
+            code, line = self.go("shared-flash", Launch())
+            code2, line2 = self.go("shared-flash-low", Launch(), label="ws1-plan-lane-2")
         self.assertIn("reason=none-available", line)
         self.assertIn("reason=none-available", line2)
         self.assertIn("its pool is at 26 of 26", err.getvalue())
@@ -382,7 +352,7 @@ class RunWorkerTests(unittest.TestCase):
         self._flash_and_low(model_caps={"river/deepseek-ai/DeepSeek-V4.1-Flash-1017": 40})
         self.pgrep = self._process_table(self._shared_model_lines(flash=6, low=20))
         launch = Launch()
-        code, line = self.go("pi-deepseek-flash", launch)
+        code, line = self.go("shared-flash", launch)
         self.assertIn("STATUS: done", line)
         self.assertEqual(len(launch.cmds), 1)
 
@@ -390,7 +360,7 @@ class RunWorkerTests(unittest.TestCase):
         self._flash_and_low(model_caps={"river/deepseek-ai/DeepSeek-V4.1-Flash-1017:low": 3})
         self.pgrep = self._process_table(self._shared_model_lines(flash=2, low=1))
         with contextlib.redirect_stderr(io.StringIO()):
-            code, line = self.go("pi-deepseek-flash", Launch())
+            code, line = self.go("shared-flash", Launch())
         self.assertIn("reason=none-available", line)
 
     def test_unreadable_pgrep_refuses_the_named_tier_fail_closed(self):
@@ -401,7 +371,7 @@ class RunWorkerTests(unittest.TestCase):
         launch = Launch()
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code, line = self.go("pi-deepseek-flash", launch)
+            code, line = self.go("shared-flash", launch)
         self.assertEqual(code, 0)
         self.assertIn("reason=none-available", line)
         self.assertEqual(launch.cmds, [])
@@ -423,17 +393,15 @@ class RunWorkerTests(unittest.TestCase):
 
     def test_pgrep_exit_two_raises_instead_of_counting_zero(self):
         import subprocess as sp
-        from unittest import mock
 
         bad = sp.CompletedProcess(args=["pgrep"], returncode=2, stdout="", stderr="regex error")
         with mock.patch.object(runner.subprocess, "run", return_value=bad):
             with self.assertRaises(PgrepFailed) as caught:
-                runner.pgrep_count("[l]aunch_pi.py.*--tier pi-deepseek-flash(")
+                runner.pgrep_count("[l]aunch_shared.py.*--tier shared-flash(")
         self.assertIn("regex error", str(caught.exception))
 
     def test_pgrep_timeout_raises_instead_of_counting_zero(self):
         import subprocess as sp
-        from unittest import mock
 
         with mock.patch.object(runner.subprocess, "run", side_effect=sp.TimeoutExpired(cmd="pgrep", timeout=2)):
             with self.assertRaises(PgrepFailed):
@@ -441,7 +409,6 @@ class RunWorkerTests(unittest.TestCase):
 
     def test_pgrep_no_match_is_zero_not_an_error(self):
         import subprocess as sp
-        from unittest import mock
 
         none = sp.CompletedProcess(args=["pgrep"], returncode=1, stdout="", stderr="")
         with mock.patch.object(runner.subprocess, "run", return_value=none):
@@ -450,11 +417,11 @@ class RunWorkerTests(unittest.TestCase):
     def test_unanchored_tier_pattern_does_not_count_its_longer_sibling(self):
         # The fixture's flash pattern has no boundary. Five low runs must not
         # fill flash's own cap of 5: the count anchors the tier name itself.
-        base = "launch_pi.py ws1 /ws/prompt /out --model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
-        lines = [base + " --tier pi-deepseek-flash-low"] * 5
+        base = "launch_shared.py ws1 /ws/prompt /out --model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        lines = [base + " --tier shared-flash-low"] * 5
         self.pgrep = self._process_table(lines)
         launch = Launch()
-        code, line = self.go("pi-deepseek-flash", launch)
+        code, line = self.go("shared-flash", launch)
         self.assertIn("STATUS: done", line)
         self.assertEqual(len(launch.cmds), 1)
 
@@ -655,49 +622,6 @@ class RunWorkerTests(unittest.TestCase):
             os.waitpid(pid, os.WNOHANG)
         self.assertEqual(out.read_text(encoding="utf-8"), "PASS\n")
 
-    def test_pi_tier_launches_launch_pi_with_tier_and_records_it(self):
-        # One launcher for every tier: a pi registry tier runs launch_pi.py
-        # in the run folder's pi/ outdir and records its tier name, so the
-        # dashboard reads pi-deepseek instead of the bare harness "pi".
-        self.counts = {}
-        launch = Launch()
-        code, line = self.go("pi-deepseek", launch)
-        self.assertEqual(code, 0)
-        self.assertIn("STATUS: done", line)
-        self.assertIn("tier=pi-deepseek", line)
-        cmd = launch.cmds[0]
-        self.assertEqual(cmd[0], "python3")
-        self.assertTrue(cmd[1].endswith("launch_pi.py"))
-        self.assertEqual(cmd[5], str(self.run_dir / "pi"))
-        self.assertEqual(cmd[cmd.index("--model") + 1], registry()["workers"]["pi-deepseek"]["model"])
-        self.assertEqual(cmd[cmd.index("--tier") + 1], "pi-deepseek")
-        self.assertEqual(without_scratch(launch.envs[0]), {})
-        row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
-        self.assertEqual(
-            row[:4],
-            ["ws1-plan-lane-1", SID, "1700000000", registry()["workers"]["pi-deepseek"]["model"]],
-        )
-        self.assertEqual(row[4], "pi-deepseek")
-
-    def test_standby_env_file_switches_the_credential_without_reading_it(self):
-        # A pi tier that declares standby_env_file launches on the standby
-        # credential: the tier records <tier>-standby, the env file path goes
-        # to the launcher as a variable, and its contents never travel.
-        data = registry()
-        data["workers"]["pi-deepseek"]["standby_env_file"] = "~/.config/pi/standby.env"
-        self.reg.write_text(json.dumps(data), encoding="utf-8")
-        self.counts = {}
-        launch = Launch()
-        code, line = self.go("pi-deepseek", launch)
-        self.assertEqual(code, 0)
-        self.assertIn("tier=pi-deepseek-standby", line)
-        env_path = os.path.expanduser("~/.config/pi/standby.env")
-        self.assertEqual(without_scratch(launch.envs[0]), {"AGENT_DASH_PI_ENV_FILE": env_path})
-        tier = (self.run_dir / "ws1-plan-lane-1.tier").read_text(encoding="utf-8").strip()
-        self.assertEqual(tier, "pi-deepseek-standby")
-        row = (self.run_dir / "pi-sessions.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")
-        self.assertEqual(row[4], "pi-deepseek-standby")
-
     def test_codex_tier_launches_launch_codex_with_tier_and_records_it(self):
         # A codex registry tier runs launch_codex.py in the run folder
         # itself (so the manifests source finds the codex-sessions.tsv
@@ -759,104 +683,56 @@ class RunWorkerTests(unittest.TestCase):
         # A QUOTA marker older than this attempt's tier file belongs to a
         # previous attempt and never cools the relaunch.
         self.counts = {}
-        stale = self.run_dir / "pi" / "QUOTA-ws1-plan-lane-1"
+        stale = self.run_dir / "codex" / "QUOTA-ws1-plan-lane-1"
         stale.parent.mkdir(parents=True, exist_ok=True)
         stale.write_text("model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n", encoding="utf-8")
         old = time.time() - 3600
         os.utime(stale, (old, old))
         launch = Launch()
-        code, line = self.go("pi-deepseek-flash", launch)
+        code, line = self.go("shared-flash", launch)
         self.assertEqual(code, 0)
         self.assertIn("STATUS: done", line)
-        self.assertIn("tier=pi-deepseek-flash", line)
+        self.assertIn("tier=shared-flash", line)
         self.assertFalse((self.state / "worker-cooldowns.json").exists())
 
-    def test_pi_quota_marker_naming_this_label_cools_the_tier(self):
+    def test_quota_marker_naming_this_label_cools_the_tier(self):
         self.counts = {}
 
-        class PiMarked(Launch):
+        class Marked(Launch):
             def spawn(self, cmd, out_path, err_path, env=None):
                 pid = super().spawn(cmd, out_path, err_path, env)
                 Path(out_path).write_text("", encoding="utf-8")
-                (self_run_dir / "pi").mkdir(parents=True, exist_ok=True)
-                (self_run_dir / "pi" / "QUOTA-ws1-plan-lane-1").write_text(
+                (self_run_dir / "codex").mkdir(parents=True, exist_ok=True)
+                (self_run_dir / "codex" / "QUOTA-ws1-plan-lane-1").write_text(
                     "model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n",
                     encoding="utf-8",
                 )
                 return pid
 
         self_run_dir = self.run_dir
-        code, line = self.go("pi-deepseek-flash", PiMarked())
+        code, line = self.go("shared-flash", Marked())
         self.assertIn("reason=quota", line)
         cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
-        self.assertIn("pi-deepseek-flash", cooled)
+        self.assertIn("shared-flash", cooled)
 
-    def test_pi_quota_marker_for_another_label_does_not_cool_the_tier(self):
-        # Runs sharing a pi/ outdir each have their own marker; a sibling's
+    def test_quota_marker_for_another_label_does_not_cool_the_tier(self):
+        # Runs sharing an outdir each have their own marker; a sibling's
         # marker never cools this launch.
         self.counts = {}
 
         class SiblingMarked(Launch):
             def spawn(self, cmd, out_path, err_path, env=None):
                 pid = super().spawn(cmd, out_path, err_path, env)
-                (self_run_dir / "pi").mkdir(parents=True, exist_ok=True)
-                (self_run_dir / "pi" / "QUOTA-ws1-plan-lane-9").write_text(
+                (self_run_dir / "codex").mkdir(parents=True, exist_ok=True)
+                (self_run_dir / "codex" / "QUOTA-ws1-plan-lane-9").write_text(
                     "model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-9\n",
                     encoding="utf-8",
                 )
                 return pid
 
         self_run_dir = self.run_dir
-        code, line = self.go("pi-deepseek-flash", SiblingMarked())
+        code, line = self.go("shared-flash", SiblingMarked())
         self.assertIn("STATUS: done", line)
-        self.assertFalse((self.state / "worker-cooldowns.json").exists())
-
-    def test_legacy_bare_quota_file_naming_this_label_still_cools_the_tier(self):
-        # A pi run started before the per-label name leaves a bare pi/QUOTA
-        # naming its label; it still counts, matched on the label line.
-        self.counts = {}
-
-        class LegacyMarked(Launch):
-            def spawn(self, cmd, out_path, err_path, env=None):
-                pid = super().spawn(cmd, out_path, err_path, env)
-                Path(out_path).write_text("", encoding="utf-8")
-                (self_run_dir / "pi").mkdir(parents=True, exist_ok=True)
-                (self_run_dir / "pi" / "QUOTA").write_text(
-                    "model\triver/deepseek-ai/DeepSeek-V4.1-Flash-1017\nlabel\tws1-plan-lane-1\n",
-                    encoding="utf-8",
-                )
-                return pid
-
-        self_run_dir = self.run_dir
-        code, line = self.go("pi-deepseek-flash", LegacyMarked())
-        self.assertIn("reason=quota", line)
-        cooled = json.loads((self.state / "worker-cooldowns.json").read_text(encoding="utf-8"))
-        self.assertIn("pi-deepseek-flash", cooled)
-
-    def test_pi_summary_retry_line_never_reads_quota(self):
-        # For a pi tier the outer out file is launch_pi.py's summary line
-        # and the outer err log its stderr; pi's stream and stderr stay in
-        # the run folder's pi/ outdir. A recovered rate-limit retry
-        # recorded there as rate_limit_retries=<n> must not match the pi
-        # quota_patterns ("rate limit", "429", ...) and cool the tier.
-        self.counts = {}
-
-        class Retried(Launch):
-            def spawn(self, cmd, out_path, err_path, env=None):
-                pid = super().spawn(cmd, out_path, err_path, env)
-                Path(out_path).write_text(
-                    "launched pi ws1-plan-lane-1"
-                    " model river/deepseek-ai/DeepSeek-V4.1-Flash-1017"
-                    " status done verdict PASS rate_limit_retries=1\n",
-                    encoding="utf-8",
-                )
-                return pid
-
-        launch = Retried()
-        code, line = self.go("pi-deepseek-flash", launch)
-        self.assertEqual(code, 0)
-        self.assertIn("STATUS: done", line)
-        self.assertIn("tier=pi-deepseek-flash", line)
         self.assertFalse((self.state / "worker-cooldowns.json").exists())
 
     def test_meta_file_records_tier_harness_and_paths(self):
@@ -1017,7 +893,7 @@ class RunWorkerTests(unittest.TestCase):
             "[m]use-bin|[m]use exec": 25,
             "-m [g]lm-5.3-flash": 5,
             "[l]aunch_codex.py.*--tier codex-luna": 3,
-            "[l]aunch_pi.py.*--tier pi-deepseek-flash": 5,
+            "[l]aunch_shared.py.*--tier shared-flash": 5,
         }
         launch = Launch()
         code, line = self.go("auto", launch)
@@ -1102,134 +978,6 @@ class RunWorkerTests(unittest.TestCase):
         code, line = self.go("muse", launch, label="ws1-exec-lane-1")
         self.assertEqual(len(launch.cmds), 1, "second call must observe, not relaunch")
         self.assertTrue(line.startswith("STATUS: done"), line)
-
-
-class DirectQueueTests(unittest.TestCase):
-    """A direct launch yields to ready queued jobs for the same model while the broker is alive."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.ws = self.root / "ws"
-        self.ws.mkdir()
-        self.prompt = self.root / "prompt.md"
-        self.prompt.write_text("do the task\n", encoding="utf-8")
-        self.run_dir = self.root / "runs"
-        self.home = self.root / "agentq"
-        self.home.mkdir()
-        self.reg = self.root / "workers.json"
-        self.reg.write_text(json.dumps(registry()), encoding="utf-8")
-        self.saved = {
-            key: os.environ.get(key)
-            for key in ("AGENT_DASH_WORKERS", "AGENT_DASH_STATE_DIR", "AGENT_DASH_SCRATCH_ROOT", "AGENTQ_HOME", "AGENTQ_JOB")
-        }
-        os.environ["AGENT_DASH_WORKERS"] = str(self.reg)
-        os.environ["AGENT_DASH_STATE_DIR"] = str(self.root / "state")
-        os.environ["AGENT_DASH_SCRATCH_ROOT"] = str(self.root / "scratch")
-        os.environ["AGENTQ_HOME"] = str(self.home)
-        os.environ.pop("AGENTQ_JOB", None)
-
-    def tearDown(self):
-        for key, value in self.saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        self.tmp.cleanup()
-
-    def heartbeat(self, at=NOW):
-        (self.home / "broker.heartbeat").write_text(f"{at}\n", encoding="utf-8")
-
-    def queue(self, tier, label, not_before=0.0):
-        out = io.StringIO()
-        env = {"AGENTQ_HOME": str(self.home), "AGENTQ_SESSION": "sess-q", "PATH": os.environ["PATH"]}
-        code = cli.main(["submit", str(self.prompt), "--label", label, "--tier", tier], env=env, out=out, now=lambda: NOW)
-        self.assertEqual(code, 0, out.getvalue())
-        conn = db.connect(self.home)
-        conn.execute("UPDATE jobs SET not_before = ? WHERE label = ?", (not_before, label))
-        conn.close()
-
-    def launch(self, tier, launch=None, label="ws1-plan-lane-1"):
-        launch = launch or Launch()
-        argv = [tier, label, str(self.ws), str(self.prompt), str(self.run_dir), "0", "--no-preflight"]
-        out = io.StringIO()
-        err = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = runner.run(
-                argv,
-                spawn=launch.spawn,
-                pgrep=lambda _pattern: 0,
-                sleep=lambda _s: None,
-                now=lambda: NOW,
-                alive=launch.is_alive,
-                new_uuid=lambda: SID,
-            )
-        return code, out.getvalue().strip(), err.getvalue(), launch
-
-    def test_fresh_heartbeat_and_ready_job_for_the_same_model_refuse_a_direct_launch(self):
-        self.heartbeat()
-        self.queue("muse", "queued-muse")
-        code, line, err, launch = self.launch("muse")
-        self.assertEqual(code, 0)
-        self.assertIn("reason=none-available", line)
-        self.assertEqual(launch.cmds, [])
-        self.assertIn("agentq queue has 1 waiting job(s) for this model; queue first", err)
-
-    def test_a_job_on_another_tier_of_the_same_model_also_refuses(self):
-        self.heartbeat()
-        self.queue("pi-deepseek", "queued-sibling")
-        code, line, _err, launch = self.launch("pi-deepseek-flash")
-        self.assertIn("reason=none-available", line)
-        self.assertEqual(launch.cmds, [])
-
-    def test_auto_skips_a_tier_whose_model_has_a_ready_queued_job(self):
-        self.heartbeat()
-        self.queue("muse", "queued-muse")
-        code, line, _err, launch = self.launch("auto")
-        self.assertEqual(code, 0)
-        self.assertIn("tier=glm-flash", line)
-        self.assertEqual(len(launch.cmds), 1)
-
-    def test_stale_heartbeat_allows_the_direct_launch(self):
-        self.heartbeat(at=NOW - 121)
-        self.queue("muse", "queued-muse")
-        code, line, _err, launch = self.launch("muse")
-        self.assertIn("STATUS: done", line)
-        self.assertEqual(len(launch.cmds), 1)
-
-    def test_missing_database_allows_the_direct_launch(self):
-        self.heartbeat()
-        code, line, _err, launch = self.launch("muse")
-        self.assertIn("STATUS: done", line)
-        self.assertEqual(len(launch.cmds), 1)
-
-    def test_job_not_yet_ready_allows_the_direct_launch(self):
-        self.heartbeat()
-        self.queue("muse", "queued-later", not_before=NOW + 60)
-        code, line, _err, launch = self.launch("muse")
-        self.assertIn("STATUS: done", line)
-        self.assertEqual(len(launch.cmds), 1)
-
-    def test_job_for_a_different_model_allows_the_direct_launch(self):
-        self.heartbeat()
-        self.queue("deepseek-flash", "queued-other")
-        code, line, _err, launch = self.launch("muse")
-        self.assertIn("STATUS: done", line)
-        self.assertEqual(len(launch.cmds), 1)
-
-    def test_broker_launched_run_is_never_held_by_the_queue(self):
-        self.heartbeat()
-        self.queue("muse", "queued-muse")
-        os.environ["AGENTQ_JOB"] = "job-from-broker"
-        code, line, _err, launch = self.launch("muse")
-        self.assertIn("STATUS: done", line)
-        self.assertEqual(len(launch.cmds), 1)
-
-    def test_empty_queue_leaves_a_direct_launch_unchanged(self):
-        self.heartbeat()
-        code, line, _err, launch = self.launch("muse")
-        self.assertIn("STATUS: done", line)
-        self.assertEqual(len(launch.cmds), 1)
 
 
 class PreflightTests(unittest.TestCase):
@@ -1360,7 +1108,7 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("tier=muse", out)
         self.assertEqual(len(launch.cmds), 1)
 
-    def test_preflight_passes_for_codex_and_pi_tiers(self):
+    def test_preflight_passes_for_codex_and_shared_tiers(self):
         # gpt-6-luna and the DeepSeek V4.1 Flash pi id are priced, and the
         # codex tier carries the xhigh effort the policy requires.
         self.counts = {}
@@ -1369,10 +1117,10 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("STATUS: done", out)
         self.assertIn("tier=codex-luna", out)
         self.assertEqual(len(launch.cmds), 1)
-        code, out, _err, launch = self.launch("pi-deepseek-flash", label="ws1-plan-pi")
+        code, out, _err, launch = self.launch("shared-flash", label="ws1-plan-shared")
         self.assertEqual(code, 0)
         self.assertIn("STATUS: done", out)
-        self.assertIn("tier=pi-deepseek-flash", out)
+        self.assertIn("tier=shared-flash", out)
 
     def test_preflight_blocks_codex_policy_breach(self):
         workers = registry()["workers"]
@@ -1565,10 +1313,6 @@ class PromptHandoffTests(unittest.TestCase):
     def test_grok_build_tier_sends_the_assembled_prompt(self):
         cmd, text = self.check_tier("glm", Launch())
         self.assertEqual(cmd[2], text + "\n" + runner.RUN_RULE)
-
-    def test_pi_tier_passes_the_assembled_prompt_to_its_launcher(self):
-        cmd, _ = self.check_tier("pi-deepseek", Launch())
-        self.assertIn(str(self.run_dir / "ws1-plan-lane-1.md"), cmd)
 
     def test_codex_tier_passes_the_assembled_prompt_to_its_launcher(self):
         cmd, _ = self.check_tier("codex-luna", Launch())

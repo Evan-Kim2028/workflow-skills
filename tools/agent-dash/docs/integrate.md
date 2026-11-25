@@ -297,37 +297,9 @@ Status comes from the files: growing output means running, a SIGTERM trace in th
 
 The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `beam`, `commandcode`, `codex`, `other`, and `claude` buckets. Grok CLI runs split by model family: `deepseek-*` counts as DeepSeek, `beam-*` as Beam, `glm-*` as GLM, anything else as Other. A generic run shows in the running table, on its task chip, and in tokens and cost either way; set `--tier` to the closest bucket only when the tile must count it.
 
-### pi workers
+### Past pi runs
 
-Retired: the shipped pi tiers are disabled. Kept for reading past runs.
-
-`scripts/launch_pi.py <label> <workspace> <prompt-file> <outdir> [--model M]`
-runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker. The
-default model is `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`; pass
-`--model river/zai-org/GLM-5.3-Flash` for GLM. The label is validated and
-refused with the exact fix on a weak one, and the prompt is copied to
-`<outdir>/prompt-<label>.md` with a `[label: <label>]` first line added when
-missing. `stdin` is closed (pi hangs otherwise).
-
-The launcher writes `pi-sessions.tsv` (`label`, session id, start epoch,
-model), `stream-<label>.ndjson`, `out-<label>.md` (final assistant text),
-`err-<label>.log`, and `running/<label>` while the run is live, and appends
-one `generic.jsonl` start line, one usage line per assistant message
-(`message_id` = session id + index, run id `pi:<session>:<label>`), and one
-finish line. The `pi` source reads the manifest and a `pi/` folder beside
-it, takes status and verdict from the files, and reads liveness from the
-live `node .../pi-coding-agent/dist/cli.js` process (the label rides in its
-prompt path). The tile counts River DeepSeek as DeepSeek and River GLM as
-GLM by their model ids.
-
-Quota or credit exhaustion (an `errorMessage` naming
-insufficient/credit/quota/balance, HTTP 402, or a rate-limit 429 the run
-never recovered from) finishes `died_early` with verdict `BLOCKED` and
-writes `<outdir>/QUOTA-<label>` naming the model and label, so the lead knows to
-swap the API key. A transient 429 pi auto-retried past is not quota: the
-launcher's summary line records it as `rate_limit_retries=<n>`. Run the worker with a
-`ws<N>-plan-<slug>` or `ws<N>-exec-<slug>` label so the Project home
-planning-versus-execution card splits it correctly (§3).
+The pi launcher is removed. The `pi` source still reads past runs from `pi-sessions.tsv` and the `pi/` folder beside it.
 
 ## 3. Labels and the task map
 
@@ -411,13 +383,9 @@ Add a model by appending a row:
 
 A model with no input rate or no output rate stays unpriced: the cost tile counts unpriced runs instead of showing `$0`. Zero tokens cost zero even with no rate for that class. A `reasoning` rate requires reasoning counts, else the run stays unpriced. `billing_mode` (`api`, `plan-included`, `subscription`, `unknown`) is a note; the numeric rates still apply. A `long_context` block prices prompts past its threshold at the higher rates.
 
-### pi workers (River AI)
+### Past pi runs (River AI)
 
-Retired: the shipped pi tiers are disabled. Kept for reading past runs.
-
-`scripts/launch_pi.py` runs one headless `pi` worker on the River AI
-provider (`https://api.river.ai/v1`); the default model is
-`river/deepseek-ai/DeepSeek-V4.1-Flash-1017`. The catalog prices River's
+The catalog prices River's
 four inference models as `provider` `river`, confidence `published`,
 from River's public price list (https://console.river.ai/api/public/pricing,
 retrieved 2026-10-22), USD per 1M tokens, flat with no time bands:
@@ -437,11 +405,9 @@ its `training_and_sampling` list is fine-tuning pricing, not API pricing.
 the river rows from the feed, update `retrieved_at`, then run
 `python3 agent_dash.py reprice` and `python3 -m unittest tests.test_pi`.
 
-### pi workers (Morph)
+### Past pi runs (Morph)
 
-Retired: the shipped pi tiers are disabled. Kept for reading past runs.
-
-A pi tier can launch DeepSeek V4.1 Flash through Morph
+Past runs used DeepSeek V4.1 Flash through Morph
 (`morph/morph-dsv41flash-1017`, `morph/morph-dsv41flash`). Morph's stream
 reports `cost` 0, so the catalog prices the run: `provider` `morph`,
 confidence `published`, from https://morphllm.com/pricing (retrieved

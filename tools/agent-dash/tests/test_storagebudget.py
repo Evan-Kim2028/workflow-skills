@@ -9,7 +9,6 @@ import json
 import os
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -120,9 +119,8 @@ class MeasureTest(unittest.TestCase):
         self.state = self.home / "state"
         self.state.mkdir(parents=True)
         self.scratch = self.home / "scratch"
-        self.agentq = self.home / "agentq"
         self.originals = self.home / "originals"
-        for path in (self.scratch, self.agentq / "jobs", self.originals):
+        for path in (self.scratch, self.originals):
             path.mkdir(parents=True, exist_ok=True)
 
     def _write(self, path, size):
@@ -135,15 +133,12 @@ class MeasureTest(unittest.TestCase):
         self._write(self.dest / "state" / "manifest.jsonl", 300)
         self._write(self.dest / "state" / "manifest-segments" / "seg-1-0000.jsonl.zst", 200)
         self._write(self.state / "log-archive" / "x.zst", 400)
-        self._write(self.agentq / "jobs" / "j1" / "out.log", 700)
         self._write(self.scratch / "ws" / "big.bin", 900)
         self._write(self.originals / "s" / "a.jsonl", 100)
         worktrees = {"bytes": 4000, "physical": 1000, "units": 3, "count": 2, "idle_hours": 5.0}
         with mock.patch.object(sb, "_archive_dest", lambda cfg=None: self.dest), mock.patch.object(
             sb, "_originals_roots", lambda: [str(self.originals)]
-        ), mock.patch.object(sb, "_scratch_root", lambda: self.scratch), mock.patch.object(
-            sb, "_agentq_home", lambda: self.agentq
-        ), mock.patch.object(sb, "_state_dir", lambda cfg=None: self.state), mock.patch.object(
+        ), mock.patch.object(sb, "_scratch_root", lambda: self.scratch), mock.patch.object(sb, "_state_dir", lambda cfg=None: self.state), mock.patch.object(
             sb, "_worktrees", lambda now: dict(worktrees)
         ):
             sample = sb.measure(metrics={"compressed": 10_000, "uncompressed": 60_000}, now=1000.0)
@@ -154,12 +149,11 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual((comp["session_archive"]["bytes"], comp["session_archive"]["units"]), (1500, 2))
         self.assertEqual((comp["session_manifest"]["bytes"], comp["session_manifest"]["units"]), (500, 2))
         self.assertEqual((comp["log_archive"]["bytes"], comp["log_archive"]["units"]), (400, 1))
-        self.assertEqual((comp["agentq_jobs"]["bytes"], comp["agentq_jobs"]["units"]), (700, 1))
         self.assertEqual((comp["scratch"]["bytes"], comp["scratch"]["units"]), (900, 1))
         self.assertEqual((comp["session_originals"]["bytes"], comp["session_originals"]["units"]), (100, 1))
         self.assertEqual(comp["worktrees"]["count"], 2)
-        self.assertEqual(sample["footprint"], 10_000 + 1500 + 500 + 400 + 700 + 900 + 4000 + 100)
-        self.assertEqual(sample["footprint_physical"], 10_000 + 1500 + 500 + 400 + 700 + 900 + 1000 + 100)
+        self.assertEqual(sample["footprint"], 10_000 + 1500 + 500 + 400 + 900 + 4000 + 100)
+        self.assertEqual(sample["footprint_physical"], 10_000 + 1500 + 500 + 400 + 900 + 1000 + 100)
         self.assertGreater(sample["disk"]["total"], 0)
         self.assertEqual(sample["iso"], "1970-01-01T00:16:40Z")
 

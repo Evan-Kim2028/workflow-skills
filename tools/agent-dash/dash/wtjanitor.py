@@ -29,8 +29,7 @@ Disk-pressure mode: when free space on the volume is below
 clears itself without waiting a day. The run says so in its output.
 
 Dry-run by default. ``--daily-maintenance`` additionally prunes the uv
-cache and (when the installed agentq supports it) collects old run
-folders, at most once per 24h, tracked in ``janitor_state.json`` under
+cache, at most once per 24h, tracked in ``janitor_state.json`` under
 the state dir. Stdlib only.
 """
 
@@ -77,8 +76,7 @@ keeps the worktree and its artifacts. --apply-cooldown <dur> turns an
 --apply run into a dry run when the previous --apply run on that
 checkout is younger than <dur>; the scheduled launchd job passes 1h so
 a run right after load cannot delete a second time. --daily-maintenance
-adds `uv cache prune` and, when the installed agentq supports it,
-`agentq gc --apply --runs-older-than 7d`, at most once per 24h.
+adds `uv cache prune`, at most once per 24h.
 """
 
 ARTIFACT_DIRS = (
@@ -103,7 +101,6 @@ SCAN_DEADLINE_S = 30.0
 CMD_TIMEOUT_S = 900
 MAINTENANCE_INTERVAL_S = 24 * 3600.0
 STATE_FILE_NAME = "janitor_state.json"
-AGENTQ_GC_ARGS = ("gc", "--apply", "--runs-older-than", "7d")
 
 
 def disk_free_pct(path: str | Path) -> float | None:
@@ -418,35 +415,6 @@ def _run_cmd(args: list[str], timeout: int = CMD_TIMEOUT_S) -> tuple[int, str]:
     return proc.returncode, (tail[-1] if tail else "")
 
 
-_AGENTQ_GC_SUPPORTED: list[bool] = []
-
-
-def agentq_gc_supported() -> bool:
-    """True when the installed agentq advertises `gc --runs-older-than`.
-
-    The answer is cached for the life of the process, so a run of the
-    janitor asks the CLI at most once.
-    """
-    if _AGENTQ_GC_SUPPORTED:
-        return _AGENTQ_GC_SUPPORTED[-1]
-    found = False
-    if shutil.which("agentq") is not None:
-        try:
-            proc = subprocess.run(
-                ["agentq", "gc", "--help"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            text = (proc.stdout or "") + (proc.stderr or "")
-            found = proc.returncode == 0 and "--runs-older-than" in text
-        except (OSError, subprocess.TimeoutExpired):
-            found = False
-    _AGENTQ_GC_SUPPORTED.append(found)
-    return found
-
-
 def run_maintenance(
     state_file: str | Path,
     apply: bool,
@@ -457,11 +425,6 @@ def run_maintenance(
     state = load_state(state_file)
     results: list[dict] = []
     plans: list[tuple[str, str, list[str]]] = [("uv_cache_prune", "uv cache prune", ["uv", "cache", "prune"])]
-    if shutil.which("agentq") is not None and agentq_gc_supported():
-        plans.append(("agentq_gc", "agentq gc --apply --runs-older-than 7d", ["agentq", *AGENTQ_GC_ARGS]))
-    else:
-        results.append({"action": "agentq_gc", "command": "agentq gc --apply --runs-older-than 7d",
-                        "decision": "skip", "reason": "installed agentq has no --runs-older-than yet"})
     for key, shown, argv in plans:
         last = state.get(key)
         last_ts = float(last) if isinstance(last, (int, float)) else 0.0

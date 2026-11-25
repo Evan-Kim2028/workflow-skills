@@ -7,7 +7,7 @@ each outcome, and writes one event stream. The lead writes prompts, reads report
 decides and merges. It no longer launches, polls or tracks run status by hand.
 
 Tiers launch through `scripts/run_worker.py`; the shipped default worker is `muse`
-(`muse-spark-1.3-contributor`). The agentq queue is retired.
+(`muse-spark-1.3-contributor`).
 
 ## Files
 

@@ -5,7 +5,7 @@ The original bytes live in two archives:
 
 - the native session archive, one lossless `tar.zst` per unit under
   `~/.local/share/agent-sessions/archive` ([session archive](session-archive.md));
-- the agentq log archive, one stripped `zst` per file under
+- the log archive, one stripped `zst` per file under
   `~/.local/share/agent-dash/log-archive` ([log archive](log-archive.md)).
 
 `dash/storebuild.py` re-ingests both into a second VictoriaLogs instance on
@@ -41,7 +41,7 @@ python3 agent_dash.py logs rebuild-store \
 - Re-ingests **every archived revision** of every session unit (a unit that
   grew after it was packed is archived again with a higher `rev`, and the
   store keeps both, because `rev` is part of its dedupe key), every
-  log-archive `.zst`, and the agentq job entries.
+  log-archive `.zst`.
 - Reads the whole manifest, including the records `logs sessions manifest
   compact` rolled into `manifest-segments/*.jsonl.zst`. Compaction moves
   records, it does not drop them, so the rebuild still sees units whose

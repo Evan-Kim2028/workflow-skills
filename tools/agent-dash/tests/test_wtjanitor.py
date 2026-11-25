@@ -407,63 +407,41 @@ class MaintenanceTest(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp(prefix="dash-janitor-state-")) / "janitor_state.json"
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.state.parent)], check=False, timeout=60))
-        wtjanitor._AGENTQ_GC_SUPPORTED.clear()
-        self.addCleanup(wtjanitor._AGENTQ_GC_SUPPORTED.clear)
 
-    def _fake(self, gc_help):
+    def _fake(self):
         calls = []
 
         def fake_run(args, **kwargs):
             calls.append(list(args))
-            if list(args[:2]) == ["agentq", "gc"] and "--help" in args:
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout=gc_help, stderr="")
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="cleaned", stderr="")
 
         return calls, fake_run
 
     def test_daily_maintenance_runs_once_per_day(self):
-        """uv and agentq run at most once per 24h, tracked in the state file."""
-        calls, fake_run = self._fake("usage: agentq gc [--runs-older-than DUR]\n")
+        """uv runs at most once per 24h, tracked in the state file."""
+        calls, fake_run = self._fake()
         base = time.time()
         with mock.patch.object(wtjanitor.shutil, "which", side_effect=lambda name: "/usr/bin/" + name), \
                 mock.patch.object(wtjanitor.subprocess, "run", side_effect=fake_run):
             first = wtjanitor.run_maintenance(self.state, True, now=base)
             second = wtjanitor.run_maintenance(self.state, True, now=base + 3600.0)
             third = wtjanitor.run_maintenance(self.state, True, now=base + 25 * 3600.0)
-        self.assertEqual([row["decision"] for row in first], ["run", "run"])
-        self.assertEqual([row["decision"] for row in second], ["skip", "skip"])
-        self.assertEqual([row["decision"] for row in third], ["run", "run"])
+        self.assertEqual([row["decision"] for row in first], ["run"])
+        self.assertEqual([row["decision"] for row in second], ["skip"])
+        self.assertEqual([row["decision"] for row in third], ["run"])
         uv_calls = [call for call in calls if call == ["uv", "cache", "prune"]]
-        gc_calls = [call for call in calls if call == ["agentq", *wtjanitor.AGENTQ_GC_ARGS]]
         self.assertEqual(len(uv_calls), 2)
-        self.assertEqual(len(gc_calls), 2)
-        help_calls = [call for call in calls if call[:3] == ["agentq", "gc", "--help"]]
-        self.assertEqual(len(help_calls), 1)
 
     def test_dry_run_plans_without_running(self):
         """Without --apply nothing runs and nothing is recorded."""
-        calls, fake_run = self._fake("usage: agentq gc [--runs-older-than DUR]\n")
+        calls, fake_run = self._fake()
         with mock.patch.object(wtjanitor.shutil, "which", side_effect=lambda name: "/usr/bin/" + name), \
                 mock.patch.object(wtjanitor.subprocess, "run", side_effect=fake_run):
             rows = wtjanitor.run_maintenance(self.state, False, now=time.time())
-        self.assertEqual([row["decision"] for row in rows], ["run", "run"])
+        self.assertEqual([row["decision"] for row in rows], ["run"])
         self.assertIn("would run", rows[0]["reason"])
-        self.assertEqual([call for call in calls if call[0] != "agentq" or "--help" not in call], [])
+        self.assertEqual(calls, [])
         self.assertFalse(self.state.exists())
-
-    def test_agentq_gc_is_skipped_without_the_flag(self):
-        """An older agentq reads as no capability, and no gc is attempted."""
-        calls, fake_run = self._fake("usage: agentq gc [--dry-run]\n")
-        with mock.patch.object(wtjanitor.shutil, "which", side_effect=lambda name: "/usr/bin/" + name), \
-                mock.patch.object(wtjanitor.subprocess, "run", side_effect=fake_run):
-            rows = wtjanitor.run_maintenance(self.state, True, now=time.time())
-        decisions = {row["action"]: row["decision"] for row in rows}
-        self.assertEqual(decisions["uv_cache_prune"], "run")
-        self.assertEqual(decisions["agentq_gc"], "skip")
-        gc_row = [row for row in rows if row["action"] == "agentq_gc"][0]
-        self.assertIn("no --runs-older-than", gc_row["reason"])
-        self.assertEqual([call for call in calls if call == ["agentq", *wtjanitor.AGENTQ_GC_ARGS]], [])
-
 
 if __name__ == "__main__":
     unittest.main()

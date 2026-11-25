@@ -2,7 +2,7 @@
 
 The laptop holds the agent history in several places at once (the
 VictoriaLogs store, the lossless session archive, the log archive, the
-agentq job folders, worker scratch, the git worktrees and the session
+worker scratch, the git worktrees and the session
 originals that have not been reclaimed yet). Nothing measured the total, so
 the disk filled up without warning. This module measures it once a day,
 appends one line to a history file, and projects the days left at the
@@ -89,7 +89,6 @@ COMPONENTS = (
     ("session_archive", "session archive (tar.zst)"),
     ("session_manifest", "session manifest"),
     ("log_archive", "log archive"),
-    ("agentq_jobs", "agentq job folders"),
     ("scratch", "worker scratch"),
     ("worktrees", "git worktrees"),
     ("session_originals", "session originals"),
@@ -100,7 +99,6 @@ FOOTPRINT = (
     "session_archive",
     "session_manifest",
     "log_archive",
-    "agentq_jobs",
     "scratch",
     "worktrees",
     "session_originals",
@@ -395,7 +393,7 @@ def _worktree_roots() -> list[str]:
 
     A root inside another root is dropped, so a nested ``.worktrees`` under a
     worktree is not counted twice. Symlinked and hidden roots are skipped (a
-    ``.agentq-trash`` beside the worktrees is not a worktree).
+    ``.trash`` beside the worktrees is not a worktree).
     """
     roots: list[str] = []
     base = Path(os.path.expanduser(os.environ.get(WORKTREES_ENV) or WORKTREES_ROOT))
@@ -565,13 +563,6 @@ def _scratch_root() -> Path:
     return Path(scratchdir.scratch_root())
 
 
-def _agentq_home() -> Path:
-    override = os.environ.get("AGENTQ_HOME")
-    if override:
-        return Path(os.path.expanduser(override))
-    return Path.home() / ".local" / "state" / "agentq"
-
-
 def measure(
     cfg: dict | None = None,
     *,
@@ -608,7 +599,6 @@ def measure(
         manifest = _file_tree(dest / "state" / "manifest.jsonl")
         components["session_manifest"] = _add_tree(manifest, _tree(dest / "state" / "manifest-segments"))
         components["log_archive"] = _tree(state / "log-archive")
-        components["agentq_jobs"] = _tree(_agentq_home() / "jobs")
         components["scratch"] = _tree(_scratch_root())
         components["worktrees"] = _worktrees(now)
         originals = _empty_tree()

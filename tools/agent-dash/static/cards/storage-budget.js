@@ -1,7 +1,6 @@
 /* Page card: Storage budget (read-only).
    The daily footprint of the agent-log stack: the VictoriaLogs store, the
-   session archive and its manifest, the log archive, the agentq job
-   folders, worker scratch and the session originals, plus the disk share
+   session archive and its manifest, the log archive, worker scratch and the session originals, plus the disk share
    and the days to 70/78/85% at the 7-day growth rate.
 
    The numbers come from GET /api/storage/budget, which reads the last line
@@ -29,7 +28,6 @@
     ["session_archive", "Session archive"],
     ["session_manifest", "Session manifest"],
     ["log_archive", "Log archive"],
-    ["agentq_jobs", "agentq job folders"],
     ["scratch", "Worker scratch"],
     ["worktrees", "Git worktrees"],
     ["session_originals", "Session originals"]

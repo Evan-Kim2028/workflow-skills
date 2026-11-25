@@ -110,22 +110,9 @@ class ScratchLaunchTests(unittest.TestCase):
         self.assertFalse(str(scratch).startswith(str(self.run_dir)))
         self.assertFalse((self.run_dir / "ws1-plan-outside" / ".agent-scratch.json").exists())
 
-    def test_pi_standby_keeps_its_credential_var_and_scratch(self):
-        data = dict(self.registry)
-        data["workers"] = json.loads(json.dumps(self.registry["workers"]))
-        data["workers"]["pi-deepseek-flash"]["enabled"] = True
-        data["workers"]["pi-deepseek-flash"]["standby_env_file"] = "~/.config/pi/standby.env"
-        self.reg.write_text(json.dumps(data), encoding="utf-8")
-        spawn = FakeSpawn()
-        code, line = self.launch("pi-deepseek-flash", "ws1-plan-standby", spawn)
-        self.assertEqual(code, 0)
-        env = spawn.envs[0]
-        self.assertEqual(env["AGENT_DASH_PI_ENV_FILE"], os.path.expanduser("~/.config/pi/standby.env"))
-        self.assertEqual(env["AGENT_SCRATCH"], str(self.scratch / "WS1" / "ws1-plan-standby"))
-
     def test_launch_env_helper(self):
-        self.assertEqual(runner.launch_env({}, None), None)
-        self.assertEqual(runner.launch_env({}, "/s"), {"AGENT_SCRATCH": "/s"})
+        self.assertEqual(runner.launch_env(None), None)
+        self.assertEqual(runner.launch_env("/s"), {"AGENT_SCRATCH": "/s"})
 
     def test_unwritable_scratch_root_still_exports_the_path(self):
         blocker = self.root / "not-a-dir"
