@@ -1,5 +1,9 @@
 # Staging A/B runs for launcher changes
 
+> Retired 2026-11-25. Do not submit new work here. Delegated work runs on the
+> `muse` worker through `scripts/run_worker.sh`. Kept as reference for stored
+> job history and the shims other workers still load.
+
 `scripts/stage_ab.py` replays finished read and review jobs twice, once with the control
 launcher and once with the treatment launcher, and compares tokens, requests and verdicts.
 Runs go through the live proxy (so Morph's shared limits stay governed) but never through the

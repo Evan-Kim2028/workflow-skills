@@ -79,7 +79,7 @@ Lanes in one wave share no file or test file. Each lane goes build, then review,
 
 ### If you are on Claude Code
 
-`tools/agent-dash/workflows/ws-wave.js` runs one wave in the Workflow tool (`scriptPath` to the file, `args` as documented at its top). Tiers come from the worker registry (`default`, a name, or `auto`). Each step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. Full walk-through: `tools/agent-dash/docs/workstream-lead.md`.
+`tools/agent-dash/workflows/ws-wave.js` runs one wave in the Workflow tool (`scriptPath` to the file, `args` as documented at its top). Tiers come from the worker registry (`default`, a name, or `auto`). The shipped default worker is `muse` (`muse-spark-1.3-contributor`). Where the Workflow tool is off, launch each lane directly with `scripts/run_worker.sh default`. Full walk-through: `tools/agent-dash/docs/workstream-lead.md`.
 
 ### If you use muse
 

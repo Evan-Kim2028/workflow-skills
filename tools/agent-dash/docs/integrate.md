@@ -299,6 +299,8 @@ The live-agents tile counts the `grok`, `muse`, `glm`, `deepseek`, `beam`, `comm
 
 ### pi workers
 
+Retired: the shipped pi tiers are disabled. Kept for reading past runs.
+
 `scripts/launch_pi.py <label> <workspace> <prompt-file> <outdir> [--model M]`
 runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker. The
 default model is `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`; pass
@@ -411,6 +413,8 @@ A model with no input rate or no output rate stays unpriced: the cost tile count
 
 ### pi workers (River AI)
 
+Retired: the shipped pi tiers are disabled. Kept for reading past runs.
+
 `scripts/launch_pi.py` runs one headless `pi` worker on the River AI
 provider (`https://api.river.ai/v1`); the default model is
 `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`. The catalog prices River's
@@ -434,6 +438,8 @@ the river rows from the feed, update `retrieved_at`, then run
 `python3 agent_dash.py reprice` and `python3 -m unittest tests.test_pi`.
 
 ### pi workers (Morph)
+
+Retired: the shipped pi tiers are disabled. Kept for reading past runs.
 
 A pi tier can launch DeepSeek V4.1 Flash through Morph
 (`morph/morph-dsv41flash-1017`, `morph/morph-dsv41flash`). Morph's stream

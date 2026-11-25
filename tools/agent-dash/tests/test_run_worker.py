@@ -141,8 +141,9 @@ class RunWorkerTests(unittest.TestCase):
 
     def test_example_lists_the_launch_tiers(self):
         data = shipped_registry()
-        self.assertEqual(data["default"], "pi-anthropic-haiku")
-        self.assertEqual(data["auto_order"], ["pi-anthropic-haiku", "pi-deepseek-flash"])
+        self.assertEqual(data["default"], "muse")
+        self.assertEqual(data["auto_order"], ["muse"])
+        self.assertEqual(data["workers"]["muse"]["model"], "muse-spark-1.3-contributor")
         self.assertEqual(
             set(data["workers"]),
             {"pi-anthropic-haiku", "pi-deepseek-flash", "muse", "grok-build-47", "deepseek-flash",
@@ -171,7 +172,7 @@ class RunWorkerTests(unittest.TestCase):
         self.assertIn("--tier pi-anthropic-haiku", tiers["pi-anthropic-haiku"])
         for name, row in data["workers"].items():
             self.assertIn("[", row["pgrep"])
-            self.assertTrue(row["enabled"])
+            self.assertEqual(row["enabled"], row["kind"] != "pi", name)
             self.assertIn("cap", row)
             self.assertIn("quota_patterns", row)
             self.assertIn("columns", row)

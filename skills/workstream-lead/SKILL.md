@@ -43,7 +43,7 @@ At each milestone run `agent_dash.py lead-profile` on the lead session: a LOW-DE
 
 ### If you are on Claude Code
 
-Run the wave with the `ws-wave` Workflow tool: `scriptPath` is `tools/agent-dash/workflows/ws-wave.js` and the args are in the brief. Tiers come from the worker registry: `default`, a named tier, or `auto` for failover by availability. Each step is a low-effort Haiku wrapper around `scripts/run_worker.sh`. A lane may set `reviewFocus` (checks with evidence) and `oneWay: true` (irreversible lanes, still reviewed). Approved lanes move to `pr` via `ws task`.
+Run the wave with the `ws-wave` Workflow tool: `scriptPath` is `tools/agent-dash/workflows/ws-wave.js` and the args are in the brief. Tiers come from the worker registry: `default`, a named tier, or `auto` for failover by availability. The shipped default worker is `muse` (`muse-spark-1.3-contributor`). Where the Workflow tool is off, launch each lane directly with `scripts/run_worker.sh default`. A lane may set `reviewFocus` (checks with evidence) and `oneWay: true` (irreversible lanes, still reviewed). Approved lanes move to `pr` via `ws task`.
 
 ## Throughput
 

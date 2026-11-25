@@ -2,9 +2,8 @@
 # Worker rules (include in every muse and Haiku worker prompt)
 
 You are a worker, not an orchestrator. Do the task in this prompt and return.
-Do not submit jobs (`agentq submit`) and do not launch any worker (`run_worker.*`,
-`launch_pi.py`, `muse exec`, `launch_codex.py`). If the task needs another
-worker, name it in your report; the lead submits it.
+Do not launch any worker (`run_worker.*`, `muse exec`, `launch_codex.py`). If
+the task needs another worker, name it in your report; the lead launches it.
 
 - Scope: obey the read-only or write scope stated in the prompt. Write only in
   your own worktree or the paths named. Read-only means read-only on every
@@ -84,44 +83,32 @@ worker, name it in your report; the lead submits it.
   `codegraph <subcommand> -p <main checkout>`. `cg` works from a worktree and
   reads the main checkout's index; run it before any grep over source code.
   Grep and Read are for non-code text or one detail; never run `cg init` in a worktree.
-- Filler findings: for a write task, run
-  `agentq filler findings --repo <repo> --path <files you will edit>` first and
-  fix or mention any open high finding in those files. It lists the newest
-  filler findings for those files and whether the line each cites is still
-  identical at `origin/main` (`still there` means nobody has fixed it yet).
 - Bash: every command already starts in your workspace. Never begin a command
   with `cd <your workspace> &&`, and write paths relative to it; that prefix
   was 18% of all worker bash output (2026-11-18). `cd` only to reach a
   different directory, or use `git -C <dir>`. Put related reads in one call
   rather than one call each, and never re-run a command whose output you
   already have.
-- Every command's output is new uncached input on your next turn, which is
-  one of the two per-minute limits on the Morph plan (output is the other;
-  cached input is free). Keep reads narrow: `sed -n` and `rg` output were 52%
+- Every command's output is new uncached input on your next turn. Keep reads narrow: `sed -n` and `rg` output were 52%
   of all worker tool output by size (2026-11-18). Locate first
   (`cg explore`, or `rg -n -m 20 <pattern> <path>`), then read only the lines
   around the hit (`sed -n 'A,Bp'`, under ~80 lines). Never `cat` or `sed -n`
   a whole large file, never `rg` without a path and a `-m` or `| head` cap.
 - Labels: build every run label with `python3 ~/.claude/tools/agent-dash/agent_dash.py label make ...`, never hand-write one; hooks refuse bad ones.
 - Finish: after the report is written and committed, print it as your final
-  message and exit at once. Do not idle or wait for input. For queued
-  jobs the broker watchdog kills the run at `$AGENTQ_DEADLINE` (epoch seconds;
-  often 30 to 60 min, not hours) and after a stall of 45 min with no change to
-  the run folder. A killed run loses everything it has not written. Check
-  `echo $(( AGENTQ_DEADLINE - $(date +%s) ))s` when you plan and every ~20
-  turns; once under a quarter of the time is left, stop exploring and write
-  the report with what you have (`PARTIAL`, listing what was not done). For muse and grok runs, the parent's watcher
-  ends a run still alive 10 minutes after its report.
+  message and exit at once. Do not idle or wait for input. The
+  parent's watcher flags a run with no activity for 45 minutes or past 6 hours,
+  and ends a run still alive 10 minutes after its report. If time runs short,
+  stop exploring and write the report with what you have (`PARTIAL`, listing
+  what was not done).
 - Report: start with a verdict line, `PASS`, `PARTIAL` (list what was not
   covered or compared), or `BLOCKED`. Cite `file:line`, list exact test
   commands with pass/fail counts, and state what was not done.
 - Review jobs: the verdict line is one of `APPROVE`, `APPROVE_WITH_CHANGES`,
   `REQUEST_CHANGES` or `REJECT`, and it is the first line of the report (for
-  example `**Verdict: REQUEST_CHANGES.**`). The broker stores that word
-  verbatim. The parser reads the first verdict-looking line, case-insensitive,
+  example `**Verdict: REQUEST_CHANGES.**`). The parser reads the first verdict-looking line, case-insensitive,
   with or without bold, a colon or a `Verdict:` label; a report with no such
-  line is recorded as `none` and its job detail says "no verdict line in
-  report".
+  line is recorded as `none`.
 - Data access, efficient by default (owner rule, 2026-10-30):
   - Postgres: one set-based query per question, never a loop of per-batch
     or per-id queries (36 batches of 200 ids re-scanned a 5.7 GB table 36

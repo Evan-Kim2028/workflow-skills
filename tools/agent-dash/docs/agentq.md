@@ -1,5 +1,9 @@
 # agentq: one laptop job queue
 
+> Retired 2026-11-25. Do not submit new work here. Delegated work runs on the
+> `muse` worker through `scripts/run_worker.sh`. Kept as reference for stored
+> job history and the shims other workers still load.
+
 agentq runs agent work for every harness session on this laptop (Claude Code,
 codex, muse, pi) through one durable queue. A session submits a prompt file, the
 broker launches a pi worker through `scripts/run_worker.py`, and the report comes
