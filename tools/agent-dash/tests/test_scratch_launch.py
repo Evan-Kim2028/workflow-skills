@@ -113,6 +113,7 @@ class ScratchLaunchTests(unittest.TestCase):
     def test_pi_standby_keeps_its_credential_var_and_scratch(self):
         data = dict(self.registry)
         data["workers"] = json.loads(json.dumps(self.registry["workers"]))
+        data["workers"]["pi-deepseek-flash"]["enabled"] = True
         data["workers"]["pi-deepseek-flash"]["standby_env_file"] = "~/.config/pi/standby.env"
         self.reg.write_text(json.dumps(data), encoding="utf-8")
         spawn = FakeSpawn()

@@ -1,11 +1,11 @@
 {
-  "default": "pi-anthropic-haiku",
-  "auto_order": ["pi-anthropic-haiku", "pi-deepseek-flash"],
+  "default": "muse",
+  "auto_order": ["muse"],
   "cooldown_minutes": 30,
   "model_caps": {"river/deepseek-ai/DeepSeek-V4.1-Flash-1017": 5},
   "workers": {
     "pi-anthropic-haiku": {
-      "enabled": true,
+      "enabled": false,
       "kind": "pi",
       "model": "anthropic/claude-haiku-5-5",
       "extra_args": [],
@@ -17,7 +17,7 @@
       "cost_rank": 1
     },
     "pi-deepseek-flash": {
-      "enabled": true,
+      "enabled": false,
       "kind": "pi",
       "model": "river/deepseek-ai/DeepSeek-V4.1-Flash-1017",
       "extra_args": [],
@@ -89,7 +89,7 @@
       "cost_rank": 2
     },
     "pi-beam": {
-      "enabled": true,
+      "enabled": false,
       "kind": "pi",
       "model": "reflection/Beam-1.0-501B-A23B",
       "extra_args": [],

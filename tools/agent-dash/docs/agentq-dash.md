@@ -1,5 +1,9 @@
 # agentq dash: live dashboard
 
+> Retired 2026-11-25. Do not submit new work here. Delegated work runs on the
+> `muse` worker through `scripts/run_worker.sh`. Kept as reference for stored
+> job history and the shims other workers still load.
+
 A read-only page on the laptop that shows the Morph proxy's billed use against
 each limit, worker counts, 429s, queue wait and recent jobs.
 

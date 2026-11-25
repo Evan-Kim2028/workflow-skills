@@ -1,5 +1,9 @@
 # agentq proxy: Morph rate governor
 
+> Retired 2026-11-25. Do not submit new work here. Delegated work runs on the
+> `muse` worker through `scripts/run_worker.sh`. Kept as reference for stored
+> job history and the shims other workers still load.
+
 `agentq/proxy.py` is a local HTTP proxy on `127.0.0.1:18790` between pi and
 `api.morphllm.com`. It admits each request only when every Morph budget the
 request touches has room under its learned target. Requests that do not fit

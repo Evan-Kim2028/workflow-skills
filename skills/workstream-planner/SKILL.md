@@ -84,4 +84,4 @@ Size work so waves fan out. Detail and evidence: [orchestration principles](../.
 
 ### If you are on Claude Code
 
-Code search starts with CodeGraph; lanes run through the `ws-wave` Workflow with Haiku wrappers around `run_worker.sh`; tiers come from the worker registry (`default`, a name, or `auto`). The wave call and the tier shapes are in `tools/agent-dash/docs/workstream-lead.md`.
+Code search starts with CodeGraph; lanes run through `run_worker.sh` (or the `ws-wave` Workflow where that tool is on); tiers come from the worker registry (`default`, a name, or `auto`), whose shipped default is `muse` (`muse-spark-1.3-contributor`). The wave call and the tier shapes are in `tools/agent-dash/docs/workstream-lead.md`.

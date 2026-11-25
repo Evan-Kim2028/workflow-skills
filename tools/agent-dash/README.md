@@ -56,6 +56,8 @@ no label. Throttled attempts show as `died_early` with verdict `QUOTA`.
 
 ### pi workers (`launch_pi.py`)
 
+Retired: the shipped pi tiers are disabled and `muse` is the default worker.
+
 `scripts/launch_pi.py <label> <workspace> <prompt-file> <outdir> [--model M]`
 runs one headless `pi` (`@mariozechner/pi-coding-agent`) worker on the
 River AI provider, defaulting to
@@ -130,7 +132,7 @@ finish line with the verdict; `parent_session_id` links it to the lead
 session that launched it.
 
 `scripts/run_worker.py` launches registry tiers through these launchers, such as
-`codex-luna` (kind `codex`) and `pi-deepseek-flash` (kind `pi`). `workers.example.json`
+`muse` (the default) and `codex-luna` (kind `codex`). `workers.example.json`
 is the single reference for tiers, caps, models and `auto_order`. `auto` skips a tier
 whose model has no catalog price. A tier that hits its quota patterns (or whose launcher
 writes its `QUOTA` marker) cools down for `cooldown_minutes` and the next tier takes the launch.
